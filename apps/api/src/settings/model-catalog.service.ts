@@ -1,3 +1,4 @@
+import { type LocalModel, localModel } from "@crm/db/local-model";
 import { CACHE_MANAGER } from "@nestjs/cache-manager";
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { Cache } from "cache-manager";
@@ -7,7 +8,9 @@ const CATALOG_URL = "https://ai-gateway.vercel.sh/v1/models";
 
 const CATALOG_TTL_MS = 30 * 60_000;
 
-const CATALOG_KEY = "settings:model-catalog";
+const CATALOG_RETRY_MS = 60_000;
+
+const CATALOG_KEY = "settings:model-catalog:v2";
 
 const CATALOG_TIMEOUT_MS = 5_000;
 
@@ -62,6 +65,18 @@ function toCatalogModel(model: GatewayModel): CatalogModel {
 	};
 }
 
+type CachedCatalog = { models: CatalogModel[] | null };
+
+function toLocalCatalogModel(model: LocalModel): CatalogModel {
+	return {
+		id: model.id,
+		name: `${model.name} (local)`,
+		provider: "local",
+		contextWindowTokens: model.contextWindowTokens,
+		pricing: null,
+	};
+}
+
 @Injectable()
 export class ModelCatalogService {
 	private readonly logger = new Logger(ModelCatalogService.name);
@@ -69,13 +84,24 @@ export class ModelCatalogService {
 	constructor(@Inject(CACHE_MANAGER) private readonly cache: Cache) {}
 
 	async models(): Promise<CatalogModel[] | null> {
-		const cached = await this.cache.get<CatalogModel[]>(CATALOG_KEY);
-		if (cached) return cached;
+		const local = localModel();
+		const gateway = await this.gatewayModels();
+
+		if (!local) return gateway;
+
+		return [toLocalCatalogModel(local), ...(gateway ?? [])];
+	}
+
+	private async gatewayModels(): Promise<CatalogModel[] | null> {
+		const cached = await this.cache.get<CachedCatalog>(CATALOG_KEY);
+		if (cached) return cached.models;
 
 		const models = await this.fetchCatalog();
-		if (!models) return null;
-
-		await this.cache.set(CATALOG_KEY, models, CATALOG_TTL_MS);
+		await this.cache.set(
+			CATALOG_KEY,
+			{ models } satisfies CachedCatalog,
+			models ? CATALOG_TTL_MS : CATALOG_RETRY_MS,
+		);
 		return models;
 	}
 

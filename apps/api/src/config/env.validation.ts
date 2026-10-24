@@ -126,6 +126,22 @@ export class EnvironmentVariables {
 
 	@IsOptional()
 	@IsString()
+	LOCAL_MODEL_URL?: string;
+
+	@IsOptional()
+	@IsString()
+	LOCAL_MODEL_ID?: string;
+
+	@IsOptional()
+	@IsString()
+	LOCAL_MODEL_CONTEXT_TOKENS?: string;
+
+	@IsOptional()
+	@IsString()
+	LOCAL_MODEL_API_KEY?: string;
+
+	@IsOptional()
+	@IsString()
 	@Matches(/^[A-Za-z0-9+/]{43}=$/, {
 		message: "MCP_ENCRYPTION_KEY must contain exactly 32 base64-encoded bytes.",
 	})

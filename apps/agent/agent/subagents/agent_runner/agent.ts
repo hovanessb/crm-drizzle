@@ -1,50 +1,39 @@
 import { agentRun, db, orNull, whereEq } from "@crm/db";
-import { DEFAULT_AGENT_MODEL } from "@crm/db/settings";
 import { defineAgent, defineDynamic } from "eve";
+import { fallbackModel, modelEvents } from "../../lib/model";
 import { attribute, purposeOf } from "../../lib/session-purpose";
 
 export default defineAgent({
 	description:
 		"Execute one immutable deployed CRM agent version and persist its result and every side effect.",
 	model: defineDynamic({
-		events: {
-			"session.started": async (_event, ctx) => {
-				if (purposeOf(ctx) !== "team-agent") {
-					return {
-						model: DEFAULT_AGENT_MODEL.id,
-						modelContextWindowTokens: DEFAULT_AGENT_MODEL.contextWindowTokens,
-					};
-				}
-				const runId = attribute(ctx, "runId");
-				if (!runId) {
-					return {
-						model: DEFAULT_AGENT_MODEL.id,
-						modelContextWindowTokens: DEFAULT_AGENT_MODEL.contextWindowTokens,
-					};
-				}
+		events: modelEvents(async (ctx) => {
+			if (purposeOf(ctx) !== "team-agent") {
+				return fallbackModel();
+			}
+			const runId = attribute(ctx, "runId");
+			if (!runId) {
+				return fallbackModel();
+			}
 
-				const run = await db.query.agentRun
-					.findFirst({
-						where: whereEq(agentRun.id, runId),
-						columns: {},
-						with: {
-							version: {
-								columns: { modelId: true, modelContextWindowTokens: true },
-							},
+			const run = await db.query.agentRun
+				.findFirst({
+					where: whereEq(agentRun.id, runId),
+					columns: {},
+					with: {
+						version: {
+							columns: { modelId: true, modelContextWindowTokens: true },
 						},
-					})
-					.then(orNull);
-				return run
-					? {
-							model: run.version.modelId,
-							modelContextWindowTokens: run.version.modelContextWindowTokens,
-						}
-					: {
-							model: DEFAULT_AGENT_MODEL.id,
-							modelContextWindowTokens: DEFAULT_AGENT_MODEL.contextWindowTokens,
-						};
-			},
-		},
+					},
+				})
+				.then(orNull);
+			return run
+				? {
+						model: run.version.modelId,
+						modelContextWindowTokens: run.version.modelContextWindowTokens,
+					}
+				: fallbackModel();
+		}),
 	}),
 	limits: {
 		maxInputTokensPerSession: 500_000,

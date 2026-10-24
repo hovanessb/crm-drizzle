@@ -5,11 +5,11 @@ import {
 	isCurrencyCode,
 	normalizeCurrency,
 } from "./currency";
+import { defaultAgentModel } from "./local-model";
 import type { NewAppSetting } from "./schema/models";
 import { appSetting } from "./schema/schema";
 import {
 	type AgentModelSetting,
-	DEFAULT_AGENT_MODEL,
 	DEFAULT_ARCHIVE_RETENTION_DAYS,
 	MAX_ARCHIVE_RETENTION_DAYS,
 	MIN_ARCHIVE_RETENTION_DAYS,
@@ -40,14 +40,16 @@ async function writeSettings(
 export async function readAgentModel(db: Executor): Promise<AgentModelSetting> {
 	const row = await readSettings(db);
 
+	const fallback = defaultAgentModel();
+
 	if (!row?.agentModelId) {
-		return { ...DEFAULT_AGENT_MODEL, isDefault: true };
+		return { ...fallback, isDefault: true };
 	}
 
 	return {
 		id: row.agentModelId,
 		contextWindowTokens:
-			row.agentModelContextWindow ?? DEFAULT_AGENT_MODEL.contextWindowTokens,
+			row.agentModelContextWindow ?? fallback.contextWindowTokens,
 		isDefault: false,
 	};
 }

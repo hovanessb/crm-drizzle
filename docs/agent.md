@@ -22,6 +22,31 @@ agent and the API both need it.
 - **Not a frontier model, deliberately** — refusing wrong answers is enforced by the
   tools and evidence model, not model strength.
 
+### A local model instead of the Gateway
+
+`LOCAL_MODEL_URL`, `LOCAL_MODEL_ID` and `LOCAL_MODEL_CONTEXT_TOKENS` point the agent
+at any server that speaks the OpenAI chat completions API — `llama-server`, vLLM,
+Ollama. `@crm/db/local-model` parses them once, for the agent and the API.
+
+- **The id is `local/<LOCAL_MODEL_ID>`.** With all three variables set it is the
+  default model and the first entry in the chooser. A Gateway model chosen in
+  Settings still wins, and still needs a Gateway key.
+- **eve selects strings at `session.started` and live models only at
+  `step.started`.** `modelEvents()` in `lib/model.ts` keeps the session selection
+  a string and adds a `step.started` resolver that swaps a `local/` id for an
+  `@ai-sdk/openai-compatible` model. Without a local URL there is no step resolver.
+- **Every `local/` id reaches the one configured server**, so a saved choice
+  survives a change to `LOCAL_MODEL_ID`. Versions saved by the builder keep their
+  `local/` id the same way.
+- **`LOCAL_MODEL_CONTEXT_TOKENS` is the server's `--ctx-size`**, sent as
+  `modelContextWindowTokens`. Too high, and compaction starts after the server has
+  already refused the request.
+- **`llama-server` needs `--jinja`.** Without the model's chat template, tool calls
+  come back as plain text and the agent cannot use one tool.
+- **A wrong value turns the local model off and logs why.** It never throws.
+- **`@ai-sdk/openai-compatible` is pinned** to the release that uses eve's
+  `@ai-sdk/provider`. A different provider version does not typecheck.
+
 ## Pictures are copied, never linked
 
 `mirror()` copies bytes to Vercel Blob; the record points at our copy. Lives in

@@ -21,6 +21,7 @@
 		"./idempotency": "./src/idempotency.ts",
 		"./images": "./src/images.ts",
 		"./json": "./src/json.ts",
+		"./local-model": "./src/local-model.ts",
 		"./safe-fetch": "./src/safe-fetch.ts",
 		"./schema": "./src/schema/schema.ts",
 		"./settings": "./src/settings.ts",
