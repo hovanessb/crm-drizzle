@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
 import pg from "pg";
-
-const SCHEMA = join(dirname(import.meta.dirname), "prisma", "schema.prisma");
-const MIGRATIONS = join(dirname(import.meta.dirname), "prisma", "migrations");
+import {
+	appliedHashes,
+	journal,
+	migrateDatabase,
+	migrationHash,
+} from "./migrations";
 
 const url = resolve();
 
@@ -26,7 +26,7 @@ if (!name.endsWith("_test")) {
 }
 
 await create(url, name, process.argv.includes("--reset"));
-migrate(url);
+await migrateDatabase(url);
 
 if (!process.env.TEST_DATABASE_URL) {
 	console.log(
@@ -99,28 +99,6 @@ async function drop(client: pg.Client, database: string): Promise<void> {
 }
 
 async function stale(target: string, database: string): Promise<string | null> {
-	const applied = await appliedMigrations(target);
-
-	if (applied === null) return null;
-
-	const onDisk = new Set(
-		existsSync(MIGRATIONS)
-			? readdirSync(MIGRATIONS, { withFileTypes: true })
-					.filter((entry) => entry.isDirectory())
-					.map((entry) => entry.name)
-			: [],
-	);
-
-	const foreign = applied.filter((migration) => !onDisk.has(migration));
-
-	if (foreign.length > 0) {
-		return `${database} holds ${foreign.length} migration(s) this branch does not have, starting with ${foreign[0]}`;
-	}
-
-	return drifted(target) ? `${database} no longer matches schema.prisma` : null;
-}
-
-async function appliedMigrations(target: string): Promise<string[] | null> {
 	const client = new pg.Client({ connectionString: target });
 
 	try {
@@ -130,52 +108,24 @@ async function appliedMigrations(target: string): Promise<string[] | null> {
 	}
 
 	try {
-		const rows = await client.query<{ migration_name: string }>(
-			`SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NOT NULL`,
-		);
-		return rows.rows.map((row) => row.migration_name);
-	} catch {
-		return null;
+		const applied = await appliedHashes(client);
+		if (applied === null) return null;
+
+		const onDisk = journal().map((entry) => migrationHash(entry.tag));
+		const known = new Set(onDisk);
+		const foreign = applied.filter((hash) => !known.has(hash));
+
+		if (foreign.length > 0) {
+			return `${database} holds ${foreign.length} migration(s) this branch does not have`;
+		}
+
+		const changed = applied.some((hash, index) => onDisk[index] !== hash);
+		return changed
+			? `${database} was migrated from different migration files`
+			: null;
 	} finally {
 		await client.end();
 	}
-}
-
-function drifted(target: string): boolean {
-	const result = spawnSync(
-		"prisma",
-		[
-			"migrate",
-			"diff",
-			"--from-config-datasource",
-			"--to-schema",
-			SCHEMA,
-			"--exit-code",
-		],
-		{ stdio: "ignore", env: { ...process.env, DATABASE_URL: target } },
-	);
-
-	return result.status === 2;
-}
-
-function migrate(target: string): void {
-	const result = spawnSync("prisma", ["migrate", "deploy"], {
-		stdio: "inherit",
-		env: { ...process.env, DATABASE_URL: target },
-	});
-
-	if (result.error) {
-		fail([
-			"Could not run prisma migrate deploy.",
-			"Run this through the package script, which puts prisma on PATH:",
-			"",
-			"    bun run db:test",
-			"",
-			result.error.message,
-		]);
-	}
-
-	if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
 function resolve(): string | null {

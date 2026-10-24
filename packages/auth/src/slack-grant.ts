@@ -1,4 +1,13 @@
-import { db } from "@crm/db";
+import {
+	account as accountTable,
+	and,
+	db,
+	eq,
+	lt,
+	ne,
+	slackInstallation,
+	slackWorkspaceGrant,
+} from "@crm/db";
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import type { OauthAccess } from "@crm/validation";
 import { SLACK_PROVIDER_ID } from "./scopes";
@@ -16,11 +25,13 @@ export async function rememberSlackInstall(grant: OauthAccess): Promise<void> {
 		createdAt: new Date(),
 	};
 
-	await db.slackInstallation.upsert({
-		where: { installerId: installer.id },
-		create: { installerId: installer.id, ...install },
-		update: install,
-	});
+	await db
+		.insert(slackInstallation)
+		.values({ installerId: installer.id, ...install })
+		.onConflictDoUpdate({
+			target: slackInstallation.installerId,
+			set: install,
+		});
 
 	await forgetStaleInstalls();
 }
@@ -29,25 +40,27 @@ export async function replaceSlackConnection(account: {
 	id: string;
 	accountId: string;
 }): Promise<void> {
-	await db.$transaction(async (tx) => {
+	await db.transaction(async (tx) => {
 		await lockIdempotencyKey(tx, SLACK_CONNECTION.locks.connection);
 
-		await tx.account.deleteMany({
-			where: { providerId: SLACK_PROVIDER_ID, id: { not: account.id } },
-		});
+		await tx
+			.delete(accountTable)
+			.where(
+				and(
+					eq(accountTable.providerId, SLACK_PROVIDER_ID),
+					ne(accountTable.id, account.id),
+				),
+			);
 
-		const install = await tx.slackInstallation.findUnique({
-			where: { installerId: account.accountId },
-		});
+		const [install] = await tx
+			.delete(slackInstallation)
+			.where(eq(slackInstallation.installerId, account.accountId))
+			.returning();
 		if (!install) return;
 
-		await tx.slackInstallation.delete({
-			where: { installerId: account.accountId },
-		});
-
-		await tx.slackWorkspaceGrant.deleteMany({
-			where: { teamId: { not: install.teamId } },
-		});
+		await tx
+			.delete(slackWorkspaceGrant)
+			.where(ne(slackWorkspaceGrant.teamId, install.teamId));
 
 		if (!install.userToken) return;
 
@@ -57,20 +70,20 @@ export async function replaceSlackConnection(account: {
 			userScopes: install.userScopes,
 		};
 
-		await tx.slackWorkspaceGrant.upsert({
-			where: { teamId: install.teamId },
-			create: { teamId: install.teamId, ...grant },
-			update: grant,
-		});
+		await tx
+			.insert(slackWorkspaceGrant)
+			.values({ teamId: install.teamId, ...grant })
+			.onConflictDoUpdate({ target: slackWorkspaceGrant.teamId, set: grant });
 	});
 }
 
 async function forgetStaleInstalls(): Promise<void> {
-	await db.slackInstallation.deleteMany({
-		where: {
-			createdAt: {
-				lt: new Date(Date.now() - SLACK_CONNECTION.install.staleMs),
-			},
-		},
-	});
+	await db
+		.delete(slackInstallation)
+		.where(
+			lt(
+				slackInstallation.createdAt,
+				new Date(Date.now() - SLACK_CONNECTION.install.staleMs),
+			),
+		);
 }

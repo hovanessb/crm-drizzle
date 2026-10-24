@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import { and, db, endsWith, eq, member, startsWith, user } from "@crm/db";
 import { ensureWorkspaceMembership, WORKSPACE_ID } from "../src/organization";
 
 const suffix = process.env.TEST_RUN_ID ?? "organization-spec";
@@ -10,40 +10,40 @@ let firstId: string;
 let secondId: string;
 
 const seedUser = async (label: string, createdAt: Date): Promise<string> => {
-	const user = await db.user.create({
-		data: {
+	const [row] = await db
+		.insert(user)
+		.values({
 			id: `${suffix}-${label}`,
 			name: label,
 			email: emailOf(label),
 			createdAt,
 			updatedAt: createdAt,
-		},
-		select: { id: true },
-	});
+		})
+		.returning({ id: user.id });
 
-	return user.id;
+	if (!row) throw new Error(`Could not seed ${label}.`);
+	return row.id;
 };
 
 const roleOf = async (userId: string): Promise<string | null> => {
-	const member = await db.member.findUnique({
-		where: { organizationId_userId: { organizationId: WORKSPACE_ID, userId } },
-		select: { role: true },
-	});
+	const [row] = await db
+		.select({ role: member.role })
+		.from(member)
+		.where(
+			and(eq(member.organizationId, WORKSPACE_ID), eq(member.userId, userId)),
+		);
 
-	return member?.role ?? null;
+	return row?.role ?? null;
 };
 
 const clear = async () => {
-	await db.member.deleteMany({
-		where: { userId: { startsWith: `${suffix}-` } },
-	});
-	await db.user.deleteMany({
-		where: { email: { endsWith: `.${suffix}@example.test` } },
-	});
+	await db.delete(member).where(startsWith(member.userId, `${suffix}-`));
+	await db.delete(user).where(endsWith(user.email, `.${suffix}@example.test`));
 
-	const strangers = await db.member.count({
-		where: { organizationId: WORKSPACE_ID },
-	});
+	const strangers = await db.$count(
+		member,
+		eq(member.organizationId, WORKSPACE_ID),
+	);
 
 	if (strangers > 0) {
 		throw new Error(
@@ -73,22 +73,28 @@ describe("ensureWorkspaceMembership", () => {
 	it("is idempotent, so signing in again neither duplicates nor re-roles", async () => {
 		await ensureWorkspaceMembership(secondId);
 
-		await db.member.update({
-			where: {
-				organizationId_userId: {
-					organizationId: WORKSPACE_ID,
-					userId: secondId,
-				},
-			},
-			data: { role: "admin" },
-		});
+		await db
+			.update(member)
+			.set({ role: "admin" })
+			.where(
+				and(
+					eq(member.organizationId, WORKSPACE_ID),
+					eq(member.userId, secondId),
+				),
+			);
 
 		await ensureWorkspaceMembership(secondId);
 		await ensureWorkspaceMembership(secondId);
 
-		const rows = await db.member.findMany({
-			where: { organizationId: WORKSPACE_ID, userId: secondId },
-		});
+		const rows = await db
+			.select()
+			.from(member)
+			.where(
+				and(
+					eq(member.organizationId, WORKSPACE_ID),
+					eq(member.userId, secondId),
+				),
+			);
 
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.role).toBe("admin");
@@ -113,9 +119,10 @@ describe("ensureWorkspaceMembership", () => {
 
 		expect(await roleOf(firstId)).toBe("owner");
 
-		const owners = await db.member.count({
-			where: { organizationId: WORKSPACE_ID, role: "owner" },
-		});
+		const owners = await db.$count(
+			member,
+			and(eq(member.organizationId, WORKSPACE_ID), eq(member.role, "owner")),
+		);
 
 		expect(owners).toBe(1);
 	});

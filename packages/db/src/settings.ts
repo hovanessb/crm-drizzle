@@ -1,11 +1,33 @@
-import type { Db } from "./client";
+import { eq } from "drizzle-orm";
+import type { Executor } from "./client";
 import {
 	DEFAULT_REPORTING_CURRENCY,
 	isCurrencyCode,
 	normalizeCurrency,
 } from "./currency";
+import type { NewAppSetting } from "./schema/models";
+import { appSetting } from "./schema/schema";
 
 export const SETTINGS_ID = "app";
+
+async function readSettings(db: Executor) {
+	const [row] = await db
+		.select()
+		.from(appSetting)
+		.where(eq(appSetting.id, SETTINGS_ID))
+		.limit(1);
+	return row;
+}
+
+async function writeSettings(
+	db: Executor,
+	fields: Omit<Partial<NewAppSetting>, "id">,
+): Promise<void> {
+	await db
+		.insert(appSetting)
+		.values({ id: SETTINGS_ID, ...fields })
+		.onConflictDoUpdate({ target: appSetting.id, set: fields });
+}
 
 export const DEFAULT_AGENT_MODEL = {
 	id: "zai/glm-5.2-fast",
@@ -18,11 +40,8 @@ export interface AgentModelSetting {
 	isDefault: boolean;
 }
 
-export async function readAgentModel(db: Db): Promise<AgentModelSetting> {
-	const row = await db.appSetting.findUnique({
-		where: { id: SETTINGS_ID },
-		select: { agentModelId: true, agentModelContextWindow: true },
-	});
+export async function readAgentModel(db: Executor): Promise<AgentModelSetting> {
+	const row = await readSettings(db);
 
 	if (!row?.agentModelId) {
 		return { ...DEFAULT_AGENT_MODEL, isDefault: true };
@@ -37,7 +56,7 @@ export async function readAgentModel(db: Db): Promise<AgentModelSetting> {
 }
 
 export async function writeAgentModel(
-	db: Db,
+	db: Executor,
 	model: { id: string; contextWindowTokens: number } | null,
 ): Promise<void> {
 	const fields = {
@@ -45,41 +64,30 @@ export async function writeAgentModel(
 		agentModelContextWindow: model?.contextWindowTokens ?? null,
 	};
 
-	await db.appSetting.upsert({
-		where: { id: SETTINGS_ID },
-		create: { id: SETTINGS_ID, ...fields },
-		update: fields,
-	});
+	await writeSettings(db, fields);
 }
 
 export const CONTEXT_DEV_SIGNUP_URL = "https://link.context.dev/crm";
 
 export const CONTEXT_DEV_DISCOUNT_CODE = "CRM";
 
-export async function readContextDevKey(db: Db): Promise<string | null> {
-	const row = await db.appSetting.findUnique({
-		where: { id: SETTINGS_ID },
-		select: { contextDevApiKey: true },
-	});
+export async function readContextDevKey(db: Executor): Promise<string | null> {
+	const row = await readSettings(db);
 
 	return row?.contextDevApiKey?.trim() || null;
 }
 
-export async function writeContextDevKey(db: Db, key: string): Promise<void> {
+export async function writeContextDevKey(
+	db: Executor,
+	key: string,
+): Promise<void> {
 	const contextDevApiKey = key.trim();
 
-	await db.appSetting.upsert({
-		where: { id: SETTINGS_ID },
-		create: { id: SETTINGS_ID, contextDevApiKey },
-		update: { contextDevApiKey },
-	});
+	await writeSettings(db, { contextDevApiKey });
 }
 
-export async function readReportingCurrency(db: Db): Promise<string> {
-	const row = await db.appSetting.findUnique({
-		where: { id: SETTINGS_ID },
-		select: { reportingCurrency: true },
-	});
+export async function readReportingCurrency(db: Executor): Promise<string> {
+	const row = await readSettings(db);
 
 	const stored = normalizeCurrency(row?.reportingCurrency);
 
@@ -87,38 +95,27 @@ export async function readReportingCurrency(db: Db): Promise<string> {
 }
 
 export async function writeReportingCurrency(
-	db: Db,
+	db: Executor,
 	code: string,
 ): Promise<string> {
 	const reportingCurrency = normalizeCurrency(code);
 
-	await db.appSetting.upsert({
-		where: { id: SETTINGS_ID },
-		create: { id: SETTINGS_ID, reportingCurrency },
-		update: { reportingCurrency },
-	});
+	await writeSettings(db, { reportingCurrency });
 
 	return reportingCurrency;
 }
 
-export async function readRatesRefreshedAt(db: Db): Promise<Date | null> {
-	const row = await db.appSetting.findUnique({
-		where: { id: SETTINGS_ID },
-		select: { ratesRefreshedAt: true },
-	});
+export async function readRatesRefreshedAt(db: Executor): Promise<Date | null> {
+	const row = await readSettings(db);
 
 	return row?.ratesRefreshedAt ?? null;
 }
 
 export async function writeRatesRefreshedAt(
-	db: Db,
+	db: Executor,
 	ratesRefreshedAt: Date,
 ): Promise<void> {
-	await db.appSetting.upsert({
-		where: { id: SETTINGS_ID },
-		create: { id: SETTINGS_ID, ratesRefreshedAt },
-		update: { ratesRefreshedAt },
-	});
+	await writeSettings(db, { ratesRefreshedAt });
 }
 
 export const DEFAULT_ARCHIVE_RETENTION_DAYS = 180;
@@ -127,17 +124,14 @@ export const MIN_ARCHIVE_RETENTION_DAYS = 1;
 
 export const MAX_ARCHIVE_RETENTION_DAYS = 3650;
 
-export async function readArchiveRetentionDays(db: Db): Promise<number> {
-	const row = await db.appSetting.findUnique({
-		where: { id: SETTINGS_ID },
-		select: { archiveRetentionDays: true },
-	});
+export async function readArchiveRetentionDays(db: Executor): Promise<number> {
+	const row = await readSettings(db);
 
 	return row?.archiveRetentionDays ?? DEFAULT_ARCHIVE_RETENTION_DAYS;
 }
 
 export async function writeArchiveRetentionDays(
-	db: Db,
+	db: Executor,
 	days: number,
 ): Promise<number> {
 	const archiveRetentionDays = Math.min(
@@ -145,11 +139,7 @@ export async function writeArchiveRetentionDays(
 		MAX_ARCHIVE_RETENTION_DAYS,
 	);
 
-	await db.appSetting.upsert({
-		where: { id: SETTINGS_ID },
-		create: { id: SETTINGS_ID, archiveRetentionDays },
-		update: { archiveRetentionDays },
-	});
+	await writeSettings(db, { archiveRetentionDays });
 
 	return archiveRetentionDays;
 }

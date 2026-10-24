@@ -1,4 +1,5 @@
-import type { Db } from "./client";
+import { eq } from "drizzle-orm";
+import type { Executor } from "./client";
 import {
 	type JsonObject,
 	type JsonValue,
@@ -6,8 +7,17 @@ import {
 	jsonText,
 	type WorkspaceProfileSections,
 } from "./json";
+import { organization, workspaceProfile } from "./schema/schema";
 
 export const WORKSPACE_ID = "workspace";
+
+const PROFILE_COLUMNS = {
+	website: workspaceProfile.website,
+	narrative: workspaceProfile.narrative,
+	sections: workspaceProfile.sections,
+	sourceUrl: workspaceProfile.sourceUrl,
+	refreshedAt: workspaceProfile.refreshedAt,
+};
 
 export const DEFAULT_WORKSPACE_SLUG = "workspace";
 
@@ -88,18 +98,13 @@ export type WorkspaceIdentity = {
 };
 
 export async function readWorkspaceProfile(
-	db: Db,
+	db: Executor,
 ): Promise<WorkspaceProfile | null> {
-	const row = await db.workspaceProfile.findUnique({
-		where: { id: WORKSPACE_ID },
-		select: {
-			website: true,
-			narrative: true,
-			sections: true,
-			sourceUrl: true,
-			refreshedAt: true,
-		},
-	});
+	const [row] = await db
+		.select(PROFILE_COLUMNS)
+		.from(workspaceProfile)
+		.where(eq(workspaceProfile.id, WORKSPACE_ID))
+		.limit(1);
 
 	if (!row) return null;
 
@@ -137,13 +142,15 @@ export function profileOf(
 }
 
 export async function readWorkspaceIdentity(
-	db: Db,
+	db: Executor,
 ): Promise<WorkspaceIdentity | null> {
 	const [workspace, profile] = await Promise.all([
-		db.organization.findUnique({
-			where: { id: WORKSPACE_ID },
-			select: { name: true, website: true },
-		}),
+		db
+			.select({ name: organization.name, website: organization.website })
+			.from(organization)
+			.where(eq(organization.id, WORKSPACE_ID))
+			.limit(1)
+			.then((rows) => rows[0]),
 		readWorkspaceProfile(db),
 	]);
 
@@ -157,7 +164,7 @@ export async function readWorkspaceIdentity(
 }
 
 export async function writeWorkspaceProfile(
-	db: Db,
+	db: Executor,
 	input: {
 		website: string;
 		narrative: string;
@@ -175,18 +182,13 @@ export async function writeWorkspaceProfile(
 		refreshedAt: new Date(),
 	};
 
-	const row = await db.workspaceProfile.upsert({
-		where: { id: WORKSPACE_ID },
-		create: { id: WORKSPACE_ID, ...fields },
-		update: fields,
-		select: {
-			website: true,
-			narrative: true,
-			sections: true,
-			sourceUrl: true,
-			refreshedAt: true,
-		},
-	});
+	const [row] = await db
+		.insert(workspaceProfile)
+		.values({ id: WORKSPACE_ID, ...fields })
+		.onConflictDoUpdate({ target: workspaceProfile.id, set: fields })
+		.returning(PROFILE_COLUMNS);
+
+	if (!row) throw new Error("The workspace profile upsert returned no row.");
 
 	return { ...row, sections: readSections(row.sections) };
 }

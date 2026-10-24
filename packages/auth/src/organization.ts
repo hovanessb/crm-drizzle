@@ -1,4 +1,13 @@
-import { type Db, db } from "@crm/db";
+import {
+	and,
+	asc,
+	db,
+	type Executor,
+	eq,
+	member,
+	organization,
+	user,
+} from "@crm/db";
 import { WORKSPACE_ID, workspaceSlug } from "@crm/db/workspace";
 
 export { WORKSPACE_ID };
@@ -41,63 +50,77 @@ export async function ensureWorkspaceMembership(
 	userId: string,
 ): Promise<string | undefined> {
 	try {
-		return await db.$transaction(async (tx) => {
-			const workspace = await tx.organization.upsert({
-				where: { id: WORKSPACE_ID },
-				create: {
+		return await db.transaction(async (tx) => {
+			await tx
+				.insert(organization)
+				.values({
 					id: WORKSPACE_ID,
 					name: DEFAULT_WORKSPACE_NAME,
 					slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
 					createdAt: new Date(),
-				},
-				update: {},
-				select: { id: true, name: true, slug: true },
-			});
+				})
+				.onConflictDoNothing({ target: organization.id });
+
+			const [workspace] = await tx
+				.select({
+					id: organization.id,
+					name: organization.name,
+					slug: organization.slug,
+				})
+				.from(organization)
+				.where(eq(organization.id, WORKSPACE_ID))
+				.limit(1);
+			if (!workspace)
+				throw new Error(`Workspace ${WORKSPACE_ID} is missing after insert.`);
 
 			const slug = workspaceSlug(workspace.name);
 
 			if (workspace.slug !== slug) {
-				await tx.organization.update({
-					where: { id: workspace.id },
-					data: { slug },
-				});
+				await tx
+					.update(organization)
+					.set({ slug })
+					.where(eq(organization.id, workspace.id));
 			}
 
-			const enrolled = await tx.member.count({
-				where: { organizationId: workspace.id },
-			});
+			const enrolled = await tx.$count(
+				member,
+				eq(member.organizationId, workspace.id),
+			);
 
 			if (enrolled === 0) {
-				const existing = await tx.user.findMany({
-					select: { id: true },
-					orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-				});
+				const existing = await tx
+					.select({ id: user.id })
+					.from(user)
+					.orderBy(asc(user.createdAt), asc(user.id));
 
-				await tx.member.createMany({
-					data: existing.map((user, index) => ({
-						id: crypto.randomUUID(),
-						organizationId: workspace.id,
-						userId: user.id,
-						role: index === 0 ? "owner" : "member",
-						createdAt: new Date(),
-					})),
-					skipDuplicates: true,
-				});
+				if (existing.length > 0) {
+					await tx
+						.insert(member)
+						.values(
+							existing.map((row, index) => ({
+								id: crypto.randomUUID(),
+								organizationId: workspace.id,
+								userId: row.id,
+								role: index === 0 ? "owner" : "member",
+								createdAt: new Date(),
+							})),
+						)
+						.onConflictDoNothing();
+				}
 			}
 
-			await tx.member.upsert({
-				where: {
-					organizationId_userId: { organizationId: workspace.id, userId },
-				},
-				create: {
+			await tx
+				.insert(member)
+				.values({
 					id: crypto.randomUUID(),
 					organizationId: workspace.id,
 					userId,
 					role: "member",
 					createdAt: new Date(),
-				},
-				update: {},
-			});
+				})
+				.onConflictDoNothing({
+					target: [member.organizationId, member.userId],
+				});
 
 			return workspace.id;
 		});
@@ -114,16 +137,19 @@ export function toWorkspaceRole(value: string): WorkspaceRole {
 	return isWorkspaceRole(value) ? value : "member";
 }
 
-export type WorkspaceMemberReader = Pick<Db, "member">;
+export type WorkspaceMemberReader = Executor;
 
 export async function workspaceRoleOf(
 	userId: string,
 	client: WorkspaceMemberReader = db,
 ): Promise<WorkspaceRole | null> {
-	const member = await client.member.findUnique({
-		where: { organizationId_userId: { organizationId: WORKSPACE_ID, userId } },
-		select: { role: true },
-	});
+	const [row] = await client
+		.select({ role: member.role })
+		.from(member)
+		.where(
+			and(eq(member.organizationId, WORKSPACE_ID), eq(member.userId, userId)),
+		)
+		.limit(1);
 
-	return member ? toWorkspaceRole(member.role) : null;
+	return row ? toWorkspaceRole(row.role) : null;
 }

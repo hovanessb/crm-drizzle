@@ -1,6 +1,8 @@
+import { and, eq, gt, isNull, or } from "drizzle-orm";
 import { PRIORITY } from "./agent-tasks";
 import { db } from "./client";
 import { lockIdempotencyKey } from "./idempotency";
+import { agentTask } from "./schema/schema";
 
 const MINUTE_MS = 60_000;
 
@@ -16,26 +18,27 @@ export async function queueSlackInventorySync(reason: string): Promise<void> {
 	const since = new Date(Date.now() - SLACK_INVENTORY.throttleMs);
 
 	try {
-		await db.$transaction(async (tx) => {
+		await db.transaction(async (tx) => {
 			await lockIdempotencyKey(tx, SLACK_INVENTORY.lock);
 
-			const recent = await tx.agentTask.findFirst({
-				where: {
-					kind: SLACK_INVENTORY.kind,
-					OR: [{ finishedAt: null }, { createdAt: { gt: since } }],
-				},
-				select: { id: true },
-			});
+			const [recent] = await tx
+				.select({ id: agentTask.id })
+				.from(agentTask)
+				.where(
+					and(
+						eq(agentTask.kind, SLACK_INVENTORY.kind),
+						or(isNull(agentTask.finishedAt), gt(agentTask.createdAt, since)),
+					),
+				)
+				.limit(1);
 			if (recent) return;
 
-			await tx.agentTask.create({
-				data: {
-					kind: SLACK_INVENTORY.kind,
-					reason,
-					priority: SLACK_INVENTORY.priority,
-					budget: SLACK_INVENTORY.budget,
-					dueAt: new Date(),
-				},
+			await tx.insert(agentTask).values({
+				kind: SLACK_INVENTORY.kind,
+				reason,
+				priority: SLACK_INVENTORY.priority,
+				budget: SLACK_INVENTORY.budget,
+				dueAt: new Date(),
 			});
 		});
 	} catch {

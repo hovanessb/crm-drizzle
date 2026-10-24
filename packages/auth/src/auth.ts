@@ -1,9 +1,10 @@
 import { apiKey } from "@better-auth/api-key";
 import { sso } from "@better-auth/sso";
-import { db } from "@crm/db";
+import { db, eq, user as userTable } from "@crm/db";
+import * as schema from "@crm/db/schema";
 import { schemas } from "@crm/validation";
 import { type BetterAuthOptions, betterAuth } from "better-auth";
-import { prismaAdapter } from "better-auth/adapters/prisma";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { APIError } from "better-auth/api";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { organization } from "better-auth/plugins/organization";
@@ -74,8 +75,9 @@ export const auth = betterAuth({
 	appName: "CRM",
 	baseURL: env.apiUrl,
 
-	database: prismaAdapter(db, {
-		provider: "postgresql",
+	database: drizzleAdapter(db, {
+		provider: "pg",
+		schema,
 	}),
 
 	emailAndPassword: {
@@ -292,10 +294,11 @@ export const auth = betterAuth({
 				},
 
 				after: async (session) => {
-					const user = await db.user.findUnique({
-						where: { id: session.userId },
-						select: { id: true, email: true },
-					});
+					const [user] = await db
+						.select({ id: userTable.id, email: userTable.email })
+						.from(userTable)
+						.where(eq(userTable.id, session.userId))
+						.limit(1);
 
 					if (user) await notifySignedIn(user);
 				},

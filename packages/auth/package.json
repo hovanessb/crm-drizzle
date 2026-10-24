@@ -22,7 +22,7 @@
 		"./workspace": "./src/workspace.ts"
 	},
 	"scripts": {
-		"auth:generate": "better-auth generate --config src/auth.ts --output ../db/prisma/schema.prisma --y",
+		"auth:generate": "better-auth generate --config src/auth.ts --output ../db/drizzle/auth-schema.generated.ts --y",
 		"check-types": "tsc --noEmit",
 		"lint": "biome check .",
 		"test": "bun test",

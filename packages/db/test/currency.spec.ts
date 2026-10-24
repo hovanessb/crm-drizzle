@@ -9,11 +9,11 @@ import {
 	normalizeCurrency,
 } from "../src/currency";
 import { applyRate, type ResolvedRate, resolveRate } from "../src/fx";
-import { Prisma } from "../src/generated/prisma/client";
-import { RateSource } from "../src/generated/prisma/enums";
+import { Decimal } from "decimal.js";
+import { RateSource } from "../src/schema/enums";
 
 type Row = {
-	rate: Prisma.Decimal;
+	rate: Decimal;
 	asOf: Date;
 	source: RateSource;
 	provider: string | null;
@@ -25,12 +25,14 @@ function fakeDb(rows: Row[]): FakeDb {
 	const state = { calls: 0 };
 
 	const db = {
-		exchangeRate: {
-			findMany: async () => {
-				state.calls += 1;
-				return rows;
-			},
-		},
+		select: () => ({
+			from: () => ({
+				where: async () => {
+					state.calls += 1;
+					return rows;
+				},
+			}),
+		}),
 	} as unknown as Db;
 
 	return {
@@ -47,7 +49,7 @@ function row(
 	provider: string | null = null,
 ): Row {
 	return {
-		rate: new Prisma.Decimal(rate),
+		rate: new Decimal(rate),
 		asOf: new Date("2026-08-01T00:00:00.000Z"),
 		source,
 		provider,
@@ -165,27 +167,27 @@ describe("resolveRate", () => {
 
 describe("applyRate", () => {
 	const rate = (value: string): ResolvedRate => ({
-		rate: new Prisma.Decimal(value),
+		rate: new Decimal(value),
 		asOf: new Date("2026-08-01T00:00:00.000Z"),
 		origin: "FETCHED",
 		provider: null,
 	});
 
 	it("converts into the reporting currency", () => {
-		const converted = applyRate(new Prisma.Decimal(1000), rate("1.09"), "USD");
+		const converted = applyRate(new Decimal(1000), rate("1.09"), "USD");
 		expect(converted.baseAmount.toNumber()).toBe(1090);
 	});
 
 	it("rounds to the reporting currency's own decimals, not to two", () => {
-		const yen = applyRate(new Prisma.Decimal(100), rate("150.555"), "JPY");
+		const yen = applyRate(new Decimal(100), rate("150.555"), "JPY");
 		expect(yen.baseAmount.decimalPlaces()).toBe(0);
 
-		const dollars = applyRate(new Prisma.Decimal(1000), rate("0.0067"), "USD");
+		const dollars = applyRate(new Decimal(1000), rate("0.0067"), "USD");
 		expect(dollars.baseAmount.toNumber()).toBe(6.7);
 	});
 
 	it("carries the rate and its date onto the record, so a total is reproducible", () => {
-		const converted = applyRate(new Prisma.Decimal(1), rate("1.23"), "USD");
+		const converted = applyRate(new Decimal(1), rate("1.23"), "USD");
 		expect(converted.fxRate.toNumber()).toBe(1.23);
 		expect(converted.fxRateAt.toISOString()).toBe("2026-08-01T00:00:00.000Z");
 		expect(converted.origin).toBe("FETCHED");

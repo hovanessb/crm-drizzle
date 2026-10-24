@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { and, db, eq, inArray, member } from "@crm/db";
 import type { JsonValue } from "@crm/db/json";
 import {
 	APIError,
@@ -39,12 +39,13 @@ export const slackConnectGuard = createAuthMiddleware(async (ctx) => {
 
 	const [role, managers] = await Promise.all([
 		workspaceRoleOf(session.user.id),
-		db.member.count({
-			where: {
-				organizationId: WORKSPACE_ID,
-				role: { in: [...CONNECT_MANAGER_ROLES] },
-			},
-		}),
+		db.$count(
+			member,
+			and(
+				eq(member.organizationId, WORKSPACE_ID),
+				inArray(member.role, [...CONNECT_MANAGER_ROLES]),
+			),
+		),
 	]);
 
 	if (!role) {

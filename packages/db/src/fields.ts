@@ -1,3 +1,6 @@
+import { Decimal } from "decimal.js";
+import { and, eq, inArray } from "drizzle-orm";
+import type { Executor } from "./client";
 import {
 	columnFor,
 	FieldValueError,
@@ -6,13 +9,14 @@ import {
 	recordColumn,
 	typeLabel,
 } from "./fields-shape";
-import { Prisma } from "./generated/prisma/client";
-import type { FieldEntity, FieldType } from "./generated/prisma/enums";
+import type { FieldEntity, FieldType } from "./schema/enums";
 import type {
-	FieldDefinitionModel,
-	FieldOptionModel,
-	FieldValueModel,
-} from "./generated/prisma/models";
+	FieldDefinition as FieldDefinitionModel,
+	FieldOption as FieldOptionModel,
+	FieldValue as FieldValueModel,
+	NewFieldValue,
+} from "./schema/models";
+import { fieldValue, user } from "./schema/schema";
 
 export * from "./fields-shape";
 
@@ -141,7 +145,7 @@ export function coerceValue(
 				);
 			}
 
-			return { number: new Prisma.Decimal(parsed) };
+			return { number: new Decimal(parsed) };
 		}
 
 		case "DATE": {
@@ -233,25 +237,8 @@ export function attachValues(
 		});
 }
 
-export type FieldWriter = {
-	fieldValue: {
-		deleteMany(args: { where: Record<string, unknown> }): Promise<unknown>;
-		upsert(args: {
-			where: Record<string, unknown>;
-			create: Record<string, unknown>;
-			update: Record<string, unknown>;
-		}): Promise<unknown>;
-	};
-	user: {
-		findMany(args: {
-			where: { id: { in: string[] } };
-			select: { id: true };
-		}): Promise<{ id: string }[]>;
-	};
-};
-
 export async function writeValues(
-	tx: FieldWriter,
+	tx: Executor,
 	entity: FieldEntity,
 	recordId: string,
 	definitions: FieldDefinitionWithOptions[],
@@ -280,19 +267,25 @@ export async function writeValues(
 
 	for (const { definition, data, stored } of writes) {
 		if (stored === null || stored === undefined) {
-			await tx.fieldValue.deleteMany({
-				where: { fieldId: definition.id, [column]: recordId },
-			});
+			await tx
+				.delete(fieldValue)
+				.where(
+					and(
+						eq(fieldValue.fieldId, definition.id),
+						eq(fieldValue[column], recordId),
+					),
+				);
 			continue;
 		}
 
-		await tx.fieldValue.upsert({
-			where: {
-				[`fieldId_${column}`]: { fieldId: definition.id, [column]: recordId },
-			},
-			create: { fieldId: definition.id, [column]: recordId, ...data },
-			update: data,
-		});
+		const values = data as Partial<NewFieldValue>;
+		await tx
+			.insert(fieldValue)
+			.values({ fieldId: definition.id, [column]: recordId, ...values })
+			.onConflictDoUpdate({
+				target: [fieldValue.fieldId, fieldValue[column]],
+				set: values,
+			});
 	}
 }
 
@@ -302,7 +295,7 @@ type PendingWrite = {
 };
 
 async function assertUsersExist(
-	tx: FieldWriter,
+	tx: Executor,
 	writes: PendingWrite[],
 ): Promise<void> {
 	const wanted = writes.filter(
@@ -312,10 +305,10 @@ async function assertUsersExist(
 
 	if (wanted.length === 0) return;
 
-	const known = await tx.user.findMany({
-		where: { id: { in: [...new Set(wanted.map((write) => write.stored))] } },
-		select: { id: true },
-	});
+	const known = await tx
+		.select({ id: user.id })
+		.from(user)
+		.where(inArray(user.id, [...new Set(wanted.map((write) => write.stored))]));
 
 	const found = new Set(known.map((row) => row.id));
 

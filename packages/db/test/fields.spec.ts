@@ -10,7 +10,7 @@ import {
 	recordColumn,
 	serializeField,
 } from "../src/fields";
-import type { FieldValueModel } from "../src/generated/prisma/models";
+import type { FieldValue as FieldValueModel } from "../src/schema/models";
 
 function definition(
 	over: Partial<FieldDefinitionWithOptions> = {},

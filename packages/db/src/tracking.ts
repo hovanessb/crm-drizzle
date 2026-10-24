@@ -1,5 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { Db } from "./client";
+import { asc, eq } from "drizzle-orm";
+import type { Executor } from "./client";
+import { appSetting, trackedDomain } from "./schema/schema";
 import { SETTINGS_ID } from "./settings";
 
 export const SITE_ID_PREFIX = "cmp_";
@@ -252,26 +254,28 @@ export function dedupeKey(parts: {
 }
 
 export async function readTrackingConfig(
-	db: Db,
+	db: Executor,
 ): Promise<TrackingConfig | null> {
 	const [settings, domains] = await Promise.all([
-		db.appSetting.findUnique({
-			where: { id: SETTINGS_ID },
-			select: {
-				trackingSiteId: true,
-				trackingCrossDomain: true,
-				trackingLimitToDomains: true,
-				trackingCookieSubdomains: true,
-				trackingSecureCookies: true,
-				trackingHonourDnt: true,
-				trackingCookieDays: true,
-				trackingPaused: true,
-			},
-		}),
-		db.trackedDomain.findMany({
-			select: { host: true, scope: true },
-			orderBy: { host: "asc" },
-		}),
+		db
+			.select({
+				trackingSiteId: appSetting.trackingSiteId,
+				trackingCrossDomain: appSetting.trackingCrossDomain,
+				trackingLimitToDomains: appSetting.trackingLimitToDomains,
+				trackingCookieSubdomains: appSetting.trackingCookieSubdomains,
+				trackingSecureCookies: appSetting.trackingSecureCookies,
+				trackingHonourDnt: appSetting.trackingHonourDnt,
+				trackingCookieDays: appSetting.trackingCookieDays,
+				trackingPaused: appSetting.trackingPaused,
+			})
+			.from(appSetting)
+			.where(eq(appSetting.id, SETTINGS_ID))
+			.limit(1)
+			.then((rows) => rows[0]),
+		db
+			.select({ host: trackedDomain.host, scope: trackedDomain.scope })
+			.from(trackedDomain)
+			.orderBy(asc(trackedDomain.host)),
 	]);
 
 	if (!isSiteId(settings?.trackingSiteId)) return null;

@@ -6,10 +6,19 @@ import {
 	expect,
 	it,
 } from "bun:test";
-import { db } from "@crm/db";
+import {
+	db,
+	endsWith,
+	eq,
+	member,
+	organization as organizationTable,
+	session,
+	user,
+} from "@crm/db";
+import * as schema from "@crm/db/schema";
 import { workspaceSlug } from "@crm/db/workspace";
 import { type BetterAuthPlugin, betterAuth } from "better-auth";
-import { prismaAdapter } from "better-auth/adapters/prisma";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { createAuthEndpoint, createAuthMiddleware } from "better-auth/api";
 import { applySetCookies } from "better-auth/cookies";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
@@ -53,7 +62,7 @@ const probe = {
 const guarded = betterAuth({
 	baseURL: BASE_URL,
 	secret: "slack-connect-spec-secret",
-	database: prismaAdapter(db, { provider: "postgresql" }),
+	database: drizzleAdapter(db, { provider: "pg", schema }),
 	emailAndPassword: { enabled: false },
 	hooks: { before: slackConnectGuard },
 	plugins: [probe],
@@ -80,15 +89,13 @@ const sessionCookie = async (userId: string): Promise<string> => {
 	const context = await guarded.$context;
 	const token = idOf(`${userId}-token`);
 
-	await db.session.create({
-		data: {
-			id: idOf(`${userId}-session`),
-			token,
-			userId,
-			expiresAt: new Date(Date.now() + SESSION_MS),
-			createdAt: new Date(),
-			updatedAt: new Date(),
-		},
+	await db.insert(session).values({
+		id: idOf(`${userId}-session`),
+		token,
+		userId,
+		expiresAt: new Date(Date.now() + SESSION_MS),
+		createdAt: new Date(),
+		updatedAt: new Date(),
 	});
 
 	const cookie = context.authCookies.sessionToken;
@@ -108,30 +115,27 @@ const seat = async (
 ): Promise<string> => {
 	const now = new Date();
 
-	const user = await db.user.create({
-		data: {
-			id: idOf(label),
-			name: label,
-			email: `${label}${EMAIL_SUFFIX}`,
-			createdAt: now,
-			updatedAt: now,
-		},
-		select: { id: true },
+	const userId = idOf(label);
+
+	await db.insert(user).values({
+		id: userId,
+		name: label,
+		email: `${label}${EMAIL_SUFFIX}`,
+		createdAt: now,
+		updatedAt: now,
 	});
 
 	if (role) {
-		await db.member.create({
-			data: {
-				id: idOf(`${label}-member`),
-				organizationId: WORKSPACE_ID,
-				userId: user.id,
-				role,
-				createdAt: now,
-			},
+		await db.insert(member).values({
+			id: idOf(`${label}-member`),
+			organizationId: WORKSPACE_ID,
+			userId,
+			role,
+			createdAt: now,
 		});
 	}
 
-	return sessionCookie(user.id);
+	return sessionCookie(userId);
 };
 
 const startConnect = (
@@ -167,36 +171,46 @@ const arrived = async (response: Response): Promise<boolean> =>
 	arrival.safeParse(await response.json()).success;
 
 const clear = async () => {
-	await db.member.deleteMany({ where: { organizationId: WORKSPACE_ID } });
-	await db.organization.deleteMany({ where: { id: WORKSPACE_ID } });
-	await db.user.deleteMany({ where: { email: { endsWith: EMAIL_SUFFIX } } });
+	await db.delete(member).where(eq(member.organizationId, WORKSPACE_ID));
+	await db
+		.delete(organizationTable)
+		.where(eq(organizationTable.id, WORKSPACE_ID));
+	await db.delete(user).where(endsWith(user.email, EMAIL_SUFFIX));
 };
 
 beforeAll(async () => {
-	const organization = await db.organization.findUnique({
-		where: { id: WORKSPACE_ID },
-		select: { name: true, slug: true, website: true, metadata: true },
-	});
+	const [organization] = await db
+		.select({
+			name: organizationTable.name,
+			slug: organizationTable.slug,
+			website: organizationTable.website,
+			metadata: organizationTable.metadata,
+		})
+		.from(organizationTable)
+		.where(eq(organizationTable.id, WORKSPACE_ID));
 
 	snapshot = {
-		organization,
-		members: await db.member.findMany({
-			where: { organizationId: WORKSPACE_ID },
-			select: { id: true, userId: true, role: true, createdAt: true },
-		}),
+		organization: organization ?? null,
+		members: await db
+			.select({
+				id: member.id,
+				userId: member.userId,
+				role: member.role,
+				createdAt: member.createdAt,
+			})
+			.from(member)
+			.where(eq(member.organizationId, WORKSPACE_ID)),
 	};
 });
 
 beforeEach(async () => {
 	await clear();
 
-	await db.organization.create({
-		data: {
-			id: WORKSPACE_ID,
-			name: DEFAULT_WORKSPACE_NAME,
-			slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
-			createdAt: new Date(),
-		},
+	await db.insert(organizationTable).values({
+		id: WORKSPACE_ID,
+		name: DEFAULT_WORKSPACE_NAME,
+		slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
+		createdAt: new Date(),
 	});
 });
 
@@ -204,20 +218,20 @@ afterAll(async () => {
 	await clear();
 
 	if (snapshot.organization) {
-		await db.organization.create({
-			data: {
-				id: WORKSPACE_ID,
-				createdAt: new Date(),
-				...snapshot.organization,
-			},
+		await db.insert(organizationTable).values({
+			id: WORKSPACE_ID,
+			createdAt: new Date(),
+			...snapshot.organization,
 		});
 
-		await db.member.createMany({
-			data: snapshot.members.map((member) => ({
-				...member,
-				organizationId: WORKSPACE_ID,
-			})),
-		});
+		if (snapshot.members.length > 0) {
+			await db.insert(member).values(
+				snapshot.members.map((row) => ({
+					...row,
+					organizationId: WORKSPACE_ID,
+				})),
+			);
+		}
 	}
 });
 

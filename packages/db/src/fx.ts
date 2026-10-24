@@ -1,29 +1,31 @@
-import type { Db } from "./client";
+import { Decimal } from "decimal.js";
+import { and, eq } from "drizzle-orm";
+import type { Executor } from "./client";
 import { minorUnitsOf, normalizeCurrency } from "./currency";
-import { Prisma } from "./generated/prisma/client";
-import { RateSource } from "./generated/prisma/enums";
+import { RateSource } from "./schema/enums";
+import { exchangeRate } from "./schema/schema";
 
 export type RateOrigin = "IDENTITY" | "MANUAL" | "FETCHED";
 
 export interface ResolvedRate {
-	rate: Prisma.Decimal;
+	rate: Decimal;
 	asOf: Date;
 	origin: RateOrigin;
 	provider: string | null;
 }
 
 export interface Conversion {
-	baseAmount: Prisma.Decimal;
+	baseAmount: Decimal;
 	baseCurrency: string;
-	fxRate: Prisma.Decimal;
+	fxRate: Decimal;
 	fxRateAt: Date;
 	origin: RateOrigin;
 }
 
-export const ONE = new Prisma.Decimal(1);
+export const ONE = new Decimal(1);
 
 export async function resolveRate(
-	db: Db,
+	db: Executor,
 	base: string,
 	quote: string,
 	now: Date = new Date(),
@@ -37,10 +39,20 @@ export async function resolveRate(
 		return { rate: ONE, asOf: now, origin: "IDENTITY", provider: null };
 	}
 
-	const rows = await db.exchangeRate.findMany({
-		where: { baseCurrency, quoteCurrency },
-		select: { rate: true, asOf: true, source: true, provider: true },
-	});
+	const rows = await db
+		.select({
+			rate: exchangeRate.rate,
+			asOf: exchangeRate.asOf,
+			source: exchangeRate.source,
+			provider: exchangeRate.provider,
+		})
+		.from(exchangeRate)
+		.where(
+			and(
+				eq(exchangeRate.baseCurrency, baseCurrency),
+				eq(exchangeRate.quoteCurrency, quoteCurrency),
+			),
+		);
 
 	const manual = rows.find((row) => row.source === RateSource.MANUAL);
 	const chosen =
@@ -57,7 +69,7 @@ export async function resolveRate(
 }
 
 export function applyRate(
-	amount: Prisma.Decimal,
+	amount: Decimal,
 	rate: ResolvedRate,
 	base: string,
 ): Conversion {
@@ -75,8 +87,8 @@ export function applyRate(
 }
 
 export async function convertToBase(
-	db: Db,
-	amount: Prisma.Decimal | null,
+	db: Executor,
+	amount: Decimal | null,
 	from: string,
 	base: string,
 	now: Date = new Date(),

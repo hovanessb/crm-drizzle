@@ -1,8 +1,12 @@
-import type { Prisma } from "./generated/prisma/client";
+import type { JsonObject, JsonValue } from "./schema/json";
 
-export type JsonValue = Prisma.JsonValue;
-
-export type JsonObject = Prisma.JsonObject;
+export type {
+	InputJsonObject,
+	InputJsonValue,
+	JsonArray,
+	JsonObject,
+	JsonValue,
+} from "./schema/json";
 
 export function jsonObject(value: JsonValue | undefined): JsonObject {
 	return isJsonObject(value) ? value : {};

@@ -1,7 +1,11 @@
 import "@crm/env/load";
 
-import { PrismaPg } from "@prisma/adapter-pg";
-import { type Prisma, PrismaClient } from "./generated/prisma/client";
+import type { ExtractTablesWithRelations } from "drizzle-orm";
+import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
+import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import type { PgTransaction } from "drizzle-orm/pg-core";
+import { Pool } from "pg";
+import * as schema from "./schema/schema";
 
 const connectionString =
 	process.env.NODE_ENV === "test" ? testDatabase() : liveDatabase();
@@ -57,18 +61,20 @@ function databaseName(url: string): string {
 	}
 }
 
-export interface PrismaLogRecord {
-	level: Prisma.LogLevel;
+export type DbLogLevel = "query" | "info" | "warn" | "error";
+
+export interface DbLogRecord {
+	level: DbLogLevel;
 	message: string;
 	target: string;
 	durationMs?: number;
 }
 
-export type PrismaLogSink = (record: PrismaLogRecord) => void;
+export type DbLogSink = (record: DbLogRecord) => void;
 
-const consoleSink: PrismaLogSink = ({ level, message, target, durationMs }) => {
+const consoleSink: DbLogSink = ({ level, message, target, durationMs }) => {
 	const suffix = durationMs === undefined ? "" : ` (+${durationMs}ms)`;
-	const line = `[prisma:${level}] ${message}${suffix} [${target}]`;
+	const line = `[db:${level}] ${message}${suffix} [${target}]`;
 
 	if (level === "error") {
 		console.error(line);
@@ -79,55 +85,52 @@ const consoleSink: PrismaLogSink = ({ level, message, target, durationMs }) => {
 	}
 };
 
-let sink: PrismaLogSink = consoleSink;
+let sink: DbLogSink = consoleSink;
 
-export function setPrismaLogSink(next: PrismaLogSink | null): void {
+export function setDbLogSink(next: DbLogSink | null): void {
 	sink = next ?? consoleSink;
 }
 
-const logQueries = process.env.PRISMA_LOG_QUERIES === "true";
+const logQueries = process.env.DB_LOG_QUERIES === "true";
 
-const logDefinitions: Prisma.LogDefinition[] = [
-	{ level: "warn", emit: "event" },
-	{ level: "error", emit: "event" },
-	...(logQueries
-		? ([
-				{ level: "query", emit: "event" },
-				{ level: "info", emit: "event" },
-			] satisfies Prisma.LogDefinition[])
-		: []),
-];
+type Schema = typeof schema;
 
-const createPrismaClient = () => {
-	const client = new PrismaClient({
-		adapter: new PrismaPg({ connectionString }),
-		log: logDefinitions,
+const createDb = () => {
+	const pool = new Pool({ connectionString });
+
+	pool.on("error", (error) => {
+		sink({ level: "error", message: error.message, target: "pg.pool" });
 	});
 
-	client.$on("error", ({ message, target }) => {
-		sink({ level: "error", message, target });
+	return drizzle({
+		client: pool,
+		schema,
+		logger: logQueries
+			? {
+					logQuery(query) {
+						sink({ level: "query", message: query, target: "drizzle" });
+					},
+				}
+			: false,
 	});
-	client.$on("warn", ({ message, target }) => {
-		sink({ level: "warn", message, target });
-	});
-	client.$on("info", ({ message, target }) => {
-		sink({ level: "info", message, target });
-	});
-	client.$on("query", ({ query, duration, target }) => {
-		sink({ level: "query", message: query, target, durationMs: duration });
-	});
-
-	return client;
 };
 
 declare global {
-	var prisma: ReturnType<typeof createPrismaClient> | undefined;
+	var crmDb: (NodePgDatabase<Schema> & { $client: Pool }) | undefined;
 }
 
-export const db = globalThis.prisma ?? createPrismaClient();
+export const db = globalThis.crmDb ?? createDb();
 
 if (process.env.NODE_ENV !== "production") {
-	globalThis.prisma = db;
+	globalThis.crmDb = db;
 }
 
 export type Db = typeof db;
+
+export type Tx = PgTransaction<
+	NodePgQueryResultHKT,
+	Schema,
+	ExtractTablesWithRelations<Schema>
+>;
+
+export type Executor = Db | Tx;

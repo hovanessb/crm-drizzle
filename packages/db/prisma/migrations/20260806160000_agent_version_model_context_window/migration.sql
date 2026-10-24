@@ -1,2 +1,0 @@
-ALTER TABLE "agentVersion"
-ADD COLUMN "modelContextWindowTokens" INTEGER NOT NULL DEFAULT 1000000;

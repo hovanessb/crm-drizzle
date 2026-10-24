@@ -1,52 +1,32 @@
 import { join } from "node:path";
+import { loadRootEnv } from "@crm/env";
+import { schemaHasUnmigratedChanges } from "./check-drift";
+import { databaseUrl, migrateDatabase } from "./migrations";
+
+loadRootEnv();
 
 const directory = join(import.meta.dir, "..");
 
-await run([process.execPath, "scripts/require-local-db.ts", "dev"]);
-const [migration, generation] = await Promise.all([
-	execute([process.execPath, "run", "prisma", "migrate", "deploy"]),
-	execute([process.execPath, "run", "prisma", "generate"]),
-]);
-
-if (migration !== 0) process.exit(migration);
-if (generation !== 0) process.exit(generation);
-
-const drift = await execute([
-	process.execPath,
-	"run",
-	"prisma",
-	"migrate",
-	"diff",
-	"--from-config-datasource",
-	"--to-schema",
-	"prisma/schema.prisma",
-	"--exit-code",
-]);
-
-if (drift === 2) {
-	console.error(
-		"The database and Prisma schema differ. Reconcile the migration history with `bun run db:migrate` before starting dev.",
-	);
-	process.exit(1);
-}
-
-if (drift !== 0) process.exit(drift);
-
-console.log("Database migrations and generated Prisma client are ready.");
-
-async function run(command: string[]): Promise<void> {
-	const exitCode = await execute(command);
-	if (exitCode !== 0) process.exit(exitCode);
-}
-
-async function execute(command: string[]): Promise<number> {
-	const child = Bun.spawn(command, {
+const guard = Bun.spawn(
+	[process.execPath, "scripts/require-local-db.ts", "dev"],
+	{
 		cwd: directory,
 		env: process.env,
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",
-	});
+	},
+);
+const guardCode = await guard.exited;
+if (guardCode !== 0) process.exit(guardCode);
 
-	return child.exited;
+await migrateDatabase(databaseUrl());
+
+if (await schemaHasUnmigratedChanges()) {
+	console.error(
+		"src/schema/schema.ts has changes that no migration covers. Create one with `bun run db:migrate` before starting dev.",
+	);
+	process.exit(1);
 }
+
+console.log("Database migrations are applied and match the Drizzle schema.");
