@@ -170,11 +170,11 @@ A [Turborepo](https://turborepo.dev) monorepo on [Bun](https://bun.com), deploye
 | | |
 | --- | --- |
 | **Agent** | [eve](https://eve.dev) — durable sessions, tools, skills, schedules, sandboxes |
-| **Model** | [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) — no provider SDK, and OIDC on Vercel means no key to manage |
+| **Model** | [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) — OIDC on Vercel means no key to manage. Or a model you serve yourself, such as Gemma through `llama-server` |
 | **Sandbox** | [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) in production, Docker or microsandbox locally |
 | **Front end** | [Next.js](https://nextjs.org) App Router · [shadcn/ui](https://ui.shadcn.com) · [nuqs](https://nuqs.dev) for URL state |
 | **API** | [NestJS](https://nestjs.com) with [nestjs-trpc](https://nestjs-trpc.io) — HTTP, auth, tRPC, mailbox sync |
-| **Data** | [Drizzle](https://orm.drizzle.team) · Postgres ([Neon](https://neon.tech)) · optional Redis ([Upstash](https://upstash.com)) |
+| **Data** | [Drizzle](https://orm.drizzle.team) on `node-postgres` · any Postgres 13 or newer — a local server, Docker or [Neon](https://neon.tech) · optional Redis ([Upstash](https://upstash.com)) |
 | **Auth** | [Better Auth](https://better-auth.com) — Google, Microsoft, or your own IdP; one allow-list |
 | **Files** | [Vercel Blob](https://vercel.com/docs/vercel-blob) — mirrors profile pictures so they survive the source going away |
 | **Tooling** | [Biome](https://biomejs.dev) · TypeScript everywhere |
@@ -214,7 +214,7 @@ Written up where the work happens, not in a style guide:
 You need [Bun](https://bun.com) and Docker.
 
 ```sh
-git clone https://github.com/trycompai/crm.git && cd crm
+git clone https://github.com/hovanessb/crm-drizzle.git && cd crm-drizzle
 cp .env.example .env          # then fill in the values below
 bun install
 
@@ -249,7 +249,13 @@ Open `.env` and set these. Everything else in the file is optional and commented
 offers both buttons, and each rep's mail is read from whichever they signed in with.
 
 `DATABASE_URL` already matches the `docker compose` Postgres, so leave it alone unless
-you brought your own.
+you brought your own. Any PostgreSQL 13 or newer works, including one installed
+directly on the machine: point `DATABASE_URL` at it and run `bun run db:deploy`. The
+app writes every time as UTC, so the server's time zone does not change what is stored.
+
+**The agent needs a model.** Set `AI_GATEWAY_API_KEY` for the AI Gateway, or point it at
+a model you serve yourself — [Running the model yourself](#running-the-model-yourself).
+Without either, the CRM works and every agent session fails.
 
 <details>
 <summary><strong>Getting the Google OAuth client</strong></summary>
@@ -319,6 +325,37 @@ ALLOWED_SIGN_IN="acme.com,contractor@gmail.com"  # …plus one outsider
 ALLOWED_SIGN_IN="you@gmail.com"                  # a one-person install
 ```
 
+## Running the model yourself
+
+The agent runs on any server that speaks the OpenAI chat completions API —
+[`llama-server`](https://github.com/ggml-org/llama.cpp), vLLM or Ollama. No AI Gateway
+key is needed. Start the server with `--jinja`, so the model's chat template formats
+tool calls. Without it, tool calls arrive as plain text and the agent cannot use one
+tool.
+
+```sh
+llama-server -m gemma-4.gguf --jinja --ctx-size 131072 --port 8080
+```
+
+Then set three values in `.env`:
+
+```sh
+LOCAL_MODEL_URL="http://127.0.0.1:8080/v1"
+LOCAL_MODEL_ID="gemma-4"
+LOCAL_MODEL_CONTEXT_TOKENS="131072"   # the same number as --ctx-size
+```
+
+With all three set, `local/gemma-4` is the default model. **Settings → General** lists
+it first, and it works with no internet. A model already chosen there wins over the
+default, so pick **Default** or the local model to switch. `LOCAL_MODEL_API_KEY` is only
+for a server started with `--api-key`. A missing or wrong value turns the local model
+off, and the agent prints why at startup.
+
+A small local model makes more mistakes on long, multi-step work than the default
+model. Building a custom agent is the hardest case. `bun run --filter=agent eval` runs
+the builder against your server.
+[`docs/agent.md`](./docs/agent.md#a-local-model-instead-of-the-gateway) has the details.
+
 ## Configuration
 
 **There is one `.env`, at the root of the repo**, read by all three processes. Real
@@ -332,6 +369,8 @@ short version:
 | | |
 | --- | --- |
 | `API_URL` / `APP_URL` | Where the two halves are served. Only needed off localhost. |
+| `AI_GATEWAY_API_KEY` | The agent's model through the AI Gateway. Not needed on Vercel, or with a local model. |
+| `LOCAL_MODEL_URL` / `LOCAL_MODEL_ID` / `LOCAL_MODEL_CONTEXT_TOKENS` | A model you serve yourself. All three together. |
 | `PERPLEXITY_API_KEY` | Lets the agent search the open web, with citations. |
 | `AGENT_BRIDGE_SECRET` | Lets a rep talk to the agent from a contact's **Agent** tab. |
 | `CHAT_EVENT_ENCRYPTION_KEY` | Encrypts builder chat history. Generate it with `openssl rand -base64 32`. |
@@ -349,7 +388,10 @@ short version:
 | `bun run test` | Run the test suite |
 | `bun run check-types` | `tsc --noEmit` everywhere |
 | `bun run lint` / `format` | [Biome](https://biomejs.dev) |
-| `bun run db:migrate` | Create and apply a migration |
+| `bun run db:migrate` | Create and apply a migration from a change to `packages/db/src/schema/schema.ts` |
+| `bun run db:deploy` | Apply pending migrations — what a server runs after each update |
+| `bun run --filter=@crm/db db:check` | Fail when the schema has changes that no migration covers |
+| `bun run db:test` | Create or rebuild the `crm_test` database the tests use |
 | `bun run db:seed` | Top up the demo pipeline (idempotent) |
 | `bun run db:studio` | Drizzle Studio |
 | `bun run --filter=api trpc:generate` | Regenerate the `AppRouter` type |
@@ -375,6 +417,12 @@ both. Add `http://your-api-host/api/auth/callback/google` — and, if you use Mi
 `http://your-api-host/api/auth/callback/microsoft` — to the provider's
 redirect URIs. Set `CRON_SECRET` and point a scheduler at
 `POST /internal/sync/mailboxes` to keep the mailbox sync running.
+
+**Migrations.** A Vercel production build of the API applies them. On your own server,
+run `bun run db:deploy` after every update, before the new code starts. A database that
+an older, Prisma-based release created needs no manual step: `db:deploy` adopts it when
+it has every Prisma migration, and refuses it otherwise.
+[`packages/db/README.md`](./packages/db/README.md) explains how.
 
 `apps/api/src/generated/server.ts` is committed and `build` must never regenerate it —
 the generator needs a newer GLIBC than most build images have. Regenerate locally and
