@@ -1,4 +1,15 @@
-import { db, type Prisma } from "@crm/db";
+import {
+	agentConversation,
+	agentEvent,
+	and,
+	db,
+	desc,
+	firstRow,
+	type JsonValue,
+	requireRow,
+	startsWith,
+	whereEq,
+} from "@crm/db";
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import { type InputRequested, parse, schemas } from "@crm/validation";
 import type { ChannelEvents } from "eve/channels";
@@ -39,13 +50,16 @@ export async function persistBuilderInputRequest(
 
 	const eventId = `${eventPrefix(conversationId)}${event.turnId}:${event.sequence}:${event.stepIndex}`;
 
-	return db.$transaction(async (tx) => {
+	return db.transaction(async (tx) => {
 		await lockIdempotencyKey(tx, eventId);
 
-		const replay = await tx.agentEvent.findUnique({
-			where: { id: eventId },
-			select: { id: true },
-		});
+		const replay = await firstRow(
+			tx
+				.select({ id: agentEvent.id })
+				.from(agentEvent)
+				.where(whereEq(agentEvent.id, eventId))
+				.limit(1),
+		);
 		if (replay) return false;
 
 		const conversation = await lockBuilderConversation(tx, conversationId);
@@ -53,14 +67,23 @@ export async function persistBuilderInputRequest(
 			return false;
 		}
 
-		const recorded = await tx.agentEvent.findFirst({
-			where: {
-				conversationId: conversation.id,
-				id: { startsWith: eventPrefix(conversation.id) },
-			},
-			orderBy: [{ emittedAt: "desc" }, { id: "desc" }],
-			select: { id: true, data: true, encryptedData: true },
-		});
+		const recorded = await firstRow(
+			tx
+				.select({
+					id: agentEvent.id,
+					data: agentEvent.data,
+					encryptedData: agentEvent.encryptedData,
+				})
+				.from(agentEvent)
+				.where(
+					and(
+						whereEq(agentEvent.conversationId, conversation.id),
+						startsWith(agentEvent.id, eventPrefix(conversation.id)),
+					),
+				)
+				.orderBy(desc(agentEvent.emittedAt), desc(agentEvent.id))
+				.limit(1),
+		);
 		const recordedData = recorded
 			? readBuilderEvent(recorded, {
 					conversationId: conversation.id,
@@ -79,30 +102,36 @@ export async function persistBuilderInputRequest(
 		}
 		if (recorded && !recordedData) return false;
 
-		const storedEvent = storeBuilderEvent(event as Prisma.InputJsonValue, {
+		const storedEvent = storeBuilderEvent(event as JsonValue, {
 			conversationId: conversation.id,
 			eventId,
 		});
 
-		await tx.agentEvent.create({
-			data: {
-				id: eventId,
-				sessionId: conversation.sessionId,
-				conversationId: conversation.id,
-				type: BUILDER_INPUT.eventType,
-				data: storedEvent.data,
-				encryptedData: storedEvent.encryptedData,
-				emittedAt: new Date(),
-			},
-		});
+		await requireRow(
+			tx
+				.insert(agentEvent)
+				.values({
+					id: eventId,
+					sessionId: conversation.sessionId,
+					conversationId: conversation.id,
+					type: BUILDER_INPUT.eventType,
+					data: storedEvent.data,
+					encryptedData: storedEvent.encryptedData,
+					emittedAt: new Date(),
+				})
+				.returning(),
+		);
 
-		await tx.agentConversation.update({
-			where: { id: conversation.id },
-			data: {
-				continuationToken: builderToken(conversation.id),
-				pendingInputRequests: event.requests as Prisma.InputJsonValue,
-			},
-		});
+		await requireRow(
+			tx
+				.update(agentConversation)
+				.set({
+					continuationToken: builderToken(conversation.id),
+					pendingInputRequests: event.requests as JsonValue,
+				})
+				.where(whereEq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
 		return true;
 	});

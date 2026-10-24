@@ -1,5 +1,12 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	agentTask,
+	asc,
+	company as companyTable,
+	db,
+	type Executor,
+	inArray,
+} from "@crm/db";
 import { AgentQueueService } from "../src/agent/agent-queue.service";
 import type {
 	AgentTriggerService,
@@ -26,11 +33,11 @@ const agent = {
 	},
 	withCrmEvents: async <Result>(
 		work: (
-			tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+			tx: Executor,
 			emit: (input: CrmEventInput) => Promise<void>,
 		) => Promise<Result>,
 	) =>
-		db.$transaction((tx) =>
+		db.transaction((tx) =>
 			work(tx, async (input) => {
 				events.push(input);
 			}),
@@ -58,10 +65,10 @@ const companies = new CompaniesService(
 );
 
 async function clean() {
-	await db.agentTask.deleteMany({ where: { companyId: { in: importedIds } } });
-	await db.company.deleteMany({
-		where: { domain: { in: [domain, secondDomain] } },
-	});
+	await db.delete(agentTask).where(inArray(agentTask.companyId, importedIds));
+	await db
+		.delete(companyTable)
+		.where(inArray(companyTable.domain, [domain, secondDomain]));
 }
 
 afterAll(clean);
@@ -84,19 +91,19 @@ describe("importing companies", () => {
 			],
 		});
 
-		const stored = await db.company.findMany({
-			where: { domain: { in: [domain, secondDomain] } },
-			orderBy: { name: "asc" },
-			select: {
-				id: true,
-				name: true,
-				domain: true,
-				website: true,
-				industry: true,
-				source: true,
-				enrichmentStatus: true,
-			},
-		});
+		const stored = await db
+			.select({
+				id: companyTable.id,
+				name: companyTable.name,
+				domain: companyTable.domain,
+				website: companyTable.website,
+				industry: companyTable.industry,
+				source: companyTable.source,
+				enrichmentStatus: companyTable.enrichmentStatus,
+			})
+			.from(companyTable)
+			.where(inArray(companyTable.domain, [domain, secondDomain]))
+			.orderBy(asc(companyTable.name));
 		importedIds.push(...stored.map((company) => company.id));
 		const [first, second] = stored;
 		if (!first || !second) {

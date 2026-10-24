@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Decimal } from "decimal.js";
 import type { Db } from "../src/client";
 import {
 	CURRENCIES,
@@ -9,7 +10,6 @@ import {
 	normalizeCurrency,
 } from "../src/currency";
 import { applyRate, type ResolvedRate, resolveRate } from "../src/fx";
-import { Decimal } from "decimal.js";
 import { RateSource } from "../src/schema/enums";
 
 type Row = {

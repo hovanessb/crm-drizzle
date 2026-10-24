@@ -1,6 +1,6 @@
 import { cpSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { MIGRATIONS_FOLDER } from "./migrations";
 
 const directory = dirname(import.meta.dirname);
@@ -21,7 +21,7 @@ export async function schemaHasUnmigratedChanges(): Promise<boolean> {
 				"--schema",
 				"./src/schema/schema.ts",
 				"--out",
-				scratch,
+				relative(directory, scratch),
 				"--name",
 				"drift",
 			],

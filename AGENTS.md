@@ -19,7 +19,7 @@ context until you read them, and the rules in them are not optional.
 | `.github/workflows`, versions, changelog, how a change reaches `release` | `CONTRIBUTING.md` |
 
 Also check `.agents/skills/` for a relevant skill before starting — better-auth,
-prisma, nestjs-trpc, eve, shadcn, nuqs and others have one. Tell the user which
+nestjs-trpc, eve, shadcn, nuqs and others have one. Tell the user which
 rules and skills you read.
 
 ## Always true
@@ -92,7 +92,7 @@ Rules for the list:
 ## A server page computes. A client component renders.
 
 A client component must never import a server package. `@crm/auth` and `@crm/db`
-are server packages: their barrels reach Prisma, which reaches `pg`, which
+are server packages: their barrels reach Drizzle, which reaches `pg`, which
 reaches `dns`. The bundler follows that chain into the browser and the build
 fails with `Module not found: Can't resolve 'dns'`.
 
@@ -183,7 +183,7 @@ export const DISPATCH = {
 
 ## Parse at the boundary, never pass `Record<string, unknown>` around
 
-Untyped data — a Prisma `Json` column, a webhook body, an API response — is
+Untyped data — a `jsonb` column, a webhook body, an API response — is
 parsed into a **domain type at the moment it enters the process**, with Zod, in a
 module that owns that shape. Every consumer downstream receives the parsed type
 and nothing else. `Record<string, unknown>`, `unknown` casts and one-off

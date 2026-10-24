@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { type Db, eq, user as userTable } from "@crm/db";
 import { CACHE_MANAGER } from "@nestjs/cache-manager";
 import { Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import type { Cache } from "cache-manager";
@@ -36,17 +36,18 @@ export class AuthService {
 
 		this.logger.debug({ message: "Profile cache miss", userId });
 
-		const user = await this.db.user.findUnique({
-			where: { id: userId },
-			select: {
-				id: true,
-				name: true,
-				email: true,
-				emailVerified: true,
-				image: true,
-				createdAt: true,
-			},
-		});
+		const [user] = await this.db
+			.select({
+				id: userTable.id,
+				name: userTable.name,
+				email: userTable.email,
+				emailVerified: userTable.emailVerified,
+				image: userTable.image,
+				createdAt: userTable.createdAt,
+			})
+			.from(userTable)
+			.where(eq(userTable.id, userId))
+			.limit(1);
 
 		if (!user) {
 			this.logger.warn({ message: "Session user no longer exists", userId });

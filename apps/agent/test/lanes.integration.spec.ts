@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import { agentTask, db, eq, requireRow } from "@crm/db";
 import { DIRECT_KINDS, isDirectKind, PRIORITY } from "@crm/db/agent-tasks";
 import { claimDue } from "../agent/lib/tasks";
 
@@ -10,23 +10,25 @@ const VISIBLE = { only: DIRECT_KINDS } as const;
 const RESEARCH = { except: DIRECT_KINDS } as const;
 
 async function clear() {
-	await db.agentTask.deleteMany({ where: { reason: REASON } });
+	await db.delete(agentTask).where(eq(agentTask.reason, REASON));
 }
 
 beforeEach(clear);
 afterEach(clear);
 
 async function queue(kind: string, priority: number) {
-	return db.agentTask.create({
-		data: {
-			kind,
-			reason: REASON,
-			dueAt: new Date(Date.now() - 1000),
-			priority: TEST_PRIORITY_OFFSET + priority,
-			budget: 2,
-		},
-		select: { id: true },
-	});
+	return requireRow(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: REASON,
+				dueAt: new Date(Date.now() - 1000),
+				priority: TEST_PRIORITY_OFFSET + priority,
+				budget: 2,
+			})
+			.returning({ id: agentTask.id }),
+	);
 }
 
 describe("dispatch lanes", () => {

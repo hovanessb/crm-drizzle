@@ -1,4 +1,4 @@
-import type { Prisma } from "@crm/db";
+import type { JsonObject, JsonValue } from "@crm/db";
 import { z } from "zod";
 
 const builderMessageFields = z.record(z.string(), z.json()).catch({});
@@ -11,10 +11,10 @@ export type StoredBuilderAttachment = {
 };
 
 export function builderMessageWithAttachments(
-	value: Prisma.JsonValue,
+	value: JsonValue,
 	attachments: StoredBuilderAttachment[],
 	shareToken?: string,
-): Prisma.JsonObject {
+): JsonObject {
 	return {
 		...builderMessageFields.parse(value),
 		attachments: attachments.map((attachment) => ({

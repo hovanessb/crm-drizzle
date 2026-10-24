@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { db, eq, slackChannel } from "@crm/db";
 import {
 	slackCanInviteItself,
 	slackConnected,
@@ -32,10 +32,15 @@ async function main() {
 
 	console.log(await runSlackPeopleMatch());
 
-	const channels = await db.slackChannel.findMany({
-		where: { available: true },
-		select: { id: true, name: true, isPrivate: true, isMember: true },
-	});
+	const channels = await db
+		.select({
+			id: slackChannel.id,
+			name: slackChannel.name,
+			isPrivate: slackChannel.isPrivate,
+			isMember: slackChannel.isMember,
+		})
+		.from(slackChannel)
+		.where(eq(slackChannel.available, true));
 	const canInvite = await slackCanInviteItself();
 
 	record(

@@ -1,4 +1,18 @@
-import type { Db, Prisma } from "@crm/db";
+import {
+	asc,
+	calendarAttendee,
+	calendarEvent,
+	contact,
+	type Db,
+	desc,
+	emailMessage,
+	emailThread,
+	eq,
+	inArray,
+	type JsonValue,
+	sql,
+	user,
+} from "@crm/db";
 import { Injectable, NotFoundException } from "@nestjs/common";
 import { z } from "zod";
 import { InjectDatabase } from "../database/database.constants";
@@ -18,19 +32,21 @@ export class ConversationService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async thread(threadId: string) {
-		const thread = await this.db.emailThread.findUnique({
-			where: { id: threadId },
-			select: {
+		const thread = await this.db.query.emailThread.findFirst({
+			where: eq(emailThread.id, threadId),
+			columns: {
 				id: true,
 				subject: true,
 				messageCount: true,
 				firstMessageAt: true,
 				lastMessageAt: true,
-				company: { select: { id: true, name: true } },
-				contact: { select: { id: true, firstName: true, lastName: true } },
+			},
+			with: {
+				company: { columns: { id: true, name: true } },
+				contact: { columns: { id: true, firstName: true, lastName: true } },
 				messages: {
-					orderBy: { sentAt: "asc" },
-					select: {
+					orderBy: [asc(emailMessage.sentAt)],
+					columns: {
 						id: true,
 						direction: true,
 						fromEmail: true,
@@ -83,14 +99,24 @@ export class ConversationService {
 		if (emails.length === 0) return new Map();
 
 		const [contacts, users] = await Promise.all([
-			this.db.contact.findMany({
-				where: { email: { in: emails, mode: "insensitive" } },
-				select: { email: true, imageUrl: true },
-			}),
-			this.db.user.findMany({
-				where: { email: { in: emails, mode: "insensitive" } },
-				select: { email: true, image: true },
-			}),
+			this.db
+				.select({ email: contact.email, imageUrl: contact.imageUrl })
+				.from(contact)
+				.where(
+					inArray(
+						sql`lower(${contact.email})`,
+						emails.map((email) => email.toLowerCase()),
+					),
+				),
+			this.db
+				.select({ email: user.email, image: user.image })
+				.from(user)
+				.where(
+					inArray(
+						sql`lower(${user.email})`,
+						emails.map((email) => email.toLowerCase()),
+					),
+				),
 		]);
 
 		const faces = new Map<string, string>();
@@ -107,9 +133,9 @@ export class ConversationService {
 	}
 
 	async event(eventId: string) {
-		const event = await this.db.calendarEvent.findUnique({
-			where: { id: eventId },
-			select: {
+		const event = await this.db.query.calendarEvent.findFirst({
+			where: eq(calendarEvent.id, eventId),
+			columns: {
 				id: true,
 				title: true,
 				description: true,
@@ -120,19 +146,24 @@ export class ConversationService {
 				isAllDay: true,
 				status: true,
 				organizerEmail: true,
-				company: { select: { id: true, name: true } },
-				contact: { select: { id: true, firstName: true, lastName: true } },
+			},
+			with: {
+				company: { columns: { id: true, name: true } },
+				contact: { columns: { id: true, firstName: true, lastName: true } },
 				attendees: {
-					orderBy: [{ isOrganizer: "desc" }, { email: "asc" }],
-					select: {
+					orderBy: [
+						desc(calendarAttendee.isOrganizer),
+						asc(calendarAttendee.email),
+					],
+					columns: {
 						id: true,
 						email: true,
 						name: true,
 						responseStatus: true,
 						isOrganizer: true,
 						contactId: true,
-						contact: { select: { imageUrl: true } },
 					},
+					with: { contact: { columns: { imageUrl: true } } },
 				},
 			},
 		});
@@ -153,7 +184,7 @@ export class ConversationService {
 	}
 }
 
-function recipientsOf(value: Prisma.JsonValue): StoredRecipient[] {
+function recipientsOf(value: JsonValue): StoredRecipient[] {
 	return storedRecipients.parse(value).flatMap((entry) => {
 		const parsed = storedRecipient.safeParse(entry);
 		return parsed.success ? [parsed.data] : [];

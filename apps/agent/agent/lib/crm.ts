@@ -1,4 +1,32 @@
-import { db, EnrichmentStatus, type Prisma } from "@crm/db";
+import {
+	activity as activityTable,
+	and,
+	asc,
+	calendarAttendee,
+	calendarEvent,
+	company,
+	contactBrief,
+	contact as contactTable,
+	db,
+	deal,
+	dealContact,
+	desc,
+	EnrichmentStatus,
+	emailMessage,
+	emailThread,
+	eq,
+	firstRow,
+	inArray,
+	isNotNull,
+	isNull,
+	type JsonObject,
+	ne,
+	or,
+	orNull,
+	requireRow,
+	user,
+	whereEq,
+} from "@crm/db";
 import { domainOf, isDerivedName } from "./names";
 import type { Person } from "./socials";
 
@@ -18,28 +46,30 @@ export type WorkItem = {
 };
 
 export async function contactsNeedingWork(limit: number): Promise<WorkItem[]> {
-	const rows = await db.contact.findMany({
-		where: {
-			OR: [
-				{ brief: { is: null } },
-				{ socialsCheckedAt: null },
-				{ AND: [{ email: { not: null } }, { lastName: null }] },
-			],
-		},
-		select: {
-			id: true,
-			email: true,
-			firstName: true,
-			lastName: true,
-			title: true,
-			linkedinUrl: true,
-			socialsCheckedAt: true,
-			company: { select: { name: true, domain: true } },
-			brief: { select: { contactId: true } },
-		},
-		orderBy: { createdAt: "asc" },
-		take: limit,
-	});
+	const rows = await db
+		.select({
+			id: contactTable.id,
+			email: contactTable.email,
+			firstName: contactTable.firstName,
+			lastName: contactTable.lastName,
+			title: contactTable.title,
+			linkedinUrl: contactTable.linkedinUrl,
+			socialsCheckedAt: contactTable.socialsCheckedAt,
+			company: { name: company.name, domain: company.domain },
+			brief: { contactId: contactBrief.contactId },
+		})
+		.from(contactTable)
+		.leftJoin(company, eq(company.id, contactTable.companyId))
+		.leftJoin(contactBrief, eq(contactBrief.contactId, contactTable.id))
+		.where(
+			or(
+				isNull(contactBrief.contactId),
+				isNull(contactTable.socialsCheckedAt),
+				and(isNotNull(contactTable.email), isNull(contactTable.lastName)),
+			),
+		)
+		.orderBy(asc(contactTable.createdAt))
+		.limit(limit);
 
 	return rows.map((row) => ({
 		id: row.id,
@@ -61,16 +91,13 @@ export async function contactsNeedingWork(limit: number): Promise<WorkItem[]> {
 export async function personForVerification(
 	contactId: string,
 ): Promise<Person | null> {
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: {
-			firstName: true,
-			lastName: true,
-			title: true,
-			email: true,
-			company: { select: { name: true, domain: true } },
-		},
-	});
+	const contact = await db.query.contact
+		.findFirst({
+			where: whereEq(contactTable.id, contactId),
+			columns: { firstName: true, lastName: true, title: true, email: true },
+			with: { company: { columns: { name: true, domain: true } } },
+		})
+		.then(orNull);
 
 	if (!contact) return null;
 
@@ -89,10 +116,13 @@ export async function personForVerification(
 export async function contactProfileSlug(
 	contactId: string,
 ): Promise<{ slug: string; profileUrl: string } | null> {
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: { linkedinUrl: true },
-	});
+	const contact = await firstRow(
+		db
+			.select({ linkedinUrl: contactTable.linkedinUrl })
+			.from(contactTable)
+			.where(whereEq(contactTable.id, contactId))
+			.limit(1),
+	);
 
 	const slug = linkedinSlug(contact?.linkedinUrl ?? null);
 	return slug
@@ -165,36 +195,48 @@ export async function readCrmHistory(
 		includeCalendar?: boolean;
 	} = {},
 ): Promise<CrmHistory | null> {
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: {
-			id: true,
-			firstName: true,
-			lastName: true,
-			email: true,
-			title: true,
-			companyId: true,
-			company: {
-				select: { id: true, name: true, domain: true, industry: true },
-			},
-			deals: {
-				orderBy: { deal: { lastActivityAt: "desc" } },
-				select: {
-					role: true,
-					deal: {
-						select: {
-							id: true,
-							name: true,
-							stage: true,
-							amount: true,
-							currency: true,
-							expectedCloseDate: true,
-						},
-					},
+	const found = await firstRow(
+		db
+			.select({
+				id: contactTable.id,
+				firstName: contactTable.firstName,
+				lastName: contactTable.lastName,
+				email: contactTable.email,
+				title: contactTable.title,
+				companyId: contactTable.companyId,
+				company: {
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					industry: company.industry,
 				},
-			},
-		},
-	});
+			})
+			.from(contactTable)
+			.leftJoin(company, eq(company.id, contactTable.companyId))
+			.where(eq(contactTable.id, contactId))
+			.limit(1),
+	);
+	const contact = found
+		? {
+				...found,
+				deals: await db
+					.select({
+						role: dealContact.role,
+						deal: {
+							id: deal.id,
+							name: deal.name,
+							stage: deal.stage,
+							amount: deal.amount,
+							currency: deal.currency,
+							expectedCloseDate: deal.expectedCloseDate,
+						},
+					})
+					.from(dealContact)
+					.innerJoin(deal, eq(deal.id, dealContact.dealId))
+					.where(eq(dealContact.contactId, contactId))
+					.orderBy(desc(deal.lastActivityAt)),
+			}
+		: null;
 
 	if (!contact) return null;
 	const includeEmail = options.includeEmail ?? true;
@@ -202,18 +244,16 @@ export async function readCrmHistory(
 
 	const [threads, meetings, colleagues] = await Promise.all([
 		includeEmail
-			? db.emailThread.findMany({
-					where: { contactId },
-					orderBy: { lastMessageAt: "desc" },
-					take: options.threads ?? 5,
-					select: {
-						subject: true,
-						messageCount: true,
-						lastMessageAt: true,
+			? db.query.emailThread.findMany({
+					where: whereEq(emailThread.contactId, contactId),
+					orderBy: [desc(emailThread.lastMessageAt)],
+					limit: options.threads ?? 5,
+					columns: { subject: true, messageCount: true, lastMessageAt: true },
+					with: {
 						messages: {
-							orderBy: { sentAt: "desc" },
-							take: options.messagesPerThread ?? 6,
-							select: {
+							orderBy: [desc(emailMessage.sentAt)],
+							limit: options.messagesPerThread ?? 6,
+							columns: {
 								direction: true,
 								fromEmail: true,
 								fromName: true,
@@ -226,17 +266,23 @@ export async function readCrmHistory(
 				})
 			: Promise.resolve([]),
 		includeCalendar
-			? db.calendarEvent.findMany({
-					where: {
-						OR: [{ contactId }, { attendees: { some: { contactId } } }],
-					},
-					orderBy: { startsAt: "desc" },
-					take: 10,
-					select: {
-						title: true,
-						startsAt: true,
+			? db.query.calendarEvent.findMany({
+					where: or(
+						whereEq(calendarEvent.contactId, contactId),
+						inArray(
+							calendarEvent.id,
+							db
+								.select({ id: calendarAttendee.eventId })
+								.from(calendarAttendee)
+								.where(whereEq(calendarAttendee.contactId, contactId)),
+						),
+					),
+					orderBy: [desc(calendarEvent.startsAt)],
+					limit: 10,
+					columns: { title: true, startsAt: true },
+					with: {
 						attendees: {
-							select: {
+							columns: {
 								email: true,
 								name: true,
 								contactId: true,
@@ -247,12 +293,22 @@ export async function readCrmHistory(
 				})
 			: Promise.resolve([]),
 		contact.companyId
-			? db.contact.findMany({
-					where: { companyId: contact.companyId, id: { not: contactId } },
-					select: { id: true, firstName: true, lastName: true, title: true },
-					take: 8,
-					orderBy: { lastActivityAt: "desc" },
-				})
+			? db
+					.select({
+						id: contactTable.id,
+						firstName: contactTable.firstName,
+						lastName: contactTable.lastName,
+						title: contactTable.title,
+					})
+					.from(contactTable)
+					.where(
+						and(
+							eq(contactTable.companyId, contact.companyId),
+							ne(contactTable.id, contactId),
+						),
+					)
+					.orderBy(desc(contactTable.lastActivityAt))
+					.limit(8)
 			: Promise.resolve([]),
 	]);
 
@@ -324,10 +380,13 @@ export async function readCrmHistory(
 }
 
 export async function stampSocialsChecked(contactId: string): Promise<void> {
-	await db.contact.update({
-		where: { id: contactId },
-		data: { socialsCheckedAt: new Date() },
-	});
+	await requireRow(
+		db
+			.update(contactTable)
+			.set({ socialsCheckedAt: new Date() })
+			.where(whereEq(contactTable.id, contactId))
+			.returning(),
+	);
 }
 
 export async function setEnrichmentStatus(
@@ -335,47 +394,59 @@ export async function setEnrichmentStatus(
 	status: EnrichmentStatus,
 	error?: string,
 ): Promise<void> {
-	await db.contact.update({
-		where: { id: contactId },
-		data: {
-			enrichmentStatus: status,
-			enrichmentError: error ?? null,
-			enrichedAt: status === EnrichmentStatus.COMPLETE ? new Date() : undefined,
-		},
-	});
+	await requireRow(
+		db
+			.update(contactTable)
+			.set({
+				enrichmentStatus: status,
+				enrichmentError: error ?? null,
+				enrichedAt:
+					status === EnrichmentStatus.COMPLETE ? new Date() : undefined,
+			})
+			.where(whereEq(contactTable.id, contactId))
+			.returning(),
+	);
 }
 
 export async function writeTimelineNote(
 	contactId: string,
 	subject: string,
 	body: string,
-	meta: Prisma.InputJsonObject = {},
+	meta: JsonObject = {},
 ): Promise<string | null> {
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: { companyId: true, ownerId: true },
-	});
+	const contact = await firstRow(
+		db
+			.select({
+				companyId: contactTable.companyId,
+				ownerId: contactTable.ownerId,
+			})
+			.from(contactTable)
+			.where(whereEq(contactTable.id, contactId))
+			.limit(1),
+	);
 	if (!contact) return null;
 
 	const author =
 		contact.ownerId ??
-		(await db.user.findFirst({ select: { id: true } }))?.id ??
+		(await firstRow(db.select({ id: user.id }).from(user).limit(1)))?.id ??
 		null;
 	if (!author) return null;
 
-	const activity = await db.activity.create({
-		data: {
-			type: "NOTE",
-			subject,
-			body,
-			occurredAt: new Date(),
-			contactId,
-			companyId: contact.companyId,
-			createdById: author,
-			meta: { ...meta, agent: "people-research" },
-		},
-		select: { id: true },
-	});
+	const activity = await requireRow(
+		db
+			.insert(activityTable)
+			.values({
+				type: "NOTE",
+				subject,
+				body,
+				occurredAt: new Date(),
+				contactId,
+				companyId: contact.companyId,
+				createdById: author,
+				meta: { ...meta, agent: "people-research" },
+			})
+			.returning({ id: activityTable.id }),
+	);
 
 	return activity.id;
 }

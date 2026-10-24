@@ -1,4 +1,19 @@
-import { db, EnrichmentStatus, type Prisma } from "@crm/db";
+import {
+	agentTask,
+	and,
+	asc,
+	company,
+	contact,
+	db,
+	EnrichmentStatus,
+	eq,
+	inArray,
+	isNotNull,
+	isNull,
+	lt,
+	lte,
+	or,
+} from "@crm/db";
 import {
 	MAX_ATTEMPTS,
 	ownsCompanyStatus,
@@ -87,29 +102,29 @@ export async function reconcileStaleTasks(): Promise<StaleTaskSweep> {
 async function runSweep(sweep: StaleTaskSweep): Promise<void> {
 	const now = new Date();
 
-	const where: Prisma.AgentTaskWhereInput = {
-		finishedAt: null,
-		dueAt: { lte: now },
-		OR: [{ leasedUntil: null }, { leasedUntil: { lt: now } }],
-	};
+	const where = and(
+		isNull(agentTask.finishedAt),
+		lte(agentTask.dueAt, now),
+		or(isNull(agentTask.leasedUntil), lt(agentTask.leasedUntil, now)),
+	);
 
 	const [open, tasks] = await Promise.all([
-		db.agentTask.count({ where }),
-		db.agentTask.findMany({
-			where,
-			orderBy: [{ dueAt: "asc" }],
-			take: SCAN,
-			select: {
-				id: true,
-				kind: true,
-				contactId: true,
-				companyId: true,
-				dealId: true,
-				attempts: true,
-				leasedUntil: true,
-				startedAt: true,
-			},
-		}),
+		db.$count(agentTask, where),
+		db
+			.select({
+				id: agentTask.id,
+				kind: agentTask.kind,
+				contactId: agentTask.contactId,
+				companyId: agentTask.companyId,
+				dealId: agentTask.dealId,
+				attempts: agentTask.attempts,
+				leasedUntil: agentTask.leasedUntil,
+				startedAt: agentTask.startedAt,
+			})
+			.from(agentTask)
+			.where(where)
+			.orderBy(asc(agentTask.dueAt))
+			.limit(SCAN),
 	]);
 
 	sweep.scanned = tasks.length;
@@ -139,40 +154,50 @@ async function runSweep(sweep: StaleTaskSweep): Promise<void> {
 	}
 
 	if (landed.length > 0) {
-		const { count } = await db.agentTask.updateMany({
-			where: {
-				id: { in: landed },
-				finishedAt: null,
-				OR: [{ leasedUntil: null }, { leasedUntil: { lt: now } }],
-			},
-			data: { finishedAt: now, outcome: LANDED_OUTCOME },
-		});
+		const { rowCount: count } = await db
+			.update(agentTask)
+			.set({ finishedAt: now, outcome: LANDED_OUTCOME })
+			.where(
+				and(
+					inArray(agentTask.id, landed),
+					isNull(agentTask.finishedAt),
+					or(isNull(agentTask.leasedUntil), lt(agentTask.leasedUntil, now)),
+				),
+			);
 
-		sweep.closed = count;
+		sweep.closed = count ?? 0;
 	}
 
 	if (untargeted.length > 0) {
-		const { count } = await db.agentTask.updateMany({
-			where: {
-				id: { in: untargeted },
-				finishedAt: null,
-				OR: [{ leasedUntil: null }, { leasedUntil: { lt: now } }],
-			},
-			data: { finishedAt: now, outcome: UNTARGETED_OUTCOME },
-		});
+		const { rowCount: count } = await db
+			.update(agentTask)
+			.set({ finishedAt: now, outcome: UNTARGETED_OUTCOME })
+			.where(
+				and(
+					inArray(agentTask.id, untargeted),
+					isNull(agentTask.finishedAt),
+					or(isNull(agentTask.leasedUntil), lt(agentTask.leasedUntil, now)),
+				),
+			);
 
-		sweep.closed += count;
+		sweep.closed += count ?? 0;
 	}
 
 	sweep.retired = (await retireAbandoned()).length;
 
 	if (dead.length > 0) {
-		const { count } = await db.agentTask.updateMany({
-			where: { id: { in: dead }, finishedAt: null, leasedUntil: { lt: now } },
-			data: { leasedUntil: null },
-		});
+		const { rowCount: count } = await db
+			.update(agentTask)
+			.set({ leasedUntil: null })
+			.where(
+				and(
+					inArray(agentTask.id, dead),
+					isNull(agentTask.finishedAt),
+					lt(agentTask.leasedUntil, now),
+				),
+			);
 
-		sweep.released = count;
+		sweep.released = count ?? 0;
 	}
 }
 
@@ -185,24 +210,28 @@ async function completedSubjects(
 	const [contacts, companies] = await Promise.all([
 		contactIds.length === 0
 			? []
-			: db.contact.findMany({
-					where: {
-						id: { in: contactIds },
-						enrichmentStatus: EnrichmentStatus.COMPLETE,
-						enrichedAt: { not: null },
-					},
-					select: { id: true, enrichedAt: true },
-				}),
+			: db
+					.select({ id: contact.id, enrichedAt: contact.enrichedAt })
+					.from(contact)
+					.where(
+						and(
+							inArray(contact.id, contactIds),
+							eq(contact.enrichmentStatus, EnrichmentStatus.COMPLETE),
+							isNotNull(contact.enrichedAt),
+						),
+					),
 		companyIds.length === 0
 			? []
-			: db.company.findMany({
-					where: {
-						id: { in: companyIds },
-						enrichmentStatus: EnrichmentStatus.COMPLETE,
-						enrichedAt: { not: null },
-					},
-					select: { id: true, enrichedAt: true },
-				}),
+			: db
+					.select({ id: company.id, enrichedAt: company.enrichedAt })
+					.from(company)
+					.where(
+						and(
+							inArray(company.id, companyIds),
+							eq(company.enrichmentStatus, EnrichmentStatus.COMPLETE),
+							isNotNull(company.enrichedAt),
+						),
+					),
 	]);
 
 	const completed = new Map<string, Date>();

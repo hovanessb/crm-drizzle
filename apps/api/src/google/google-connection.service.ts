@@ -1,6 +1,25 @@
 import { isGoogleConfigured } from "@crm/auth/env";
 import { GOOGLE_PROVIDER_ID, signsInWithGoogle } from "@crm/auth/scopes";
-import type { Db, Prisma } from "@crm/db";
+import {
+	account,
+	activity,
+	and,
+	asc,
+	calendarEvent,
+	company,
+	contains,
+	type Db,
+	type Executor,
+	emailMessage,
+	emailThread,
+	eq,
+	inArray,
+	isNotNull,
+	notExists,
+	or,
+	sql,
+	suppressedDomain,
+} from "@crm/db";
 import { Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { normalizeDomain } from "../companies/domain";
 import { ActivityStampService } from "../crm/activity-stamp.service";
@@ -99,52 +118,72 @@ export class GoogleConnectionService {
 	}
 
 	async reconcileAll(): Promise<void> {
-		const accounts = await this.db.account.findMany({
-			where: {
-				providerId: GOOGLE_PROVIDER_ID,
-				OR: GOOGLE_SYNC_SOURCES.map((source) => ({
-					scope: { contains: SCOPE_FOR_SOURCE[source] },
-				})),
-			},
-			select: { userId: true },
-		});
+		const accounts = await this.db
+			.select({ userId: account.userId })
+			.from(account)
+			.where(
+				and(
+					eq(account.providerId, GOOGLE_PROVIDER_ID),
+					or(
+						...GOOGLE_SYNC_SOURCES.map((source) =>
+							contains(account.scope, SCOPE_FOR_SOURCE[source]),
+						),
+					),
+				),
+			);
 
-		for (const account of new Set(accounts.map((row) => row.userId))) {
-			await this.onConnected(account);
+		for (const userId of new Set(accounts.map((row) => row.userId))) {
+			await this.onConnected(userId);
 		}
 	}
 
 	async purgeSyncedData(userId: string): Promise<PurgeSyncedDataOutput> {
-		const mine: Prisma.EmailMessageWhereInput = {
-			syncedByUserId: userId,
-			gmailMessageId: { not: null },
-		};
-
-		const purged = await this.db.$transaction(
-			async (tx) => {
-				const touched = await tx.emailMessage.findMany({
-					where: mine,
-					select: { threadId: true },
-					distinct: ["threadId"],
-				});
-
-				const threadIds = touched.map((row) => row.threadId);
-				const messages = await tx.emailMessage.deleteMany({ where: mine });
-
-				await tx.emailThread.deleteMany({
-					where: { id: { in: threadIds }, messages: { none: {} } },
-				});
-
-				await rebuildThreads(tx, threadIds);
-
-				const events = await tx.calendarEvent.deleteMany({
-					where: { syncedByUserId: userId },
-				});
-
-				return messages.count + events.count;
-			},
-			{ timeout: PURGE_TIMEOUT_MS },
+		const mine = and(
+			eq(emailMessage.syncedByUserId, userId),
+			isNotNull(emailMessage.gmailMessageId),
 		);
+
+		const purged = await this.db.transaction(async (tx) => {
+			await tx.execute(
+				sql`SET LOCAL statement_timeout = ${sql.raw(String(PURGE_TIMEOUT_MS))}`,
+			);
+
+			const touched = await tx
+				.selectDistinct({ threadId: emailMessage.threadId })
+				.from(emailMessage)
+				.where(mine);
+
+			const threadIds = touched.map((row) => row.threadId);
+			const messages = await tx
+				.delete(emailMessage)
+				.where(mine)
+				.returning({ id: emailMessage.id });
+
+			if (threadIds.length > 0) {
+				await tx
+					.delete(emailThread)
+					.where(
+						and(
+							inArray(emailThread.id, threadIds),
+							notExists(
+								tx
+									.select({ id: emailMessage.id })
+									.from(emailMessage)
+									.where(eq(emailMessage.threadId, emailThread.id)),
+							),
+						),
+					);
+			}
+
+			await rebuildThreads(tx, threadIds);
+
+			const events = await tx
+				.delete(calendarEvent)
+				.where(eq(calendarEvent.syncedByUserId, userId))
+				.returning({ id: calendarEvent.id });
+
+			return messages.length + events.length;
+		});
 
 		await this.stamp.recomputeAll();
 
@@ -191,49 +230,63 @@ export class GoogleConnectionService {
 			);
 		}
 
-		await this.db.suppressedDomain.upsert({
-			where: { domain: normalised },
-			create: { domain: normalised, reason: options.reason ?? null },
-			update: { reason: options.reason ?? null },
-		});
+		await this.db
+			.insert(suppressedDomain)
+			.values({ domain: normalised, reason: options.reason ?? null })
+			.onConflictDoUpdate({
+				target: suppressedDomain.domain,
+				set: { reason: options.reason ?? null },
+			});
 
 		if (!options.purge) return { domain: normalised, purged: 0 };
 
-		const company = await this.db.company.findUnique({
-			where: { domain: normalised },
-			select: { id: true },
-		});
+		const [owner] = await this.db
+			.select({ id: company.id })
+			.from(company)
+			.where(eq(company.domain, normalised))
+			.limit(1);
 
-		if (!company) return { domain: normalised, purged: 0 };
+		if (!owner) return { domain: normalised, purged: 0 };
 
-		const [threads, events] = await this.db.$transaction([
-			this.db.emailThread.deleteMany({ where: { companyId: company.id } }),
-			this.db.calendarEvent.deleteMany({ where: { companyId: company.id } }),
-		]);
+		const { threads, events } = await this.db.transaction(async (tx) => ({
+			threads: await tx
+				.delete(emailThread)
+				.where(eq(emailThread.companyId, owner.id))
+				.returning({ id: emailThread.id }),
+			events: await tx
+				.delete(calendarEvent)
+				.where(eq(calendarEvent.companyId, owner.id))
+				.returning({ id: calendarEvent.id }),
+		}));
 
 		await this.stamp.recomputeAll();
 
 		this.logger.log({
 			message: "Domain suppressed",
 			domain: normalised,
-			purged: threads.count + events.count,
+			purged: threads.length + events.length,
 		});
 
-		return { domain: normalised, purged: threads.count + events.count };
+		return { domain: normalised, purged: threads.length + events.length };
 	}
 }
 
 async function rebuildThreads(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	threadIds: string[],
 ): Promise<void> {
 	if (threadIds.length === 0) return;
 
-	const remaining = await tx.emailMessage.findMany({
-		where: { threadId: { in: threadIds } },
-		select: { threadId: true, sentAt: true, subject: true, snippet: true },
-		orderBy: { sentAt: "asc" },
-	});
+	const remaining = await tx
+		.select({
+			threadId: emailMessage.threadId,
+			sentAt: emailMessage.sentAt,
+			subject: emailMessage.subject,
+			snippet: emailMessage.snippet,
+		})
+		.from(emailMessage)
+		.where(inArray(emailMessage.threadId, threadIds))
+		.orderBy(asc(emailMessage.sentAt));
 
 	const byThread = new Map<string, typeof remaining>();
 
@@ -248,19 +301,19 @@ async function rebuildThreads(
 		const last = messages.at(-1);
 		if (!first || !last) continue;
 
-		await tx.emailThread.update({
-			where: { id: threadId },
-			data: {
+		await tx
+			.update(emailThread)
+			.set({
 				messageCount: messages.length,
 				firstMessageAt: first.sentAt,
 				lastMessageAt: last.sentAt,
 				subject: first.subject,
-			},
-		});
+			})
+			.where(eq(emailThread.id, threadId));
 
-		await tx.activity.updateMany({
-			where: { emailThreadId: threadId },
-			data: { body: last.snippet, occurredAt: last.sentAt },
-		});
+		await tx
+			.update(activity)
+			.set({ body: last.snippet, occurredAt: last.sentAt })
+			.where(eq(activity.emailThreadId, threadId));
 	}
 }

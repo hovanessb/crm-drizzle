@@ -110,7 +110,8 @@ export const user = pgTable(
 		image: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -133,7 +134,8 @@ export const slackMemberMatch = pgTable(
 		slackEmail: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -165,7 +167,8 @@ export const slackChannel = pgTable(
 		classifiedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -185,7 +188,8 @@ export const slackInstallation = pgTable("slackInstallation", {
 	userScopes: text().notNull(),
 	createdAt: timestamp({ precision: 3, mode: "date" })
 		.notNull()
-		.default(sql`CURRENT_TIMESTAMP`),
+		.default(sql`CURRENT_TIMESTAMP`)
+		.$defaultFn(() => new Date()),
 });
 
 export const slackWorkspaceGrant = pgTable(
@@ -200,7 +204,8 @@ export const slackWorkspaceGrant = pgTable(
 		userScopes: text().notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -219,7 +224,8 @@ export const session = pgTable(
 		token: text().notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -258,7 +264,8 @@ export const account = pgTable(
 		password: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -297,7 +304,8 @@ export const mcpConnection = pgTable(
 		lastErrorCode: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -352,7 +360,8 @@ export const mcpClientRegistration = pgTable(
 		clientSecretExpiresAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -384,10 +393,12 @@ export const mcpToolSnapshot = pgTable(
 		reviewState: mcpToolReviewStateEnum().notNull().default("PENDING"),
 		lastSeenAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("mcpToolSnapshot_connectionId_name_fingerprint_key").on(
@@ -432,7 +443,8 @@ export const mcpOauthState = pgTable(
 		consumedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("mcpOauthState_stateHash_key").on(table.stateHash),
@@ -473,7 +485,8 @@ export const verification = pgTable(
 		expiresAt: timestamp({ precision: 3, mode: "date" }).notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -536,7 +549,8 @@ export const company = pgTable(
 		archivedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -576,7 +590,8 @@ export const companyEnrichment = pgTable(
 		raw: jsonb().$type<JsonValue>().notNull(),
 		fetchedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		foreignKey({
@@ -617,7 +632,8 @@ export const contact = pgTable(
 		archivedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -668,7 +684,8 @@ export const contactFact = pgTable(
 		decidedAt: timestamp({ precision: 3, mode: "date" }),
 		observedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		supersededAt: timestamp({ precision: 3, mode: "date" }),
 	},
 	(table): PgTableExtraConfigValue[] => [
@@ -709,7 +726,8 @@ export const contactBrief = pgTable(
 		sessionId: text(),
 		refreshedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		foreignKey({
@@ -746,7 +764,8 @@ export const agentTask = pgTable(
 		subject: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		index("agentTask_dueAt_leasedUntil_idx").on(table.dueAt, table.leasedUntil),
@@ -822,14 +841,16 @@ export const agentConversation = pgTable(
 		messageCount: integer().notNull().default(0),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
 			.$onUpdate(() => new Date()),
 		lastMessageAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		lastAssistantAt: timestamp({ precision: 3, mode: "date" }),
 		lastReadAt: timestamp({ precision: 3, mode: "date" }),
 	},
@@ -906,7 +927,8 @@ export const agentConversationFeedback = pgTable(
 		rating: agentResponseRatingEnum().notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -951,7 +973,8 @@ export const agentConversationShare = pgTable(
 		tokenHash: text().notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		expiresAt: timestamp({ precision: 3, mode: "date" }),
 		revokedAt: timestamp({ precision: 3, mode: "date" }),
 	},
@@ -1001,7 +1024,8 @@ export const agentConversationSubmission = pgTable(
 		errorMessage: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		sentAt: timestamp({ precision: 3, mode: "date" }),
 		acceptedAt: timestamp({ precision: 3, mode: "date" }),
 	},
@@ -1051,7 +1075,8 @@ export const agentConversationAttachment = pgTable(
 		position: integer().notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		index("agentConversationAttachment_submissionId_position_idx").on(
@@ -1081,7 +1106,8 @@ export const agentDefinition = pgTable(
 		currentVersionId: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1144,7 +1170,8 @@ export const agentVersion = pgTable(
 		deployedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("agentVersion_agentId_number_key").on(
@@ -1200,7 +1227,8 @@ export const agentBuilderArtifact = pgTable(
 		status: agentBuilderArtifactStatusEnum().notNull().default("WRITING"),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("agentBuilderArtifact_conversation_path_revision_key")
@@ -1255,7 +1283,8 @@ export const agentTrigger = pgTable(
 		lastRunAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1321,7 +1350,8 @@ export const agentRun = pgTable(
 		nextEventSequence: integer().notNull().default(0),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		startedAt: timestamp({ precision: 3, mode: "date" }),
 		finishedAt: timestamp({ precision: 3, mode: "date" }),
 		cancelRequestedAt: timestamp({ precision: 3, mode: "date" }),
@@ -1385,7 +1415,8 @@ export const agentRunEvent = pgTable(
 		data: jsonb().$type<JsonValue>().notNull(),
 		emittedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("agentRunEvent_runId_sequence_key").on(
@@ -1427,7 +1458,8 @@ export const agentAction = pgTable(
 		errorMessage: text(),
 		plannedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		startedAt: timestamp({ precision: 3, mode: "date" }),
 		completedAt: timestamp({ precision: 3, mode: "date" }),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
@@ -1482,7 +1514,8 @@ export const agentAuditEvent = pgTable(
 		requestId: text(),
 		emittedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("agentAuditEvent_agentId_type_requestId_key").on(
@@ -1540,7 +1573,8 @@ export const deal = pgTable(
 		stage: dealStageEnum().notNull().default("DEMO_BOOKED"),
 		stageChangedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		amount: decimal({ precision: 14, scale: 2 }),
 		currency: text().notNull().default("USD"),
 		expectedCloseDate: timestamp({ precision: 3, mode: "date" }),
@@ -1554,7 +1588,8 @@ export const deal = pgTable(
 		archivedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1600,7 +1635,8 @@ export const exchangeRate = pgTable(
 		provider: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1669,7 +1705,8 @@ export const fieldDefinition = pgTable(
 		archivedAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1807,7 +1844,8 @@ export const savedView = pgTable(
 		ownerId: text().notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1851,7 +1889,8 @@ export const activity = pgTable(
 		calendarEventId: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1932,7 +1971,8 @@ export const mailboxSync = pgTable(
 		autoCreate: boolean().notNull().default(false),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -1966,7 +2006,8 @@ export const emailThread = pgTable(
 		messageCount: integer().notNull().default(0),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -2021,7 +2062,8 @@ export const emailMessage = pgTable(
 		sentAt: timestamp({ precision: 3, mode: "date" }).notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("emailMessage_rfcMessageId_key").on(table.rfcMessageId),
@@ -2060,7 +2102,8 @@ export const calendarEvent = pgTable(
 		googleEventId: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -2137,7 +2180,8 @@ export const suppressedDomain = pgTable("suppressedDomain", {
 	reason: text(),
 	createdAt: timestamp({ precision: 3, mode: "date" })
 		.notNull()
-		.default(sql`CURRENT_TIMESTAMP`),
+		.default(sql`CURRENT_TIMESTAMP`)
+		.$defaultFn(() => new Date()),
 });
 
 export const suppressedContact = pgTable("suppressedContact", {
@@ -2145,7 +2189,8 @@ export const suppressedContact = pgTable("suppressedContact", {
 	reason: text(),
 	createdAt: timestamp({ precision: 3, mode: "date" })
 		.notNull()
-		.default(sql`CURRENT_TIMESTAMP`),
+		.default(sql`CURRENT_TIMESTAMP`)
+		.$defaultFn(() => new Date()),
 });
 
 export const appSetting = pgTable(
@@ -2189,7 +2234,8 @@ export const trackedDomain = pgTable(
 		lastSeenAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("trackedDomain_host_key").on(table.host),
@@ -2219,7 +2265,8 @@ export const trackedVisitor = pgTable(
 		lastTouchAt: timestamp({ precision: 3, mode: "date" }),
 		firstSeen: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		lastSeen: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -2318,7 +2365,8 @@ export const formSubmission = pgTable(
 		skipReason: text(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 	},
 	(table): PgTableExtraConfigValue[] => [
 		uniqueIndex("formSubmission_dedupeKey_key").on(table.dedupeKey),
@@ -2343,7 +2391,8 @@ export const install = pgTable(
 		lastRollupAt: timestamp({ precision: 3, mode: "date" }),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		updatedAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
 			.$defaultFn(() => new Date())
@@ -2358,7 +2407,8 @@ export const telemetryMilestone = pgTable("telemetryMilestone", {
 	step: text().primaryKey(),
 	reachedAt: timestamp({ precision: 3, mode: "date" })
 		.notNull()
-		.default(sql`CURRENT_TIMESTAMP`),
+		.default(sql`CURRENT_TIMESTAMP`)
+		.$defaultFn(() => new Date()),
 });
 
 export const telemetryCounter = pgTable("telemetryCounter", {
@@ -2395,7 +2445,8 @@ export const workspaceProfile = pgTable("workspaceProfile", {
 	sessionId: text(),
 	refreshedAt: timestamp({ precision: 3, mode: "date" })
 		.notNull()
-		.default(sql`CURRENT_TIMESTAMP`),
+		.default(sql`CURRENT_TIMESTAMP`)
+		.$defaultFn(() => new Date()),
 });
 
 export const member = pgTable(
@@ -2442,7 +2493,8 @@ export const invitation = pgTable(
 		expiresAt: timestamp({ precision: 3, mode: "date" }).notNull(),
 		createdAt: timestamp({ precision: 3, mode: "date" })
 			.notNull()
-			.default(sql`CURRENT_TIMESTAMP`),
+			.default(sql`CURRENT_TIMESTAMP`)
+			.$defaultFn(() => new Date()),
 		inviterId: text().notNull(),
 	},
 	(table): PgTableExtraConfigValue[] => [

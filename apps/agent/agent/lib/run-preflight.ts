@@ -1,4 +1,15 @@
-import { db } from "@crm/db";
+import {
+	agentVersion,
+	and,
+	db,
+	eq,
+	firstRow,
+	mcpConnection,
+	mcpToolSnapshot,
+	or,
+	orNull,
+	whereEq,
+} from "@crm/db";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import {
 	type AgentManifest,
@@ -32,28 +43,29 @@ export async function missingRunDependencies(
 		if (!(await CHECKS[id]())) missing.push(fix);
 	}
 	for (const grant of manifest.mcp) {
-		const connection = await db.mcpConnection.findUnique({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug: grant.platformSlug,
-				},
-			},
-			select: {
-				status: true,
-				accessMode: true,
-				toolSnapshots: {
-					where: {
-						OR: grant.tools.map((tool) => ({
-							name: tool.name,
-							fingerprint: tool.fingerprint,
-							reviewState: "REVIEWED" as const,
-						})),
+		const connection = await db.query.mcpConnection
+			.findFirst({
+				where: and(
+					eq(mcpConnection.organizationId, WORKSPACE_ID),
+					eq(mcpConnection.platformSlug, grant.platformSlug),
+				),
+				columns: { status: true, accessMode: true },
+				with: {
+					toolSnapshots: {
+						where: or(
+							...grant.tools.map((tool) =>
+								and(
+									eq(mcpToolSnapshot.name, tool.name),
+									eq(mcpToolSnapshot.fingerprint, tool.fingerprint),
+									eq(mcpToolSnapshot.reviewState, "REVIEWED"),
+								),
+							),
+						),
+						columns: { name: true, fingerprint: true },
 					},
-					select: { name: true, fingerprint: true },
 				},
-			},
-		});
+			})
+			.then(orNull);
 		const current = new Set(
 			connection?.toolSnapshots.map(
 				(tool) => `${tool.name}:${tool.fingerprint}`,
@@ -79,10 +91,13 @@ export async function missingRunDependencies(
 export async function runDependencyFailure(
 	versionId: string,
 ): Promise<string | null> {
-	const version = await db.agentVersion.findUnique({
-		where: { id: versionId },
-		select: { manifest: true },
-	});
+	const version = await firstRow(
+		db
+			.select({ manifest: agentVersion.manifest })
+			.from(agentVersion)
+			.where(whereEq(agentVersion.id, versionId))
+			.limit(1),
+	);
 	if (!version) return null;
 
 	let manifest: AgentManifest;

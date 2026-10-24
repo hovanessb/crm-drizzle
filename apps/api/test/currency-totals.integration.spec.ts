@@ -1,5 +1,20 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { DealStage, db, RateSource } from "@crm/db";
+import {
+	and,
+	appSetting,
+	company as companyTable,
+	count,
+	DealStage,
+	Decimal,
+	db,
+	deal as dealTable,
+	eq,
+	exchangeRate,
+	inArray,
+	isNotNull,
+	RateSource,
+	user,
+} from "@crm/db";
 import { normalizeCurrency } from "@crm/db/currency";
 import { SETTINGS_ID, writeReportingCurrency } from "@crm/db/settings";
 import type { AgentTriggerService } from "../src/agent/agent-trigger.service";
@@ -9,6 +24,7 @@ import { DashboardService } from "../src/dashboard/dashboard.service";
 import { DealsService } from "../src/deals/deals.service";
 import { FieldsService } from "../src/fields/fields.service";
 import { withDiscardedCrmEvents } from "./agent-trigger.stub";
+import { first, one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "currency-totals-spec";
 const userId = `user-${suffix}`;
@@ -35,32 +51,34 @@ const MILLION = 100_000_000;
 const HALF_MILLION = 50_000_000;
 
 async function rate(quote: string, value: string, source: RateSource) {
-	await db.exchangeRate.upsert({
-		where: {
-			baseCurrency_quoteCurrency_source: {
-				baseCurrency: "USD",
-				quoteCurrency: quote,
-				source,
-			},
-		},
-		create: {
+	await db
+		.insert(exchangeRate)
+		.values({
 			baseCurrency: "USD",
 			quoteCurrency: quote,
-			rate: value,
+			rate: new Decimal(value),
 			asOf: new Date("2026-08-01T00:00:00.000Z"),
 			source,
-		},
-		update: { rate: value },
-	});
+		})
+		.onConflictDoUpdate({
+			target: [
+				exchangeRate.baseCurrency,
+				exchangeRate.quoteCurrency,
+				exchangeRate.source,
+			],
+			set: { rate: new Decimal(value) },
+		});
 }
 
 async function clearRates() {
-	await db.exchangeRate.deleteMany({
-		where: {
-			baseCurrency: { in: ["USD", "EUR"] },
-			quoteCurrency: { in: ["USD", "EUR", "CHF"] },
-		},
-	});
+	await db
+		.delete(exchangeRate)
+		.where(
+			and(
+				inArray(exchangeRate.baseCurrency, ["USD", "EUR"]),
+				inArray(exchangeRate.quoteCurrency, ["USD", "EUR", "CHF"]),
+			),
+		);
 }
 
 async function pipelineCents(): Promise<number> {
@@ -69,47 +87,58 @@ async function pipelineCents(): Promise<number> {
 }
 
 beforeAll(async () => {
-	const existing = await db.appSetting.findUnique({
-		where: { id: SETTINGS_ID },
-		select: { reportingCurrency: true },
-	});
+	const existing = await first(
+		db
+			.select({ reportingCurrency: appSetting.reportingCurrency })
+			.from(appSetting)
+			.where(eq(appSetting.id, SETTINGS_ID))
+			.limit(1),
+	);
 	previousReportingCurrency = existing?.reportingCurrency ?? null;
 
 	await writeReportingCurrency(db, "USD");
 	await clearRates();
 
-	await db.user.upsert({
-		where: { id: userId },
-		create: {
+	await db
+		.insert(user)
+		.values({
 			id: userId,
 			name: "Rate Tester",
 			email: `rates@${domain}`,
 			emailVerified: true,
-		},
-		update: {},
-	});
+		})
+		.onConflictDoNothing();
 
-	const company = await db.company.upsert({
-		where: { domain },
-		create: { name: `Money Co ${suffix}`, domain },
-		update: {},
-		select: { id: true },
-	});
+	const existingCompany = await first(
+		db
+			.select({ id: companyTable.id })
+			.from(companyTable)
+			.where(eq(companyTable.domain, domain))
+			.limit(1),
+	);
+	const company =
+		existingCompany ??
+		(await one(
+			db
+				.insert(companyTable)
+				.values({ name: `Money Co ${suffix}`, domain })
+				.returning({ id: companyTable.id }),
+		));
 	companyId = company.id;
 
 	await rate("EUR", "1.10", RateSource.FETCHED);
 });
 
 afterAll(async () => {
-	await db.deal.deleteMany({ where: { companyId } });
-	await db.company.deleteMany({ where: { domain } });
-	await db.user.deleteMany({ where: { id: userId } });
+	await db.delete(dealTable).where(eq(dealTable.companyId, companyId));
+	await db.delete(companyTable).where(eq(companyTable.domain, domain));
+	await db.delete(user).where(eq(user.id, userId));
 	await clearRates();
 
 	if (previousReportingCurrency) {
 		await writeReportingCurrency(db, previousReportingCurrency);
 	} else {
-		await db.appSetting.updateMany({ data: { reportingCurrency: null } });
+		await db.update(appSetting).set({ reportingCurrency: null });
 	}
 
 	await conversion.rerateAll();
@@ -137,10 +166,23 @@ describe("a total across currencies", () => {
 	});
 
 	it("locks the rate onto the deal, so the row says how it was converted", async () => {
-		const row = await db.deal.findFirst({
-			where: { companyId, currency: "EUR" },
-			select: { amount: true, baseAmount: true, fxRate: true, fxRateAt: true },
-		});
+		const row = await first(
+			db
+				.select({
+					amount: dealTable.amount,
+					baseAmount: dealTable.baseAmount,
+					fxRate: dealTable.fxRate,
+					fxRateAt: dealTable.fxRateAt,
+				})
+				.from(dealTable)
+				.where(
+					and(
+						eq(dealTable.companyId, companyId),
+						eq(dealTable.currency, "EUR"),
+					),
+				)
+				.limit(1),
+		);
 
 		expect(row?.amount?.toNumber()).toBe(1_000_000);
 		expect(row?.baseAmount?.toNumber()).toBe(1_100_000);
@@ -186,10 +228,18 @@ describe("a total across currencies", () => {
 
 		await conversion.fillMissing();
 
-		const row = await db.deal.findFirst({
-			where: { companyId, currency: "EUR" },
-			select: { baseAmount: true },
-		});
+		const row = await first(
+			db
+				.select({ baseAmount: dealTable.baseAmount })
+				.from(dealTable)
+				.where(
+					and(
+						eq(dealTable.companyId, companyId),
+						eq(dealTable.currency, "EUR"),
+					),
+				)
+				.limit(1),
+		);
 
 		expect(row?.baseAmount?.toNumber()).toBe(1_100_000);
 	});
@@ -199,10 +249,18 @@ describe("a total across currencies", () => {
 
 		await conversion.rerateAll();
 
-		const row = await db.deal.findFirst({
-			where: { companyId, currency: "EUR" },
-			select: { baseAmount: true, fxRate: true },
-		});
+		const row = await first(
+			db
+				.select({ baseAmount: dealTable.baseAmount, fxRate: dealTable.fxRate })
+				.from(dealTable)
+				.where(
+					and(
+						eq(dealTable.companyId, companyId),
+						eq(dealTable.currency, "EUR"),
+					),
+				)
+				.limit(1),
+		);
 
 		expect(row?.fxRate?.toNumber()).toBe(1.5);
 		expect(row?.baseAmount?.toNumber()).toBe(1_500_000);
@@ -271,10 +329,13 @@ describe("a converted figure knows which currency it is in", () => {
 
 		expect(await pipelineCents()).toBe(before + MILLION);
 
-		await db.deal.update({
-			where: { id: deal.id },
-			data: { baseCurrency: "JPY" },
-		});
+		await one(
+			db
+				.update(dealTable)
+				.set({ baseCurrency: "JPY" })
+				.where(eq(dealTable.id, deal.id))
+				.returning(),
+		);
 
 		expect(await pipelineCents()).toBe(before);
 
@@ -286,7 +347,9 @@ describe("a converted figure knows which currency it is in", () => {
 
 		expect(await pipelineCents()).toBe(before + MILLION);
 
-		await db.deal.delete({ where: { id: deal.id } });
+		await one(
+			db.delete(dealTable).where(eq(dealTable.id, deal.id)).returning(),
+		);
 	});
 
 	it("never lets a converted figure with no currency on it go unnoticed", async () => {
@@ -295,19 +358,21 @@ describe("a converted figure knows which currency it is in", () => {
 
 		const before = await pipelineCents();
 
-		const orphan = await db.deal.create({
-			data: {
-				name: `Orphan ${suffix}`,
-				companyId,
-				ownerId: userId,
-				amount: 50_000,
-				currency: "USD",
-				baseAmount: 50_000,
-				fxRate: 1,
-				fxRateAt: new Date(),
-			},
-			select: { id: true },
-		});
+		const orphan = await one(
+			db
+				.insert(dealTable)
+				.values({
+					name: `Orphan ${suffix}`,
+					companyId,
+					ownerId: userId,
+					amount: new Decimal(50_000),
+					currency: "USD",
+					baseAmount: new Decimal(50_000),
+					fxRate: new Decimal(1),
+					fxRateAt: new Date(),
+				})
+				.returning({ id: dealTable.id }),
+		);
 
 		expect(await pipelineCents()).toBe(before);
 
@@ -316,29 +381,36 @@ describe("a converted figure knows which currency it is in", () => {
 
 		await conversion.fillMissing();
 
-		const healed = await db.deal.findUnique({
-			where: { id: orphan.id },
-			select: { baseCurrency: true },
-		});
+		const healed = await first(
+			db
+				.select({ baseCurrency: dealTable.baseCurrency })
+				.from(dealTable)
+				.where(eq(dealTable.id, orphan.id))
+				.limit(1),
+		);
 		expect(healed?.baseCurrency).toBe("USD");
 		expect(await pipelineCents()).toBe(before + 5_000_000);
 
-		await db.deal.delete({ where: { id: orphan.id } });
+		await one(
+			db.delete(dealTable).where(eq(dealTable.id, orphan.id)).returning(),
+		);
 	});
 
 	it("counts a currency once however it was cased or padded", async () => {
 		const rows = await Promise.all(
 			[" usd ", "Usd"].map((currency, index) =>
-				db.deal.create({
-					data: {
-						name: `Variant ${index} ${suffix}`,
-						companyId,
-						ownerId: userId,
-						amount: 1000,
-						currency,
-					},
-					select: { id: true },
-				}),
+				one(
+					db
+						.insert(dealTable)
+						.values({
+							name: `Variant ${index} ${suffix}`,
+							companyId,
+							ownerId: userId,
+							amount: new Decimal(1000),
+							currency,
+						})
+						.returning({ id: dealTable.id }),
+				),
 			),
 		);
 
@@ -349,33 +421,44 @@ describe("a converted figure knows which currency it is in", () => {
 
 		const rerated = await conversion.rerateAll();
 
-		const written = await db.deal.findMany({
-			where: { id: { in: rows.map((row) => row.id) } },
-			select: { baseAmount: true, baseCurrency: true },
-		});
+		const written = await db
+			.select({
+				baseAmount: dealTable.baseAmount,
+				baseCurrency: dealTable.baseCurrency,
+			})
+			.from(dealTable)
+			.where(
+				inArray(
+					dealTable.id,
+					rows.map((row) => row.id),
+				),
+			);
 
 		for (const row of written) {
 			expect(row.baseCurrency).toBe("USD");
 			expect(row.baseAmount?.toNumber()).toBe(1000);
 		}
 
-		const groups = await db.deal.groupBy({
-			by: ["currency"],
-			where: { amount: { not: null } },
-			_count: { _all: true },
-		});
+		const groups = await db
+			.select({ currency: dealTable.currency, count: count() })
+			.from(dealTable)
+			.where(isNotNull(dealTable.amount))
+			.groupBy(dealTable.currency);
 
 		const convertible = groups
 			.filter(
 				(group) => !rerated.missing.includes(normalizeCurrency(group.currency)),
 			)
-			.reduce((total, group) => total + group._count._all, 0);
+			.reduce((total, group) => total + group.count, 0);
 
 		expect(rerated.converted).toBe(convertible);
 
-		await db.deal.deleteMany({
-			where: { id: { in: rows.map((row) => row.id) } },
-		});
+		await db.delete(dealTable).where(
+			inArray(
+				dealTable.id,
+				rows.map((row) => row.id),
+			),
+		);
 	});
 
 	it("keeps a converted deal when the rate behind it has gone away", async () => {
@@ -390,42 +473,53 @@ describe("a converted figure knows which currency it is in", () => {
 			currency: "EUR",
 		});
 
-		const frozen = await db.deal.findUnique({
-			where: { id: deal.id },
-			select: { baseAmount: true },
-		});
+		const frozen = await first(
+			db
+				.select({ baseAmount: dealTable.baseAmount })
+				.from(dealTable)
+				.where(eq(dealTable.id, deal.id))
+				.limit(1),
+		);
 		expect(frozen?.baseAmount).not.toBeNull();
 
 		const before = await pipelineCents();
 
 		await clearRates();
 
-		const stranded = await db.deal.create({
-			data: {
-				name: `Stranded ${suffix}`,
-				companyId,
-				ownerId: userId,
-				amount: 1000,
-				currency: "EUR",
-			},
-			select: { id: true },
-		});
+		const stranded = await one(
+			db
+				.insert(dealTable)
+				.values({
+					name: `Stranded ${suffix}`,
+					companyId,
+					ownerId: userId,
+					amount: new Decimal(1000),
+					currency: "EUR",
+				})
+				.returning({ id: dealTable.id }),
+		);
 
 		const filled = await conversion.fillMissing();
 		expect(filled.missing).toContain("EUR");
 		expect(filled.cleared).toBe(0);
 
-		const kept = await db.deal.findUnique({
-			where: { id: deal.id },
-			select: { baseAmount: true, baseCurrency: true },
-		});
+		const kept = await first(
+			db
+				.select({
+					baseAmount: dealTable.baseAmount,
+					baseCurrency: dealTable.baseCurrency,
+				})
+				.from(dealTable)
+				.where(eq(dealTable.id, deal.id))
+				.limit(1),
+		);
 		expect(kept?.baseCurrency).toBe("USD");
 		expect(kept?.baseAmount?.toNumber()).toBe(frozen?.baseAmount?.toNumber());
 		expect(await pipelineCents()).toBe(before);
 
-		await db.deal.deleteMany({
-			where: { id: { in: [deal.id, stranded.id] } },
-		});
+		await db
+			.delete(dealTable)
+			.where(inArray(dealTable.id, [deal.id, stranded.id]));
 		await rate("EUR", "1.10", RateSource.FETCHED);
 	});
 });
@@ -436,42 +530,43 @@ describe("the dashboard only values what it can convert", () => {
 	beforeAll(async () => {
 		await writeReportingCurrency(db, "USD");
 
-		await db.user.upsert({
-			where: { id: analystId },
-			create: {
+		await db
+			.insert(user)
+			.values({
 				id: analystId,
 				name: "Dashboard Tester",
 				email: `dashboard@${domain}`,
 				emailVerified: true,
-			},
-			update: {},
-		});
+			})
+			.onConflictDoNothing();
 	});
 
 	afterAll(async () => {
-		await db.deal.deleteMany({ where: { ownerId: analystId } });
-		await db.user.deleteMany({ where: { id: analystId } });
+		await db.delete(dealTable).where(eq(dealTable.ownerId, analystId));
+		await db.delete(user).where(eq(user.id, analystId));
 	});
 
 	async function stale(name: string, stage: DealStage) {
 		const closed = stage === DealStage.CLOSED_WON;
 
-		return db.deal.create({
-			data: {
-				name: `${name} ${suffix}`,
-				companyId,
-				ownerId: analystId,
-				stage,
-				amount: 9_000,
-				currency: "USD",
-				baseAmount: 9_000,
-				baseCurrency: "JPY",
-				fxRate: 1,
-				fxRateAt: new Date(),
-				closedAt: closed ? new Date() : null,
-			},
-			select: { id: true },
-		});
+		return one(
+			db
+				.insert(dealTable)
+				.values({
+					name: `${name} ${suffix}`,
+					companyId,
+					ownerId: analystId,
+					stage,
+					amount: new Decimal(9_000),
+					currency: "USD",
+					baseAmount: new Decimal(9_000),
+					baseCurrency: "JPY",
+					fxRate: new Decimal(1),
+					fxRateAt: new Date(),
+					closedAt: closed ? new Date() : null,
+				})
+				.returning({ id: dealTable.id }),
+		);
 	}
 
 	it("does not average a won deal it cannot value into the rest", async () => {
@@ -492,7 +587,9 @@ describe("the dashboard only values what it can convert", () => {
 		expect(summary.performance.avgDealCents).toBe(10_000);
 		expect(summary.unconverted.count).toBe(1);
 
-		await db.deal.deleteMany({ where: { id: { in: [won.id, unvalued.id] } } });
+		await db
+			.delete(dealTable)
+			.where(inArray(dealTable.id, [won.id, unvalued.id]));
 	});
 
 	it("does not let a stale figure set the largest open deal", async () => {
@@ -515,6 +612,8 @@ describe("the dashboard only values what it can convert", () => {
 				?.baseAmountCents,
 		).toBeNull();
 
-		await db.deal.deleteMany({ where: { id: { in: [open.id, unvalued.id] } } });
+		await db
+			.delete(dealTable)
+			.where(inArray(dealTable.id, [open.id, unvalued.id]));
 	});
 });

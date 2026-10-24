@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	and,
+	contactBrief,
+	contactFact,
+	contact as contactTable,
+	db,
+	eq,
+	firstRow,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import type { Evidence } from "../agent/lib/evidence";
 import { recordFact, writeBrief } from "../agent/lib/facts";
 
@@ -14,16 +24,18 @@ const seen = (kind: Evidence["kind"], detail = "observed"): Evidence => ({
 });
 
 beforeAll(async () => {
-	await db.contact.deleteMany({ where: { email } });
-	const contact = await db.contact.create({
-		data: { firstName: "Subject", lastName: null, email },
-		select: { id: true },
-	});
+	await db.delete(contactTable).where(whereEq(contactTable.email, email));
+	const contact = await requireRow(
+		db
+			.insert(contactTable)
+			.values({ firstName: "Subject", lastName: null, email })
+			.returning({ id: contactTable.id }),
+	);
 	contactId = contact.id;
 });
 
 afterAll(async () => {
-	await db.contact.deleteMany({ where: { email } });
+	await db.delete(contactTable).where(whereEq(contactTable.email, email));
 });
 
 describe("recordFact", () => {
@@ -39,10 +51,13 @@ describe("recordFact", () => {
 		expect(result.applied).toBe(true);
 		expect(result.band).toBe("VERIFIED");
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: { title: true },
-		});
+		const contact = await firstRow(
+			db
+				.select({ title: contactTable.title })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.title).toBe("Head of Security");
 	});
 
@@ -58,10 +73,13 @@ describe("recordFact", () => {
 		expect(result.applied).toBe(true);
 		expect(result.band).toBe("PROBABLE");
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: { twitterUrl: true },
-		});
+		const contact = await firstRow(
+			db
+				.select({ twitterUrl: contactTable.twitterUrl })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.twitterUrl).toBe("https://x.com/subject");
 	});
 
@@ -91,10 +109,13 @@ describe("recordFact", () => {
 		expect(result.applied).toBe(false);
 		expect(result.reason).toContain("already carries a value");
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: { twitterUrl: true },
-		});
+		const contact = await firstRow(
+			db
+				.select({ twitterUrl: contactTable.twitterUrl })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.twitterUrl).toBe("https://x.com/subject");
 	});
 
@@ -110,9 +131,14 @@ describe("recordFact", () => {
 		expect(result.stored).toBe(false);
 		expect(result.reason).toContain("already in front of a rep");
 
-		const offers = await db.contactFact.count({
-			where: { contactId, field: "twitterUrl", status: "PROPOSED" },
-		});
+		const offers = await db.$count(
+			contactFact,
+			and(
+				whereEq(contactFact.contactId, contactId),
+				eq(contactFact.field, "twitterUrl"),
+				eq(contactFact.status, "PROPOSED"),
+			),
+		);
 		expect(offers).toBe(1);
 	});
 
@@ -125,10 +151,15 @@ describe("recordFact", () => {
 			method: "x.profile",
 		});
 
-		const facts = await db.contactFact.findMany({
-			where: { contactId, field: "twitterUrl" },
-			select: { value: true, status: true },
-		});
+		const facts = await db
+			.select({ value: contactFact.value, status: contactFact.status })
+			.from(contactFact)
+			.where(
+				and(
+					whereEq(contactFact.contactId, contactId),
+					eq(contactFact.field, "twitterUrl"),
+				),
+			);
 
 		expect(facts.filter((fact) => fact.status === "PROPOSED")).toHaveLength(0);
 		expect(
@@ -137,10 +168,13 @@ describe("recordFact", () => {
 	});
 
 	it("never overwrites what a person typed", async () => {
-		await db.contact.update({
-			where: { id: contactId },
-			data: { githubUrl: "https://github.com/typed-by-a-human" },
-		});
+		await requireRow(
+			db
+				.update(contactTable)
+				.set({ githubUrl: "https://github.com/typed-by-a-human" })
+				.where(whereEq(contactTable.id, contactId))
+				.returning(),
+		);
 
 		const result = await recordFact({
 			contactId,
@@ -153,10 +187,13 @@ describe("recordFact", () => {
 		expect(result.applied).toBe(false);
 		expect(result.reason).toContain("A person already filled in");
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: { githubUrl: true },
-		});
+		const contact = await firstRow(
+			db
+				.select({ githubUrl: contactTable.githubUrl })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.githubUrl).toBe("https://github.com/typed-by-a-human");
 	});
 
@@ -170,14 +207,26 @@ describe("recordFact", () => {
 		});
 		expect(offer.applied).toBe(false);
 
-		const proposal = await db.contactFact.findFirst({
-			where: { contactId, field: "title", status: "PROPOSED" },
-			select: { id: true },
-		});
-		await db.contactFact.update({
-			where: { id: proposal?.id },
-			data: { status: "DISMISSED", decidedAt: new Date() },
-		});
+		const proposal = await firstRow(
+			db
+				.select({ id: contactFact.id })
+				.from(contactFact)
+				.where(
+					and(
+						whereEq(contactFact.contactId, contactId),
+						eq(contactFact.field, "title"),
+						eq(contactFact.status, "PROPOSED"),
+					),
+				)
+				.limit(1),
+		);
+		await requireRow(
+			db
+				.update(contactFact)
+				.set({ status: "DISMISSED", decidedAt: new Date() })
+				.where(whereEq(contactFact.id, proposal?.id))
+				.returning(),
+		);
 
 		const result = await recordFact({
 			contactId,
@@ -208,10 +257,15 @@ describe("recordFact", () => {
 			method: "linkedin.profile",
 		});
 
-		const facts = await db.contactFact.findMany({
-			where: { contactId, field: "employer" },
-			select: { value: true, status: true },
-		});
+		const facts = await db
+			.select({ value: contactFact.value, status: contactFact.status })
+			.from(contactFact)
+			.where(
+				and(
+					whereEq(contactFact.contactId, contactId),
+					eq(contactFact.field, "employer"),
+				),
+			);
 
 		expect(facts).toHaveLength(2);
 		expect(facts.find((f) => f.value === "Fleetio")?.status).toBe("SUPERSEDED");
@@ -239,10 +293,19 @@ describe("recordFact", () => {
 		expect(result.stored).toBe(true);
 		expect(result.applied).toBe(true);
 
-		const facts = await db.contactFact.findMany({
-			where: { contactId, field: "employer" },
-			select: { value: true, status: true, score: true },
-		});
+		const facts = await db
+			.select({
+				value: contactFact.value,
+				status: contactFact.status,
+				score: contactFact.score,
+			})
+			.from(contactFact)
+			.where(
+				and(
+					whereEq(contactFact.contactId, contactId),
+					eq(contactFact.field, "employer"),
+				),
+			);
 
 		const live = facts.filter((fact) => fact.status === "APPLIED");
 		expect(live).toHaveLength(1);
@@ -251,10 +314,22 @@ describe("recordFact", () => {
 	});
 
 	it("stores the evidence, so the score can be explained later", async () => {
-		const fact = await db.contactFact.findFirst({
-			where: { contactId, field: "title" },
-			select: { evidence: true, score: true, sourceUrl: true },
-		});
+		const fact = await firstRow(
+			db
+				.select({
+					evidence: contactFact.evidence,
+					score: contactFact.score,
+					sourceUrl: contactFact.sourceUrl,
+				})
+				.from(contactFact)
+				.where(
+					and(
+						whereEq(contactFact.contactId, contactId),
+						eq(contactFact.field, "title"),
+					),
+				)
+				.limit(1),
+		);
 
 		expect(Array.isArray(fact?.evidence)).toBe(true);
 		expect(fact?.score).toBeGreaterThan(0.85);
@@ -278,7 +353,13 @@ describe("writeBrief", () => {
 			evidence: [seen("linkedin.employer-and-name")],
 		});
 
-		const brief = await db.contactBrief.findUnique({ where: { contactId } });
+		const brief = await firstRow(
+			db
+				.select()
+				.from(contactBrief)
+				.where(whereEq(contactBrief.contactId, contactId))
+				.limit(1),
+		);
 		expect(brief?.narrative).toBe("Subject is now VP Security at Example.");
 	});
 

@@ -1,4 +1,16 @@
-import { db } from "@crm/db";
+import {
+	db,
+	desc,
+	eq,
+	firstRow,
+	member as memberTable,
+	notInArray,
+	queryRows,
+	requireRow,
+	slackChannel as slackChannelTable,
+	slackMemberMatch,
+	sql,
+} from "@crm/db";
 import { queueSlackInventorySync } from "@crm/db/slack-inventory";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import { parse, schemas } from "@crm/validation";
@@ -54,10 +66,13 @@ export async function requestSlackInventorySync(): Promise<void> {
 
 export async function requestStaleSlackInventorySync(): Promise<void> {
 	try {
-		const newest = await db.slackChannel.findFirst({
-			orderBy: { updatedAt: "desc" },
-			select: { updatedAt: true },
-		});
+		const newest = await firstRow(
+			db
+				.select({ updatedAt: slackChannelTable.updatedAt })
+				.from(slackChannelTable)
+				.orderBy(desc(slackChannelTable.updatedAt))
+				.limit(1),
+		);
 		const fresh =
 			newest !== null &&
 			Date.now() - newest.updatedAt.getTime() < SLACK.inventory.staleMs;
@@ -87,36 +102,38 @@ export async function runSlackPeopleMatch(): Promise<string> {
 			return email ? [[email, member] as const] : [];
 		}),
 	);
-	const crmMembers = await db.member.findMany({
-		where: { organizationId: WORKSPACE_ID },
-		select: {
-			user: {
-				select: {
-					id: true,
-					email: true,
-				},
-			},
-		},
+	const crmMembers = await db.query.member.findMany({
+		where: eq(memberTable.organizationId, WORKSPACE_ID),
+		columns: {},
+		with: { user: { columns: { id: true, email: true } } },
 	});
 
 	let matched = 0;
 	for (const { user } of crmMembers) {
 		const slack = byEmail.get(user.email.trim().toLowerCase());
 		const slackHandle = slack ? `@${slack.name ?? slack.id}` : null;
-		await db.slackMemberMatch.upsert({
-			where: { crmUserId: user.id },
-			create: {
-				crmUserId: user.id,
-				slackUserId: slack?.id,
-				slackHandle,
-				slackEmail: slack?.profile?.email,
-			},
-			update: {
-				slackUserId: slack?.id ?? null,
-				slackHandle,
-				slackEmail: slack?.profile?.email ?? null,
-			},
-		});
+		await requireRow(
+			db
+				.insert(slackMemberMatch)
+				.values({
+					crmUserId: user.id,
+					slackUserId: slack?.id,
+					slackHandle,
+					slackEmail: slack?.profile?.email,
+				})
+				.onConflictDoUpdate({
+					target: slackMemberMatch.crmUserId,
+					set: {
+						...{
+							slackUserId: slack?.id ?? null,
+							slackHandle,
+							slackEmail: slack?.profile?.email ?? null,
+						},
+						updatedAt: new Date(),
+					},
+				})
+				.returning(),
+		);
 		if (slack) matched += 1;
 	}
 
@@ -173,33 +190,36 @@ export async function persistSlackChannels(
 		).values(),
 	];
 
-	return db.$transaction(async (tx) => {
-		const [account] = await tx.$queryRaw<Array<{ id: string }>>`
+	return db.transaction(async (tx) => {
+		const [account] = await queryRows<{ id: string }>(
+			tx,
+			sql`
 			SELECT id
 			FROM "account"
 			WHERE "providerId" = 'slack' AND "accessToken" IS NOT NULL
 			ORDER BY "updatedAt" DESC
 			LIMIT 1
 			FOR UPDATE
-		`;
+		`,
+		);
 		if (!account) return 0;
 
 		const ids = available.map((channel) => channel.id);
-		await tx.slackChannel.updateMany({
-			where: { id: { notIn: ids } },
-			data: { available: false },
-		});
+		await tx
+			.update(slackChannelTable)
+			.set({ available: false })
+			.where(notInArray(slackChannelTable.id, ids));
 		if (ids.length === 0) return 0;
 
-		await tx.$executeRaw`
+		await tx.execute(sql`
 			INSERT INTO "slackChannel" (id, name, "memberCount", "isPrivate", "isMember", available, "classifiedAt", "createdAt", "updatedAt")
 			SELECT id, name, "memberCount", "isPrivate", "isMember", true, NOW(), NOW(), NOW()
 			FROM UNNEST(
-				${ids}::text[],
-				${available.map((channel) => channel.name)}::text[],
-				${available.map((channel) => channel.num_members ?? null)}::int[],
-				${available.map((channel) => channel.is_private ?? false)}::boolean[],
-				${available.map((channel) => channel.is_member ?? false)}::boolean[]
+				${sql.param(ids)}::text[],
+				${sql.param(available.map((channel) => channel.name))}::text[],
+				${sql.param(available.map((channel) => channel.num_members ?? null))}::int[],
+				${sql.param(available.map((channel) => channel.is_private ?? false))}::boolean[],
+				${sql.param(available.map((channel) => channel.is_member ?? false))}::boolean[]
 			) AS incoming(id, name, "memberCount", "isPrivate", "isMember")
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
@@ -209,7 +229,7 @@ export async function persistSlackChannels(
 				available = true,
 				"classifiedAt" = NOW(),
 				"updatedAt" = NOW()
-		`;
+		`);
 
 		return ids.length;
 	});

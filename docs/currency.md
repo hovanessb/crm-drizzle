@@ -17,7 +17,7 @@ to dollars and printed `$2.0M`, silently.)
   - **Compose with `AND`, never spread** — it contains an `OR`, and so does the deals
     list's own `where`.
   - **Every writer of `baseAmount` writes `baseCurrency` in the same statement**:
-    `ConversionService` and `prisma/seed.ts`.
+    `ConversionService` and `scripts/seed.ts`.
 - **The rate is resolved once and frozen.** `create`/`update` call
   `ConversionService.dealFields` when `amount` *or* `currency` changes, reading the
   unchanged one back in the same call. Converting on read makes a closed quarter change

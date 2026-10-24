@@ -1,4 +1,4 @@
-import type { Prisma } from "@crm/db";
+import type { NewCompany } from "@crm/db";
 import { blobEnabled, mirror } from "@crm/db/blob";
 import { COMPANY_IMAGE_FIELDS } from "@crm/db/images";
 import { z } from "zod";
@@ -7,8 +7,8 @@ const mirrorableUrl = z.string().regex(/\S/).nullable().catch(null);
 
 export async function mirrorBrandImages(
 	companyId: string,
-	update: Prisma.CompanyUpdateInput,
-): Promise<{ update: Prisma.CompanyUpdateInput; mirrored: string[] }> {
+	update: Partial<NewCompany>,
+): Promise<{ update: Partial<NewCompany>; mirrored: string[] }> {
 	if (!blobEnabled()) return { update, mirrored: [] };
 
 	const mirrored: string[] = [];

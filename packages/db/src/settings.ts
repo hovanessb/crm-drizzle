@@ -7,8 +7,16 @@ import {
 } from "./currency";
 import type { NewAppSetting } from "./schema/models";
 import { appSetting } from "./schema/schema";
+import {
+	type AgentModelSetting,
+	DEFAULT_AGENT_MODEL,
+	DEFAULT_ARCHIVE_RETENTION_DAYS,
+	MAX_ARCHIVE_RETENTION_DAYS,
+	MIN_ARCHIVE_RETENTION_DAYS,
+	SETTINGS_ID,
+} from "./settings-shape";
 
-export const SETTINGS_ID = "app";
+export * from "./settings-shape";
 
 async function readSettings(db: Executor) {
 	const [row] = await db
@@ -27,17 +35,6 @@ async function writeSettings(
 		.insert(appSetting)
 		.values({ id: SETTINGS_ID, ...fields })
 		.onConflictDoUpdate({ target: appSetting.id, set: fields });
-}
-
-export const DEFAULT_AGENT_MODEL = {
-	id: "zai/glm-5.2-fast",
-	contextWindowTokens: 1_000_000,
-} as const;
-
-export interface AgentModelSetting {
-	id: string;
-	contextWindowTokens: number;
-	isDefault: boolean;
 }
 
 export async function readAgentModel(db: Executor): Promise<AgentModelSetting> {
@@ -66,10 +63,6 @@ export async function writeAgentModel(
 
 	await writeSettings(db, fields);
 }
-
-export const CONTEXT_DEV_SIGNUP_URL = "https://link.context.dev/crm";
-
-export const CONTEXT_DEV_DISCOUNT_CODE = "CRM";
 
 export async function readContextDevKey(db: Executor): Promise<string | null> {
 	const row = await readSettings(db);
@@ -118,12 +111,6 @@ export async function writeRatesRefreshedAt(
 	await writeSettings(db, { ratesRefreshedAt });
 }
 
-export const DEFAULT_ARCHIVE_RETENTION_DAYS = 180;
-
-export const MIN_ARCHIVE_RETENTION_DAYS = 1;
-
-export const MAX_ARCHIVE_RETENTION_DAYS = 3650;
-
 export async function readArchiveRetentionDays(db: Executor): Promise<number> {
 	const row = await readSettings(db);
 
@@ -142,9 +129,4 @@ export async function writeArchiveRetentionDays(
 	await writeSettings(db, { archiveRetentionDays });
 
 	return archiveRetentionDays;
-}
-
-export function maskKey(key: string): string {
-	const trimmed = key.trim();
-	return trimmed.length > 4 ? `••••${trimmed.slice(-4)}` : "••••";
 }

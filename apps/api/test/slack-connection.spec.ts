@@ -1,11 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import type { WorkspaceRole } from "@crm/auth/organization";
-import type { Db } from "@crm/db";
 import { SLACK_INVENTORY } from "@crm/db/slack-inventory";
 import type { AgentAccessService } from "../src/agent/agent-access.service";
 import type { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import type { SlackChannelsService } from "../src/slack/slack-channels.service";
 import { SlackConnectionService } from "../src/slack/slack-connection.service";
+import { fakeDb, type Row, rendered } from "./fake-db";
 
 const userId = "crm-1";
 
@@ -25,7 +25,7 @@ function serviceFor(input: {
 		};
 	}>;
 	memberCount?: number;
-	agents?: unknown[];
+	agents?: Row[];
 	syncingTask?: {
 		createdAt: Date;
 		startedAt: Date | null;
@@ -47,57 +47,48 @@ function serviceFor(input: {
 	const requested: Array<{ reason: string; required: boolean | undefined }> =
 		[];
 	const deleted: string[] = [];
-	const tx = {
-		account: {
-			deleteMany: async () => {
-				deleted.push("account");
-				return { count: input.accountUpdatedAt ? 1 : 0 };
-			},
+	const { db } = fakeDb({
+		select: (table, call) => {
+			if (table === "account")
+				return input.accountUpdatedAt
+					? [
+							{
+								id: "account-1",
+								accountId: "slack-user",
+								updatedAt: input.accountUpdatedAt,
+								scope: null,
+							},
+						]
+					: [];
+			if (table === "agentDefinition") return input.agents ?? [];
+			if (table === "slackMemberMatch") return input.matches ?? [];
+			if (table === "slackWorkspaceGrant")
+				return input.grant ? [{ id: "grant-1", teamName: null }] : [];
+			if (table === "member")
+				return (input.members ?? []).map(({ user }) => ({
+					user: { id: user.id, name: user.name, email: user.email },
+					match: user.slackMemberMatch
+						? { ...user.slackMemberMatch, id: `match-${user.id}` }
+						: null,
+				}));
+			if (table === "agentTask") {
+				const open = rendered(call.where)?.sql.includes(
+					'"agentTask"."finishedAt" is null',
+				);
+				const row = open ? input.syncingTask : input.lastFill;
+				return row ? [row] : [];
+			}
+			if (table === "slackChannel") return input.channels ?? [];
+			return [];
 		},
-		slackChannel: {
-			deleteMany: async () => {
-				deleted.push("slackChannel");
-				return { count: 0 };
-			},
+		count: () => input.memberCount ?? 0,
+		delete: (call) => {
+			deleted.push(call.table);
+			return call.table === "account" && input.accountUpdatedAt
+				? [{ id: "account-1" }]
+				: [];
 		},
-		slackWorkspaceGrant: {
-			deleteMany: async () => {
-				deleted.push("slackWorkspaceGrant");
-				return { count: 0 };
-			},
-		},
-	};
-	const db = {
-		$transaction: async <T>(run: (client: typeof tx) => Promise<T>) => run(tx),
-		account: {
-			findFirst: async () =>
-				input.accountUpdatedAt
-					? {
-							id: "account-1",
-							accountId: "slack-user",
-							updatedAt: input.accountUpdatedAt,
-						}
-					: null,
-		},
-		agentDefinition: { findMany: async () => input.agents ?? [] },
-		slackMemberMatch: { findMany: async () => input.matches ?? [] },
-		slackWorkspaceGrant: {
-			findFirst: async () => (input.grant ? { id: "grant-1" } : null),
-		},
-		member: {
-			count: async () => input.memberCount ?? 0,
-			findMany: async () => input.members ?? [],
-		},
-		agentTask: {
-			findFirst: async (args: { where: { finishedAt?: null } }) =>
-				args.where.finishedAt === null
-					? (input.syncingTask ?? null)
-					: (input.lastFill ?? null),
-		},
-		slackChannel: {
-			findMany: async () => input.channels ?? [],
-		},
-	} as unknown as Db;
+	});
 	const agent = {
 		slackPeopleRequested: async (reason: string, required?: boolean) => {
 			requested.push({ reason, required });

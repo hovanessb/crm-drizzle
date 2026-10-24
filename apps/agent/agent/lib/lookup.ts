@@ -1,4 +1,26 @@
-import { DealStage, db } from "@crm/db";
+import {
+	and,
+	asc,
+	company,
+	contact,
+	contains,
+	DealStage,
+	db,
+	deal,
+	desc,
+	eq,
+	equalsInsensitive,
+	firstRow,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	lte,
+	or,
+	type SQL,
+	sql,
+	user,
+} from "@crm/db";
 import { LOSING_DEAL_STAGES, OPEN_DEAL_STAGES } from "@crm/db/deal-stage";
 import { domainOf, normalise } from "./names";
 
@@ -75,49 +97,55 @@ export async function listDeals(options: DealListOptions = {}) {
 					? [...LOSING_DEAL_STAGES]
 					: null;
 
-	const rows = await db.deal.findMany({
-		where: {
-			stage: stages ? { in: stages } : undefined,
-			companyId: options.companyId ?? undefined,
-			ownerId: options.ownerId ?? undefined,
-			OR: cutoff
-				? [
-						{ lastActivityAt: { lte: cutoff } },
-						{ lastActivityAt: null, createdAt: { lte: cutoff } },
-					]
-				: undefined,
-		},
-		orderBy: [
-			{ lastActivityAt: { sort: "asc", nulls: "first" } },
-			{ createdAt: "asc" },
-			{ id: "asc" },
-		],
-		cursor: options.cursor ? { id: options.cursor } : undefined,
-		skip: options.cursor ? 1 : undefined,
-		take: limit + 1,
-		select: {
-			id: true,
-			name: true,
-			stage: true,
-			amount: true,
-			currency: true,
-			createdAt: true,
-			lastActivityAt: true,
-			expectedCloseDate: true,
+	const rows = await db
+		.select({
+			id: deal.id,
+			name: deal.name,
+			stage: deal.stage,
+			amount: deal.amount,
+			currency: deal.currency,
+			createdAt: deal.createdAt,
+			lastActivityAt: deal.lastActivityAt,
+			expectedCloseDate: deal.expectedCloseDate,
 			company: {
-				select: {
-					id: true,
-					name: true,
-					domain: true,
-					iconUrl: true,
-					iconDarkUrl: true,
-					iconTone: true,
-					logoUrl: true,
-				},
+				id: company.id,
+				name: company.name,
+				domain: company.domain,
+				iconUrl: company.iconUrl,
+				iconDarkUrl: company.iconDarkUrl,
+				iconTone: company.iconTone,
+				logoUrl: company.logoUrl,
 			},
-			owner: { select: { id: true, name: true, email: true, image: true } },
-		},
-	});
+			owner: {
+				id: user.id,
+				name: user.name,
+				email: user.email,
+				image: user.image,
+			},
+		})
+		.from(deal)
+		.innerJoin(company, eq(company.id, deal.companyId))
+		.leftJoin(user, eq(user.id, deal.ownerId))
+		.where(
+			and(
+				stages ? inArray(deal.stage, stages) : undefined,
+				options.companyId ? eq(deal.companyId, options.companyId) : undefined,
+				options.ownerId ? eq(deal.ownerId, options.ownerId) : undefined,
+				cutoff
+					? or(
+							lte(deal.lastActivityAt, cutoff),
+							and(isNull(deal.lastActivityAt), lte(deal.createdAt, cutoff)),
+						)
+					: undefined,
+				options.cursor ? await dealsAfter(options.cursor) : undefined,
+			),
+		)
+		.orderBy(
+			sql`${deal.lastActivityAt} asc nulls first`,
+			asc(deal.createdAt),
+			asc(deal.id),
+		)
+		.limit(limit + 1);
 	const hasMore = rows.length > limit;
 	const page = rows.slice(0, limit);
 
@@ -152,6 +180,38 @@ export async function listDeals(options: DealListOptions = {}) {
 		hasMore,
 		nextCursor: hasMore ? page.at(-1)?.id : null,
 	};
+}
+
+async function dealsAfter(cursorId: string): Promise<SQL | undefined> {
+	const cursor = await firstRow(
+		db
+			.select({
+				id: deal.id,
+				createdAt: deal.createdAt,
+				lastActivityAt: deal.lastActivityAt,
+			})
+			.from(deal)
+			.where(eq(deal.id, cursorId))
+			.limit(1),
+	);
+	if (!cursor) return sql`false`;
+
+	const tail = or(
+		gt(deal.createdAt, cursor.createdAt),
+		and(eq(deal.createdAt, cursor.createdAt), gt(deal.id, cursor.id)),
+	);
+
+	if (cursor.lastActivityAt === null) {
+		return or(
+			isNotNull(deal.lastActivityAt),
+			and(isNull(deal.lastActivityAt), tail),
+		);
+	}
+
+	return or(
+		gt(deal.lastActivityAt, cursor.lastActivityAt),
+		and(eq(deal.lastActivityAt, cursor.lastActivityAt), tail),
+	);
 }
 
 export async function searchCrm(
@@ -192,34 +252,33 @@ async function searchContacts(
 	email: string | null,
 	limit: number,
 ): Promise<ContactHit[]> {
-	const contains = words.flatMap((word) => [
-		{ firstName: { contains: word, mode: "insensitive" as const } },
-		{ lastName: { contains: word, mode: "insensitive" as const } },
-		{ email: { contains: word, mode: "insensitive" as const } },
+	const matches = words.flatMap((word) => [
+		contains(contact.firstName, word, { insensitive: true }),
+		contains(contact.lastName, word, { insensitive: true }),
+		contains(contact.email, word, { insensitive: true }),
 	]);
 
-	const rows = await db.contact.findMany({
-		where: {
-			OR: [
-				...(email
-					? [{ email: { equals: email, mode: "insensitive" as const } }]
-					: []),
-				...contains,
-				{ company: { name: { contains: term, mode: "insensitive" as const } } },
-			],
-		},
-		orderBy: [{ lastActivityAt: "desc" }, { createdAt: "asc" }],
-		take: limit * 3,
-		select: {
-			id: true,
-			firstName: true,
-			lastName: true,
-			title: true,
-			email: true,
-			lastActivityAt: true,
-			company: { select: { id: true, name: true } },
-		},
-	});
+	const rows = await db
+		.select({
+			id: contact.id,
+			firstName: contact.firstName,
+			lastName: contact.lastName,
+			title: contact.title,
+			email: contact.email,
+			lastActivityAt: contact.lastActivityAt,
+			company: { id: company.id, name: company.name },
+		})
+		.from(contact)
+		.leftJoin(company, eq(company.id, contact.companyId))
+		.where(
+			or(
+				email ? equalsInsensitive(contact.email, email) : undefined,
+				...matches,
+				contains(company.name, term, { insensitive: true }),
+			),
+		)
+		.orderBy(desc(contact.lastActivityAt), asc(contact.createdAt))
+		.limit(limit * 3);
 
 	return rows
 		.map((row) => {
@@ -248,28 +307,29 @@ async function searchCompanies(
 	domain: string | null,
 	limit: number,
 ): Promise<CompanyHit[]> {
-	const rows = await db.company.findMany({
-		where: {
-			OR: [
-				{ name: { contains: term, mode: "insensitive" } },
-				...(domain
-					? [{ domain: { contains: domain, mode: "insensitive" as const } }]
-					: []),
-				...words.map((word) => ({
-					name: { contains: word, mode: "insensitive" as const },
-				})),
-			],
-		},
-		orderBy: [{ lastActivityAt: "desc" }, { name: "asc" }],
-		take: limit * 3,
-		select: {
-			id: true,
-			name: true,
-			domain: true,
-			industry: true,
-			_count: { select: { contacts: true, deals: true } },
-		},
-	});
+	const rows = await db
+		.select({
+			id: company.id,
+			name: company.name,
+			domain: company.domain,
+			industry: company.industry,
+			contacts: db.$count(contact, eq(contact.companyId, company.id)),
+			deals: db.$count(deal, eq(deal.companyId, company.id)),
+		})
+		.from(company)
+		.where(
+			or(
+				contains(company.name, term, { insensitive: true }),
+				domain
+					? contains(company.domain, domain, { insensitive: true })
+					: undefined,
+				...words.map((word) =>
+					contains(company.name, word, { insensitive: true }),
+				),
+			),
+		)
+		.orderBy(desc(company.lastActivityAt), asc(company.name))
+		.limit(limit * 3);
 
 	return rows
 		.map((row) => ({
@@ -280,8 +340,8 @@ async function searchCompanies(
 				name: row.name,
 				domain: row.domain,
 				industry: row.industry,
-				contacts: row._count.contacts,
-				deals: row._count.deals,
+				contacts: row.contacts,
+				deals: row.deals,
 			},
 		}))
 		.sort((a, b) => b.score - a.score)
@@ -294,27 +354,28 @@ async function searchDeals(
 	words: string[],
 	limit: number,
 ): Promise<DealHit[]> {
-	const rows = await db.deal.findMany({
-		where: {
-			OR: [
-				{ name: { contains: term, mode: "insensitive" } },
-				...words.map((word) => ({
-					name: { contains: word, mode: "insensitive" as const },
-				})),
-				{ company: { name: { contains: term, mode: "insensitive" } } },
-			],
-		},
-		orderBy: [{ lastActivityAt: "desc" }, { createdAt: "desc" }],
-		take: limit * 3,
-		select: {
-			id: true,
-			name: true,
-			stage: true,
-			amount: true,
-			currency: true,
-			company: { select: { id: true, name: true } },
-		},
-	});
+	const rows = await db
+		.select({
+			id: deal.id,
+			name: deal.name,
+			stage: deal.stage,
+			amount: deal.amount,
+			currency: deal.currency,
+			company: { id: company.id, name: company.name },
+		})
+		.from(deal)
+		.innerJoin(company, eq(company.id, deal.companyId))
+		.where(
+			or(
+				contains(deal.name, term, { insensitive: true }),
+				...words.map((word) =>
+					contains(deal.name, word, { insensitive: true }),
+				),
+				contains(company.name, term, { insensitive: true }),
+			),
+		)
+		.orderBy(desc(deal.lastActivityAt), desc(deal.createdAt))
+		.limit(limit * 3);
 
 	return rows
 		.map((row) => ({

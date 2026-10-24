@@ -1,4 +1,26 @@
-import { ActivityType, db, EmailDirection } from "@crm/db";
+import {
+	ActivityType,
+	activity,
+	and,
+	asc,
+	calendarAttendee,
+	calendarEvent,
+	company as companyTable,
+	contact,
+	db,
+	deal as dealTable,
+	desc,
+	EmailDirection,
+	emailMessage,
+	emailThread,
+	eq,
+	firstRow,
+	inArray,
+	or,
+	orNull,
+	sql,
+	whereEq,
+} from "@crm/db";
 import { z } from "zod";
 import { isDerivedName } from "./names";
 
@@ -102,59 +124,73 @@ export async function readCompanyHistory(
 		includeCalendar?: boolean;
 	} = {},
 ): Promise<CompanyHistory | null> {
-	const company = await db.company.findUnique({
-		where: { id: companyId },
-		select: {
-			id: true,
-			name: true,
-			domain: true,
-			website: true,
-			industry: true,
-			subIndustry: true,
-			city: true,
-			country: true,
-			description: true,
-			linkedinUrl: true,
-			enrichmentStatus: true,
-		},
-	});
+	const company = await firstRow(
+		db
+			.select({
+				id: companyTable.id,
+				name: companyTable.name,
+				domain: companyTable.domain,
+				website: companyTable.website,
+				industry: companyTable.industry,
+				subIndustry: companyTable.subIndustry,
+				city: companyTable.city,
+				country: companyTable.country,
+				description: companyTable.description,
+				linkedinUrl: companyTable.linkedinUrl,
+				enrichmentStatus: companyTable.enrichmentStatus,
+			})
+			.from(companyTable)
+			.where(whereEq(companyTable.id, companyId))
+			.limit(1),
+	);
 
 	if (!company) return null;
 	const includeEmail = options.includeEmail ?? true;
 	const includeCalendar = options.includeCalendar ?? true;
 
-	const belongsToCompany = { OR: [{ companyId }, { contact: { companyId } }] };
+	const companyContacts = db
+		.select({ id: contact.id })
+		.from(contact)
+		.where(eq(contact.companyId, companyId));
+	const belongsToCompany = or(
+		eq(emailThread.companyId, companyId),
+		inArray(emailThread.contactId, companyContacts),
+	);
+	const companyThreads = db
+		.select({ id: emailThread.id })
+		.from(emailThread)
+		.where(belongsToCompany);
 
 	const [people, deals, threads, meetings, notes, lastInbound, counts] =
 		await Promise.all([
-			db.contact.findMany({
-				where: { companyId },
-				orderBy: [{ lastActivityAt: "desc" }, { createdAt: "asc" }],
-				take: options.people ?? 25,
-				select: {
-					id: true,
-					firstName: true,
-					lastName: true,
-					title: true,
-					email: true,
-					linkedinUrl: true,
-					lastActivityAt: true,
-					_count:
-						includeEmail || includeCalendar
-							? {
-									select: {
-										emailThreads: includeEmail,
-										calendarEvents: includeCalendar,
-									},
-								}
-							: false,
-				},
-			}),
-			db.deal.findMany({
-				where: { companyId },
-				orderBy: [{ lastActivityAt: "desc" }, { createdAt: "desc" }],
-				take: 20,
-				select: {
+			db
+				.select({
+					id: contact.id,
+					firstName: contact.firstName,
+					lastName: contact.lastName,
+					title: contact.title,
+					email: contact.email,
+					linkedinUrl: contact.linkedinUrl,
+					lastActivityAt: contact.lastActivityAt,
+					threads: includeEmail
+						? db.$count(emailThread, eq(emailThread.contactId, contact.id))
+						: sql<number>`0`.mapWith(Number),
+					meetings: includeCalendar
+						? db.$count(calendarEvent, eq(calendarEvent.contactId, contact.id))
+						: sql<number>`0`.mapWith(Number),
+				})
+				.from(contact)
+				.where(eq(contact.companyId, companyId))
+				.orderBy(
+					sql`${contact.lastActivityAt} desc nulls first`,
+					asc(contact.createdAt),
+				)
+				.limit(options.people ?? 25),
+			db.query.deal.findMany({
+				where: whereEq(dealTable.companyId, companyId),
+				orderBy: [desc(dealTable.lastActivityAt), desc(dealTable.createdAt)],
+				limit: 20,
+				columns: {
 					id: true,
 					name: true,
 					stage: true,
@@ -162,32 +198,36 @@ export async function readCompanyHistory(
 					currency: true,
 					expectedCloseDate: true,
 					lastActivityAt: true,
+				},
+				with: {
 					contacts: {
-						select: {
-							role: true,
+						columns: { role: true },
+						with: {
 							contact: {
-								select: { id: true, firstName: true, lastName: true },
+								columns: { id: true, firstName: true, lastName: true },
 							},
 						},
 					},
 				},
 			}),
 			includeEmail
-				? db.emailThread.findMany({
+				? db.query.emailThread.findMany({
 						where: belongsToCompany,
-						orderBy: { lastMessageAt: "desc" },
-						take: options.threads ?? 5,
-						select: {
+						orderBy: [desc(emailThread.lastMessageAt)],
+						limit: options.threads ?? 5,
+						columns: {
 							subject: true,
 							messageCount: true,
 							lastMessageAt: true,
+						},
+						with: {
 							contact: {
-								select: { id: true, firstName: true, lastName: true },
+								columns: { id: true, firstName: true, lastName: true },
 							},
 							messages: {
-								orderBy: { sentAt: "desc" },
-								take: options.messagesPerThread ?? 4,
-								select: {
+								orderBy: [desc(emailMessage.sentAt)],
+								limit: options.messagesPerThread ?? 4,
+								columns: {
 									direction: true,
 									fromEmail: true,
 									fromName: true,
@@ -200,45 +240,60 @@ export async function readCompanyHistory(
 					})
 				: Promise.resolve([]),
 			includeCalendar
-				? db.calendarEvent.findMany({
-						where: {
-							OR: [
-								{ companyId },
-								{ contact: { companyId } },
-								{ attendees: { some: { contact: { companyId } } } },
-							],
-						},
-						orderBy: { startsAt: "desc" },
-						take: 10,
-						select: {
-							title: true,
-							startsAt: true,
-							attendees: { select: { email: true, name: true } },
-						},
+				? db.query.calendarEvent.findMany({
+						where: or(
+							eq(calendarEvent.companyId, companyId),
+							inArray(calendarEvent.contactId, companyContacts),
+							inArray(
+								calendarEvent.id,
+								db
+									.select({ id: calendarAttendee.eventId })
+									.from(calendarAttendee)
+									.where(inArray(calendarAttendee.contactId, companyContacts)),
+							),
+						),
+						orderBy: [desc(calendarEvent.startsAt)],
+						limit: 10,
+						columns: { title: true, startsAt: true },
+						with: { attendees: { columns: { email: true, name: true } } },
 					})
 				: Promise.resolve([]),
 			recentNotes({ companyId }),
 			includeEmail
-				? db.emailMessage.findFirst({
-						where: {
-							direction: EmailDirection.INBOUND,
-							thread: belongsToCompany,
-						},
-						orderBy: { sentAt: "desc" },
-						select: { sentAt: true, fromEmail: true, fromName: true },
-					})
+				? firstRow(
+						db
+							.select({
+								sentAt: emailMessage.sentAt,
+								fromEmail: emailMessage.fromEmail,
+								fromName: emailMessage.fromName,
+							})
+							.from(emailMessage)
+							.where(
+								and(
+									eq(emailMessage.direction, EmailDirection.INBOUND),
+									inArray(emailMessage.threadId, companyThreads),
+								),
+							)
+							.orderBy(desc(emailMessage.sentAt))
+							.limit(1),
+					)
 				: Promise.resolve(null),
 			Promise.all([
-				db.contact.count({ where: { companyId } }),
+				db.$count(contact, whereEq(contact.companyId, companyId)),
 				includeEmail
-					? db.emailMessage.count({ where: { thread: belongsToCompany } })
+					? db.$count(
+							emailMessage,
+							inArray(emailMessage.threadId, companyThreads),
+						)
 					: Promise.resolve(0),
 				includeCalendar
-					? db.calendarEvent.count({
-							where: {
-								OR: [{ companyId }, { contact: { companyId } }],
-							},
-						})
+					? db.$count(
+							calendarEvent,
+							or(
+								eq(calendarEvent.companyId, companyId),
+								inArray(calendarEvent.contactId, companyContacts),
+							),
+						)
 					: Promise.resolve(0),
 			]),
 		]);
@@ -267,8 +322,8 @@ export async function readCompanyHistory(
 			email: person.email,
 			linkedinUrl: person.linkedinUrl,
 			lastActivityAt: person.lastActivityAt?.toISOString() ?? null,
-			threads: person._count?.emailThreads ?? 0,
-			meetings: person._count?.calendarEvents ?? 0,
+			threads: person.threads,
+			meetings: person.meetings,
 			needsIdentity: isDerivedName(
 				person.email,
 				person.firstName,
@@ -346,39 +401,43 @@ export async function readDealHistory(
 		includeCalendar?: boolean;
 	} = {},
 ): Promise<DealHistory | null> {
-	const deal = await db.deal.findUnique({
-		where: { id: dealId },
-		select: {
-			id: true,
-			name: true,
-			description: true,
-			stage: true,
-			stageChangedAt: true,
-			amount: true,
-			currency: true,
-			expectedCloseDate: true,
-			closedAt: true,
-			closedReason: true,
-			lastActivityAt: true,
-			createdAt: true,
-			owner: { select: { name: true, email: true } },
-			company: { select: { id: true, name: true, domain: true } },
-			contacts: {
-				select: {
-					role: true,
-					contact: {
-						select: {
-							id: true,
-							firstName: true,
-							lastName: true,
-							title: true,
-							email: true,
+	const deal = await db.query.deal
+		.findFirst({
+			where: whereEq(dealTable.id, dealId),
+			columns: {
+				id: true,
+				name: true,
+				description: true,
+				stage: true,
+				stageChangedAt: true,
+				amount: true,
+				currency: true,
+				expectedCloseDate: true,
+				closedAt: true,
+				closedReason: true,
+				lastActivityAt: true,
+				createdAt: true,
+			},
+			with: {
+				owner: { columns: { name: true, email: true } },
+				company: { columns: { id: true, name: true, domain: true } },
+				contacts: {
+					columns: { role: true },
+					with: {
+						contact: {
+							columns: {
+								id: true,
+								firstName: true,
+								lastName: true,
+								title: true,
+								email: true,
+							},
 						},
 					},
 				},
 			},
-		},
-	});
+		})
+		.then(orNull);
 
 	if (!deal) return null;
 	const includeEmail = options.includeEmail ?? true;
@@ -388,38 +447,43 @@ export async function readDealHistory(
 
 	const relatedThreads =
 		contactIds.length > 0
-			? {
-					OR: [
-						{ contactId: { in: contactIds } },
-						{ companyId: deal.company.id },
-					],
-				}
-			: { companyId: deal.company.id };
+			? or(
+					inArray(emailThread.contactId, contactIds),
+					eq(emailThread.companyId, deal.company.id),
+				)
+			: eq(emailThread.companyId, deal.company.id);
 
 	const [stageChanges, threads, meetings, notes, lastInbound] =
 		await Promise.all([
-			db.activity.findMany({
-				where: { dealId, type: ActivityType.STAGE_CHANGE },
-				orderBy: { createdAt: "asc" },
-				take: 25,
-				select: { meta: true, createdAt: true },
-			}),
+			db
+				.select({ meta: activity.meta, createdAt: activity.createdAt })
+				.from(activity)
+				.where(
+					and(
+						whereEq(activity.dealId, dealId),
+						eq(activity.type, ActivityType.STAGE_CHANGE),
+					),
+				)
+				.orderBy(asc(activity.createdAt))
+				.limit(25),
 			includeEmail
-				? db.emailThread.findMany({
+				? db.query.emailThread.findMany({
 						where: relatedThreads,
-						orderBy: { lastMessageAt: "desc" },
-						take: options.threads ?? 5,
-						select: {
+						orderBy: [desc(emailThread.lastMessageAt)],
+						limit: options.threads ?? 5,
+						columns: {
 							subject: true,
 							messageCount: true,
 							lastMessageAt: true,
+						},
+						with: {
 							contact: {
-								select: { id: true, firstName: true, lastName: true },
+								columns: { id: true, firstName: true, lastName: true },
 							},
 							messages: {
-								orderBy: { sentAt: "desc" },
-								take: options.messagesPerThread ?? 4,
-								select: {
+								orderBy: [desc(emailMessage.sentAt)],
+								limit: options.messagesPerThread ?? 4,
+								columns: {
 									direction: true,
 									fromEmail: true,
 									fromName: true,
@@ -432,38 +496,52 @@ export async function readDealHistory(
 					})
 				: Promise.resolve([]),
 			includeCalendar
-				? db.calendarEvent.findMany({
+				? db.query.calendarEvent.findMany({
 						where:
 							contactIds.length > 0
-								? {
-										OR: [
-											{ contactId: { in: contactIds } },
-											{
-												attendees: { some: { contactId: { in: contactIds } } },
-											},
-											{ companyId: deal.company.id },
-										],
-									}
-								: { companyId: deal.company.id },
-						orderBy: { startsAt: "desc" },
-						take: 10,
-						select: {
-							title: true,
-							startsAt: true,
-							attendees: { select: { email: true, name: true } },
-						},
+								? or(
+										inArray(calendarEvent.contactId, contactIds),
+										inArray(
+											calendarEvent.id,
+											db
+												.select({ id: calendarAttendee.eventId })
+												.from(calendarAttendee)
+												.where(inArray(calendarAttendee.contactId, contactIds)),
+										),
+										eq(calendarEvent.companyId, deal.company.id),
+									)
+								: eq(calendarEvent.companyId, deal.company.id),
+						orderBy: [desc(calendarEvent.startsAt)],
+						limit: 10,
+						columns: { title: true, startsAt: true },
+						with: { attendees: { columns: { email: true, name: true } } },
 					})
 				: Promise.resolve([]),
 			recentNotes({ dealId }),
 			includeEmail
-				? db.emailMessage.findFirst({
-						where: {
-							direction: EmailDirection.INBOUND,
-							thread: relatedThreads,
-						},
-						orderBy: { sentAt: "desc" },
-						select: { sentAt: true, fromEmail: true, fromName: true },
-					})
+				? firstRow(
+						db
+							.select({
+								sentAt: emailMessage.sentAt,
+								fromEmail: emailMessage.fromEmail,
+								fromName: emailMessage.fromName,
+							})
+							.from(emailMessage)
+							.where(
+								and(
+									eq(emailMessage.direction, EmailDirection.INBOUND),
+									inArray(
+										emailMessage.threadId,
+										db
+											.select({ id: emailThread.id })
+											.from(emailThread)
+											.where(relatedThreads),
+									),
+								),
+							)
+							.orderBy(desc(emailMessage.sentAt))
+							.limit(1),
+					)
 				: Promise.resolve(null),
 		]);
 
@@ -540,28 +618,30 @@ function isOpen(stage: string): boolean {
 async function recentNotes(
 	where: { companyId: string } | { dealId: string },
 ): Promise<AccountNote[]> {
-	const rows = await db.activity.findMany({
-		where: {
-			...where,
-			type: {
-				in: [
+	const rows = await db
+		.select({
+			type: activity.type,
+			subject: activity.subject,
+			body: activity.body,
+			occurredAt: activity.occurredAt,
+			createdAt: activity.createdAt,
+		})
+		.from(activity)
+		.where(
+			and(
+				"companyId" in where
+					? eq(activity.companyId, where.companyId)
+					: eq(activity.dealId, where.dealId),
+				inArray(activity.type, [
 					ActivityType.NOTE,
 					ActivityType.CALL,
 					ActivityType.TASK,
 					ActivityType.ENRICHMENT,
-				],
-			},
-		},
-		orderBy: { createdAt: "desc" },
-		take: 10,
-		select: {
-			type: true,
-			subject: true,
-			body: true,
-			occurredAt: true,
-			createdAt: true,
-		},
-	});
+				]),
+			),
+		)
+		.orderBy(desc(activity.createdAt))
+		.limit(10);
 
 	return rows.map((row) => ({
 		type: row.type,

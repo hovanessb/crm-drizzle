@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { type Db, sql } from "@crm/db";
 import { Injectable } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
 
@@ -7,7 +7,7 @@ export class TrackingRollupService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async run(before: Date): Promise<number> {
-		const rolled = await this.db.$executeRaw`
+		const rolled = await this.db.execute(sql`
 			INSERT INTO "trackedPageDaily" ("day", "host", "path", "views", "visitors")
 			SELECT
 				date_trunc('day', "occurredAt") AS "day",
@@ -21,8 +21,8 @@ export class TrackingRollupService {
 			ON CONFLICT ("day", "host", "path") DO UPDATE
 			SET "views" = GREATEST("trackedPageDaily"."views", EXCLUDED."views"),
 				"visitors" = GREATEST("trackedPageDaily"."visitors", EXCLUDED."visitors");
-		`;
+		`);
 
-		return rolled;
+		return rolled.rowCount ?? 0;
 	}
 }

@@ -204,46 +204,35 @@ if (!process.env.VERCEL) {
 	const dbDir = join(repoRoot, "packages/db");
 	const dbEnv = { ...process.env, DATABASE_URL: directDatabaseUrl };
 
-	console.log("• applying migrations (prisma migrate deploy)...");
-	execSync(`${bun} x prisma migrate deploy`, {
+	console.log("• applying migrations (drizzle)...");
+	execSync(`${bun} scripts/migrate.ts`, {
 		cwd: dbDir,
 		stdio: "inherit",
 		env: dbEnv,
 	});
 	console.log("✓ migrations applied");
 
-	console.log("• checking the deployed schema against schema.prisma...");
-	const drift = spawnSync(
-		bun,
-		[
-			"x",
-			"prisma",
-			"migrate",
-			"diff",
-			"--from-config-datasource",
-			"--to-schema",
-			join("prisma", "schema.prisma"),
-			"--exit-code",
-		],
-		{ cwd: dbDir, encoding: "utf8", env: dbEnv },
-	);
+	console.log("• checking src/schema/schema.ts against the migrations...");
+	const drift = spawnSync(bun, ["scripts/check-drift.ts"], {
+		cwd: dbDir,
+		encoding: "utf8",
+		env: dbEnv,
+	});
 
 	if (drift.status === 0) {
 		console.log("✓ schema matches");
-	} else if (drift.status === 2) {
+	} else if (drift.status === 1) {
 		console.log("");
-		console.log("!!  THE PRODUCTION SCHEMA DOES NOT MATCH schema.prisma  !!");
 		console.log(
-			"    Every migration is recorded as applied, so `migrate deploy` will keep reporting",
+			"!!  src/schema/schema.ts HAS CHANGES THAT NO MIGRATION COVERS  !!",
 		);
 		console.log(
-			"    nothing pending while queries fail on columns that are not there. Reconcile with",
+			"    The deployed database has every migration, but queries read columns that no",
 		);
 		console.log(
-			"    `prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --script`.",
+			"    migration created. Run `bun run db:migrate` locally and commit the new migration.",
 		);
 		console.log("");
-		console.log(drift.stdout || "");
 	} else {
 		console.log(
 			`• could not compare the schema (${drift.stderr?.trim() || "unknown error"})`,

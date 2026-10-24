@@ -1,5 +1,21 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	agentAction,
+	agentDefinition,
+	agentRun,
+	agentVersion,
+	and,
+	db,
+	eq,
+	firstRow,
+	mcpClientRegistration,
+	mcpConnection,
+	mcpToolSnapshot,
+	organization,
+	requireRow,
+	user,
+	whereEq,
+} from "@crm/db";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import type { ApprovalContext } from "eve/tools";
 import {
@@ -49,179 +65,208 @@ function context(
 }
 
 beforeAll(async () => {
-	const workspace = await db.organization.findUnique({
-		where: { id: WORKSPACE_ID },
-		select: { id: true },
-	});
+	const workspace = await firstRow(
+		db
+			.select({ id: organization.id })
+			.from(organization)
+			.where(eq(organization.id, WORKSPACE_ID))
+			.limit(1),
+	);
 	if (!workspace) {
-		await db.organization.create({
-			data: {
-				id: WORKSPACE_ID,
-				name: "Test Workspace",
-				slug: "workspace",
-				createdAt: new Date(),
-			},
-		});
+		await requireRow(
+			db
+				.insert(organization)
+				.values({
+					id: WORKSPACE_ID,
+					name: "Test Workspace",
+					slug: "workspace",
+					createdAt: new Date(),
+				})
+				.returning(),
+		);
 		createdWorkspace = true;
 	}
-	await db.user.create({
-		data: {
-			id: userId,
-			name: "MCP Runtime Test",
-			email: `${userId}@example.test`,
-		},
-	});
-	const agent = await db.agentDefinition.create({
-		data: { name: "MCP runtime", status: "LIVE", createdById: userId },
-		select: { id: true },
-	});
+	await requireRow(
+		db
+			.insert(user)
+			.values({
+				id: userId,
+				name: "MCP Runtime Test",
+				email: `${userId}@example.test`,
+			})
+			.returning(),
+	);
+	const agent = await requireRow(
+		db
+			.insert(agentDefinition)
+			.values({ name: "MCP runtime", status: "LIVE", createdById: userId })
+			.returning({ id: agentDefinition.id }),
+	);
 	agentId = agent.id;
-	const version = await db.agentVersion.create({
-		data: {
-			agentId,
-			number: 1,
-			status: "DEPLOYED",
-			instructions: "Use approved Linear tools.",
-			manifest: {
-				triggers: [
-					{
-						type: "MANUAL",
-						name: "Manual",
-						summary: "Run manually",
-						config: {},
+	const version = await requireRow(
+		db
+			.insert(agentVersion)
+			.values({
+				agentId,
+				number: 1,
+				status: "DEPLOYED",
+				instructions: "Use approved Linear tools.",
+				manifest: {
+					triggers: [
+						{
+							type: "MANUAL",
+							name: "Manual",
+							summary: "Run manually",
+							config: {},
+						},
+					],
+					dataScope: {
+						mode: "WORKSPACE",
+						summary: "Use the workspace",
+						resources: [],
 					},
-				],
-				dataScope: {
-					mode: "WORKSPACE",
-					summary: "Use the workspace",
-					resources: [],
+					actions: [
+						{
+							type: "run.summary",
+							provider: "crm",
+							summary: "Summarize the run",
+						},
+					],
+					mcp: [
+						{
+							platformSlug,
+							summary: "Use Linear",
+							tools: [
+								{
+									name: "list_issues",
+									fingerprint: readFingerprint,
+									callKind: "read",
+									summary: "List issues",
+								},
+								{
+									name: "create_issue",
+									fingerprint: changeFingerprint,
+									callKind: "change",
+									summary: "Create an issue",
+								},
+								{
+									name: "delete_issue",
+									fingerprint: riskyFingerprint,
+									callKind: "risky",
+									summary: "Delete an issue",
+								},
+							],
+						},
+					],
 				},
-				actions: [
-					{
-						type: "run.summary",
-						provider: "crm",
-						summary: "Summarize the run",
-					},
-				],
-				mcp: [
-					{
-						platformSlug,
-						summary: "Use Linear",
-						tools: [
-							{
-								name: "list_issues",
-								fingerprint: readFingerprint,
-								callKind: "read",
-								summary: "List issues",
-							},
-							{
-								name: "create_issue",
-								fingerprint: changeFingerprint,
-								callKind: "change",
-								summary: "Create an issue",
-							},
-							{
-								name: "delete_issue",
-								fingerprint: riskyFingerprint,
-								callKind: "risky",
-								summary: "Delete an issue",
-							},
-						],
-					},
-				],
-			},
-			modelId: "test/model",
-			sandboxPolicy: {},
-			createdById: userId,
-			approvedAt: new Date(),
-			deployedAt: new Date(),
-		},
-		select: { id: true },
-	});
+				modelId: "test/model",
+				sandboxPolicy: {},
+				createdById: userId,
+				approvedAt: new Date(),
+				deployedAt: new Date(),
+			})
+			.returning({ id: agentVersion.id }),
+	);
 	versionId = version.id;
-	await db.agentDefinition.update({
-		where: { id: agentId },
-		data: { currentVersionId: versionId },
-	});
-	const run = await db.agentRun.create({
-		data: {
-			agentId,
-			versionId,
-			triggerType: "MANUAL",
-			status: "RUNNING",
-			idempotencyKey: `mcp-runtime-${suffix}`,
-			correlationId: `mcp-runtime-${suffix}`,
-		},
-		select: { id: true },
-	});
+	await requireRow(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: versionId })
+			.where(whereEq(agentDefinition.id, agentId))
+			.returning(),
+	);
+	const run = await requireRow(
+		db
+			.insert(agentRun)
+			.values({
+				agentId,
+				versionId,
+				triggerType: "MANUAL",
+				status: "RUNNING",
+				idempotencyKey: `mcp-runtime-${suffix}`,
+				correlationId: `mcp-runtime-${suffix}`,
+			})
+			.returning({ id: agentRun.id }),
+	);
 	runId = run.id;
-	const registration = await db.mcpClientRegistration.create({
-		data: {
-			platformSlug,
-			metadataFingerprint: suffix,
-			issuer: "https://mcp.linear.app",
-			clientId: `client-${suffix}`,
-		},
-		select: { id: true },
-	});
+	const registration = await requireRow(
+		db
+			.insert(mcpClientRegistration)
+			.values({
+				platformSlug,
+				metadataFingerprint: suffix,
+				issuer: "https://mcp.linear.app",
+				clientId: `client-${suffix}`,
+			})
+			.returning({ id: mcpClientRegistration.id }),
+	);
 	registrationId = registration.id;
-	const connection = await db.mcpConnection.create({
-		data: {
-			organizationId: WORKSPACE_ID,
-			platformSlug,
-			status: "CONNECTED",
-			accessMode: "READ_WRITE",
-			grantedScopes: ["read", "write"],
-			registrationId,
-			connectedById: userId,
-			toolSnapshots: {
-				create: [
-					{
-						name: "list_issues",
-						description: "List issues",
-						inputSchema: {},
-						fingerprint: readFingerprint,
-						callKind: "read",
-						reviewState: "REVIEWED",
-					},
-					{
-						name: "create_issue",
-						description: "Create an issue",
-						inputSchema: {},
-						fingerprint: changeFingerprint,
-						callKind: "change",
-						reviewState: "REVIEWED",
-					},
-					{
-						name: "delete_issue",
-						description: "Delete an issue",
-						inputSchema: {},
-						fingerprint: riskyFingerprint,
-						callKind: "risky",
-						reviewState: "REVIEWED",
-					},
-				],
+	const connection = await requireRow(
+		db
+			.insert(mcpConnection)
+			.values({
+				organizationId: WORKSPACE_ID,
+				platformSlug,
+				status: "CONNECTED",
+				accessMode: "READ_WRITE",
+				grantedScopes: ["read", "write"],
+				registrationId,
+				connectedById: userId,
+			})
+			.returning({ id: mcpConnection.id }),
+	);
+	await db.insert(mcpToolSnapshot).values(
+		[
+			{
+				name: "list_issues",
+				description: "List issues",
+				inputSchema: {},
+				fingerprint: readFingerprint,
+				callKind: "read" as const,
+				reviewState: "REVIEWED" as const,
 			},
-		},
-		select: { id: true },
-	});
+			{
+				name: "create_issue",
+				description: "Create an issue",
+				inputSchema: {},
+				fingerprint: changeFingerprint,
+				callKind: "change" as const,
+				reviewState: "REVIEWED" as const,
+			},
+			{
+				name: "delete_issue",
+				description: "Delete an issue",
+				inputSchema: {},
+				fingerprint: riskyFingerprint,
+				callKind: "risky" as const,
+				reviewState: "REVIEWED" as const,
+			},
+		].map((tool) => ({ ...tool, connectionId: connection.id })),
+	);
 	connectionId = connection.id;
 });
 
 afterAll(async () => {
-	await db.mcpConnection.deleteMany({ where: { platformSlug } });
-	await db.mcpClientRegistration.deleteMany({ where: { id: registrationId } });
-	await db.agentAction.deleteMany({ where: { runId } });
-	await db.agentRun.deleteMany({ where: { id: runId } });
-	await db.agentDefinition.update({
-		where: { id: agentId },
-		data: { currentVersionId: null },
-	});
-	await db.agentVersion.deleteMany({ where: { id: versionId } });
-	await db.agentDefinition.deleteMany({ where: { id: agentId } });
-	await db.user.deleteMany({ where: { id: userId } });
+	await db
+		.delete(mcpConnection)
+		.where(whereEq(mcpConnection.platformSlug, platformSlug));
+	await db
+		.delete(mcpClientRegistration)
+		.where(whereEq(mcpClientRegistration.id, registrationId));
+	await db.delete(agentAction).where(whereEq(agentAction.runId, runId));
+	await db.delete(agentRun).where(whereEq(agentRun.id, runId));
+	await requireRow(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(whereEq(agentDefinition.id, agentId))
+			.returning(),
+	);
+	await db.delete(agentVersion).where(whereEq(agentVersion.id, versionId));
+	await db.delete(agentDefinition).where(whereEq(agentDefinition.id, agentId));
+	await db.delete(user).where(whereEq(user.id, userId));
 	if (createdWorkspace) {
-		await db.organization.deleteMany({ where: { id: WORKSPACE_ID } });
+		await db.delete(organization).where(eq(organization.id, WORKSPACE_ID));
 	}
 });
 
@@ -292,9 +337,10 @@ describe("MCP runtime authorization", () => {
 			),
 		).toBe("user-approval");
 		expect(
-			await db.agentAction.count({
-				where: { idempotencyKey: `${runId}:manual-change` },
-			}),
+			await db.$count(
+				agentAction,
+				whereEq(agentAction.idempotencyKey, `${runId}:manual-change`),
+			),
 		).toBe(0);
 	});
 
@@ -306,9 +352,10 @@ describe("MCP runtime authorization", () => {
 			),
 		).toBe("approved");
 		expect(
-			await db.agentAction.count({
-				where: { idempotencyKey: `${runId}:auto-change` },
-			}),
+			await db.$count(
+				agentAction,
+				whereEq(agentAction.idempotencyKey, `${runId}:auto-change`),
+			),
 		).toBe(1);
 	});
 
@@ -343,10 +390,15 @@ describe("MCP runtime authorization", () => {
 	});
 
 	it("denies a tool after its reviewed fingerprint changes", async () => {
-		await db.mcpToolSnapshot.updateMany({
-			where: { connectionId, name: "list_issues" },
-			data: { reviewState: "CHANGED" },
-		});
+		await db
+			.update(mcpToolSnapshot)
+			.set({ reviewState: "CHANGED" })
+			.where(
+				and(
+					whereEq(mcpToolSnapshot.connectionId, connectionId),
+					eq(mcpToolSnapshot.name, "list_issues"),
+				),
+			);
 		try {
 			expect(
 				await authorizeMcpTool(
@@ -358,18 +410,26 @@ describe("MCP runtime authorization", () => {
 				reason: "The MCP tool changed after deployment.",
 			});
 		} finally {
-			await db.mcpToolSnapshot.updateMany({
-				where: { connectionId, name: "list_issues" },
-				data: { reviewState: "REVIEWED" },
-			});
+			await db
+				.update(mcpToolSnapshot)
+				.set({ reviewState: "REVIEWED" })
+				.where(
+					and(
+						whereEq(mcpToolSnapshot.connectionId, connectionId),
+						eq(mcpToolSnapshot.name, "list_issues"),
+					),
+				);
 		}
 	});
 
 	it("denies a change through a read-only connection", async () => {
-		await db.mcpConnection.update({
-			where: { id: connectionId },
-			data: { accessMode: "READ_ONLY" },
-		});
+		await requireRow(
+			db
+				.update(mcpConnection)
+				.set({ accessMode: "READ_ONLY" })
+				.where(whereEq(mcpConnection.id, connectionId))
+				.returning(),
+		);
 		try {
 			expect(
 				await authorizeMcpTool(
@@ -381,18 +441,24 @@ describe("MCP runtime authorization", () => {
 				reason: "The MCP connection is read-only.",
 			});
 		} finally {
-			await db.mcpConnection.update({
-				where: { id: connectionId },
-				data: { accessMode: "READ_WRITE" },
-			});
+			await requireRow(
+				db
+					.update(mcpConnection)
+					.set({ accessMode: "READ_WRITE" })
+					.where(whereEq(mcpConnection.id, connectionId))
+					.returning(),
+			);
 		}
 	});
 
 	it("denies the next call after disconnect", async () => {
-		await db.mcpConnection.update({
-			where: { id: connectionId },
-			data: { status: "DISCONNECTED" },
-		});
+		await requireRow(
+			db
+				.update(mcpConnection)
+				.set({ status: "DISCONNECTED" })
+				.where(whereEq(mcpConnection.id, connectionId))
+				.returning(),
+		);
 		try {
 			expect(
 				await authorizeMcpTool(
@@ -404,10 +470,13 @@ describe("MCP runtime authorization", () => {
 				reason: "The MCP platform is disconnected.",
 			});
 		} finally {
-			await db.mcpConnection.update({
-				where: { id: connectionId },
-				data: { status: "CONNECTED" },
-			});
+			await requireRow(
+				db
+					.update(mcpConnection)
+					.set({ status: "CONNECTED" })
+					.where(whereEq(mcpConnection.id, connectionId))
+					.returning(),
+			);
 		}
 	});
 
@@ -422,9 +491,10 @@ describe("MCP runtime authorization", () => {
 			reason: "This MCP change already ran.",
 		});
 		expect(
-			await db.agentAction.count({
-				where: { idempotencyKey: `${runId}:change-once` },
-			}),
+			await db.$count(
+				agentAction,
+				whereEq(agentAction.idempotencyKey, `${runId}:change-once`),
+			),
 		).toBe(1);
 	});
 });

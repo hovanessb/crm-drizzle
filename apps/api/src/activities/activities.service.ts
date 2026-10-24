@@ -1,4 +1,29 @@
-import { ActivityType, type Db, Prisma } from "@crm/db";
+import {
+	ActivityType,
+	activity,
+	and,
+	calendarAttendee,
+	calendarEvent,
+	company,
+	contact,
+	contains,
+	count,
+	type Db,
+	deal,
+	desc,
+	eq,
+	gte,
+	inArray,
+	isNotNull,
+	isNull,
+	lt,
+	not,
+	or,
+	relatedCount,
+	type SQL,
+	sql,
+	user,
+} from "@crm/db";
 import { activityMeta } from "@crm/validation/activity-meta";
 import {
 	BadRequestException,
@@ -15,6 +40,8 @@ import {
 	type OrderByColumns,
 	paginate,
 	resolveOrderBy,
+	sortBy,
+	sortNullsLast,
 } from "../trpc/list-input";
 import type {
 	ActivityCreateInput,
@@ -36,44 +63,53 @@ import {
 	taskWindowFilter,
 } from "./task-due-date";
 
-const AUTHOR_SELECT = {
+const AUTHOR_COLUMNS = {
 	id: true,
 	name: true,
 	email: true,
 	image: true,
 } as const;
 
-const ENTRY_SELECT = {
-	id: true,
-	type: true,
-	subject: true,
-	body: true,
-	occurredAt: true,
-	dueAt: true,
-	completedAt: true,
-	meta: true,
-	createdAt: true,
-	createdBy: { select: AUTHOR_SELECT },
-	company: { select: { id: true, name: true } },
-	contact: { select: { id: true, firstName: true, lastName: true } },
-	deal: { select: { id: true, name: true } },
-
-	emailThread: {
-		select: {
-			id: true,
-			messageCount: true,
-			lastMessageAt: true,
-		},
+const ENTRY_QUERY = {
+	columns: {
+		id: true,
+		type: true,
+		subject: true,
+		body: true,
+		occurredAt: true,
+		dueAt: true,
+		completedAt: true,
+		meta: true,
+		createdAt: true,
 	},
-	calendarEvent: {
-		select: {
-			id: true,
-			startsAt: true,
-			endsAt: true,
-			isAllDay: true,
-			location: true,
-			conferenceUrl: true,
-			_count: { select: { attendees: true } },
+	with: {
+		createdBy: { columns: AUTHOR_COLUMNS },
+		company: { columns: { id: true, name: true } },
+		contact: { columns: { id: true, firstName: true, lastName: true } },
+		deal: { columns: { id: true, name: true } },
+		emailThread: {
+			columns: {
+				id: true,
+				messageCount: true,
+				lastMessageAt: true,
+			},
+		},
+		calendarEvent: {
+			columns: {
+				id: true,
+				startsAt: true,
+				endsAt: true,
+				isAllDay: true,
+				location: true,
+				conferenceUrl: true,
+			},
+			extras: (event: { id: typeof calendarEvent.id }) => ({
+				attendeeCount: relatedCount(
+					calendarAttendee,
+					calendarAttendee.eventId,
+					event.id,
+				).as("attendeeCount"),
+			}),
 		},
 	},
 } as const;
@@ -85,54 +121,53 @@ const NOTE_TYPES = [
 	ActivityType.MEETING,
 ];
 
-const TASK_SELECT = {
-	id: true,
-	subject: true,
-	dueAt: true,
-	completedAt: true,
-	createdAt: true,
-	createdBy: { select: AUTHOR_SELECT },
-	company: {
-		select: {
-			id: true,
-			name: true,
-			domain: true,
-			iconUrl: true,
-			iconDarkUrl: true,
-			iconTone: true,
-			logoUrl: true,
-		},
+const TASK_FIELDS = {
+	id: activity.id,
+	subject: activity.subject,
+	dueAt: activity.dueAt,
+	completedAt: activity.completedAt,
+	createdAt: activity.createdAt,
+	createdBy: {
+		id: user.id,
+		name: user.name,
+		email: user.email,
+		image: user.image,
 	},
-	contact: { select: { id: true, firstName: true, lastName: true } },
-	deal: { select: { id: true, name: true } },
-} as const;
+	company: {
+		id: company.id,
+		name: company.name,
+		domain: company.domain,
+		iconUrl: company.iconUrl,
+		iconDarkUrl: company.iconDarkUrl,
+		iconTone: company.iconTone,
+		logoUrl: company.logoUrl,
+	},
+	contact: {
+		id: contact.id,
+		firstName: contact.firstName,
+		lastName: contact.lastName,
+	},
+	deal: { id: deal.id, name: deal.name },
+};
 
-const TASK_SORTABLE: OrderByColumns<Prisma.ActivityOrderByWithRelationInput[]> =
-	{
-		subject: (dir) => [{ subject: { sort: dir, nulls: "last" } }],
-		dueAt: (dir) => [
-			{ dueAt: { sort: dir, nulls: "last" } },
-			{ createdAt: "desc" },
-		],
-		status: (dir) => [
-			{
-				completedAt: {
-					sort: dir,
-					nulls: dir === "asc" ? "first" : "last",
-				},
-			},
-			{ dueAt: { sort: "asc", nulls: "last" } },
-		],
-		company: (dir) => [
-			{ company: { name: dir } },
-			{ dueAt: { sort: "asc", nulls: "last" } },
-		],
-		createdBy: (dir) => [
-			{ createdBy: { name: dir } },
-			{ dueAt: { sort: "asc", nulls: "last" } },
-		],
-		createdAt: (dir) => [{ createdAt: dir }],
-	};
+const dueFirst = sql`${activity.dueAt} asc nulls last`;
+
+const TASK_SORTABLE: OrderByColumns<SQL[]> = {
+	subject: (dir) => [sortNullsLast(activity.subject, dir)],
+	dueAt: (dir) => [
+		sortNullsLast(activity.dueAt, dir),
+		desc(activity.createdAt),
+	],
+	status: (dir) => [
+		dir === "asc"
+			? sql`${activity.completedAt} asc nulls first`
+			: sql`${activity.completedAt} desc nulls last`,
+		dueFirst,
+	],
+	company: (dir) => [sortBy(company.name, dir), dueFirst],
+	createdBy: (dir) => [sortBy(user.name, dir), dueFirst],
+	createdAt: (dir) => [sortBy(activity.createdAt, dir)],
+};
 
 const taskAggregateRow = z.object({
 	open: z.coerce.number().int().nonnegative(),
@@ -154,19 +189,17 @@ export class ActivitiesService {
 	) {}
 
 	async timeline(input: TimelineInput): Promise<TimelineResult> {
-		const where = this.anchor(input);
-		Object.assign(where, filterClause(input.filter));
+		const where = and(
+			this.anchor(input),
+			filterClause(input.filter),
+			input.cursor ? await this.after(input.cursor) : undefined,
+		);
 
-		const rows = await this.db.activity.findMany({
+		const rows = await this.db.query.activity.findMany({
+			...ENTRY_QUERY,
 			where,
-			take: input.limit + 1,
-			cursor: input.cursor ? { id: input.cursor } : undefined,
-			skip: input.cursor ? 1 : undefined,
-			orderBy: [
-				{ occurredAt: { sort: "desc", nulls: "last" } },
-				{ id: "desc" },
-			],
-			select: ENTRY_SELECT,
+			limit: input.limit + 1,
+			orderBy: [sql`${activity.occurredAt} desc nulls last`, desc(activity.id)],
 		});
 
 		const hasMore = rows.length > input.limit;
@@ -184,20 +217,12 @@ export class ActivitiesService {
 		const anchor = this.anchor(input);
 
 		const [all, notes, upcoming, done, email, meetings] = await Promise.all([
-			this.db.activity.count({ where: anchor }),
-			this.db.activity.count({
-				where: { ...anchor, ...filterClause("notes") },
-			}),
-			this.db.activity.count({
-				where: { ...anchor, ...filterClause("upcoming") },
-			}),
-			this.db.activity.count({ where: { ...anchor, ...filterClause("done") } }),
-			this.db.activity.count({
-				where: { ...anchor, ...filterClause("email") },
-			}),
-			this.db.activity.count({
-				where: { ...anchor, ...filterClause("meetings") },
-			}),
+			this.db.$count(activity, anchor),
+			this.db.$count(activity, and(anchor, filterClause("notes"))),
+			this.db.$count(activity, and(anchor, filterClause("upcoming"))),
+			this.db.$count(activity, and(anchor, filterClause("done"))),
+			this.db.$count(activity, and(anchor, filterClause("email"))),
+			this.db.$count(activity, and(anchor, filterClause("meetings"))),
 		]);
 
 		return { all, notes, upcoming, done, email, meetings };
@@ -211,8 +236,9 @@ export class ActivitiesService {
 
 		const isTask = input.type === ActivityType.TASK;
 
-		const activity = await this.db.activity.create({
-			data: {
+		const [inserted] = await this.db
+			.insert(activity)
+			.values({
 				type: input.type,
 				subject: blankToNull(input.subject ?? ""),
 				body: blankToNull(input.body ?? ""),
@@ -222,46 +248,46 @@ export class ActivitiesService {
 				contactId: input.contactId ?? null,
 				dealId: input.dealId ?? null,
 				createdById: actingUserId,
-			},
-			select: ENTRY_SELECT,
-		});
+			})
+			.returning({ id: activity.id });
+		if (!inserted) throw new Error("The activity insert returned no row.");
+
+		const entry = await this.entry(inserted.id);
 
 		await this.stamp.touch(
 			{ companyId, contactId: input.contactId, dealId: input.dealId },
-			activity.createdAt,
+			entry.createdAt,
 		);
 
 		this.logger.log({
 			message: "Activity logged",
-			activityId: activity.id,
-			type: activity.type,
+			activityId: entry.id,
+			type: entry.type,
 		});
 
-		return serializeEntry(activity);
+		return serializeEntry(entry);
 	}
 
 	async update(input: ActivityUpdateInput): Promise<ActivityEntry> {
 		await this.requireTask(input.id, "Only tasks can be edited.");
 
-		const updated = await this.db.activity.update({
-			where: { id: input.id },
-			data: { subject: input.subject, dueAt: parseTaskDueDay(input.dueAt) },
-			select: ENTRY_SELECT,
-		});
+		await this.db
+			.update(activity)
+			.set({ subject: input.subject, dueAt: parseTaskDueDay(input.dueAt) })
+			.where(eq(activity.id, input.id));
 
-		return serializeEntry(updated);
+		return serializeEntry(await this.entry(input.id));
 	}
 
 	async complete(id: string, completed: boolean): Promise<ActivityEntry> {
 		await this.requireTask(id, "Only tasks can be completed.");
 
-		const updated = await this.db.activity.update({
-			where: { id },
-			data: { completedAt: completed ? new Date() : null },
-			select: ENTRY_SELECT,
-		});
+		await this.db
+			.update(activity)
+			.set({ completedAt: completed ? new Date() : null })
+			.where(eq(activity.id, id));
 
-		return serializeEntry(updated);
+		return serializeEntry(await this.entry(id));
 	}
 
 	async myTasks(
@@ -269,23 +295,19 @@ export class ActivitiesService {
 		actingUserId: string,
 	): Promise<ActivityEntry[]> {
 		const now = new Date();
-		const where: Prisma.ActivityWhereInput = {
-			type: ActivityType.TASK,
-			completedAt: null,
-			createdById: actingUserId,
-		};
+		const where = and(
+			eq(activity.type, ActivityType.TASK),
+			isNull(activity.completedAt),
+			eq(activity.createdById, actingUserId),
+			input.window === "overdue" ? lt(activity.dueAt, now) : undefined,
+			input.window === "upcoming" ? gte(activity.dueAt, now) : undefined,
+		);
 
-		if (input.window === "overdue") where.dueAt = { lt: now };
-		if (input.window === "upcoming") where.dueAt = { gte: now };
-
-		const tasks = await this.db.activity.findMany({
+		const tasks = await this.db.query.activity.findMany({
+			...ENTRY_QUERY,
 			where,
-			take: input.limit,
-			orderBy: [
-				{ dueAt: { sort: "asc", nulls: "last" } },
-				{ createdAt: "desc" },
-			],
-			select: ENTRY_SELECT,
+			limit: input.limit,
+			orderBy: [dueFirst, desc(activity.createdAt)],
 		});
 
 		return tasks.map(serializeEntry);
@@ -297,17 +319,17 @@ export class ActivitiesService {
 		const { skip, take } = paginate(input);
 
 		const [rows, total, facetCounts] = await Promise.all([
-			this.db.activity.findMany({
-				where,
-				skip,
-				take,
-				orderBy: resolveOrderBy(input, TASK_SORTABLE, [
-					{ dueAt: { sort: "asc", nulls: "last" } },
-					{ createdAt: "desc" },
-				]),
-				select: TASK_SELECT,
-			}),
-			this.db.activity.count({ where }),
+			selectTasks(this.db)
+				.where(where)
+				.orderBy(
+					...resolveOrderBy(input, TASK_SORTABLE, [
+						dueFirst,
+						desc(activity.createdAt),
+					]),
+				)
+				.limit(take)
+				.offset(skip),
+			this.db.$count(activity, where),
 			this.taskFacetCounts(input.q, now),
 		]);
 
@@ -322,48 +344,60 @@ export class ActivitiesService {
 		};
 	}
 
-	private taskWhere(
-		input: TaskListInput,
-		now: Date,
-	): Prisma.ActivityWhereInput {
-		const where = this.taskBaseWhere(input.q);
-
-		if (input.status === "open") where.completedAt = null;
-		if (input.status === "done") where.completedAt = { not: null };
-		if (input.createdBy.length > 0) {
-			where.createdById = { in: input.createdBy };
-		}
-		if (input.due.length > 0) {
-			where.AND = [
-				{ OR: input.due.map((window) => taskWindowFilter(window, now)) },
-			];
-		}
-
-		return where;
+	private taskWhere(input: TaskListInput, now: Date): SQL | undefined {
+		return and(
+			this.taskBaseWhere(input.q),
+			input.status === "open" ? isNull(activity.completedAt) : undefined,
+			input.status === "done" ? isNotNull(activity.completedAt) : undefined,
+			input.createdBy.length > 0
+				? inArray(activity.createdById, input.createdBy)
+				: undefined,
+			input.due.length > 0
+				? or(...input.due.map((window) => taskWindowFilter(window, now)))
+				: undefined,
+		);
 	}
 
-	private taskBaseWhere(q: string): Prisma.ActivityWhereInput {
+	private taskBaseWhere(q: string): SQL | undefined {
 		const term = q.trim();
-		const where: Prisma.ActivityWhereInput = { type: ActivityType.TASK };
-		if (!term) return where;
+		const isTask = eq(activity.type, ActivityType.TASK);
+		if (!term) return isTask;
 
-		where.OR = [
-			{ subject: { contains: term, mode: "insensitive" } },
-			{ body: { contains: term, mode: "insensitive" } },
-			{ company: { name: { contains: term, mode: "insensitive" } } },
-			{ deal: { name: { contains: term, mode: "insensitive" } } },
-			{ contact: { firstName: { contains: term, mode: "insensitive" } } },
-			{ contact: { lastName: { contains: term, mode: "insensitive" } } },
-		];
+		const matches = (column: Parameters<typeof contains>[0]) =>
+			contains(column, term, { insensitive: true });
 
-		return where;
+		return and(
+			isTask,
+			or(
+				matches(activity.subject),
+				matches(activity.body),
+				inArray(
+					activity.companyId,
+					this.db
+						.select({ id: company.id })
+						.from(company)
+						.where(matches(company.name)),
+				),
+				inArray(
+					activity.dealId,
+					this.db.select({ id: deal.id }).from(deal).where(matches(deal.name)),
+				),
+				inArray(
+					activity.contactId,
+					this.db
+						.select({ id: contact.id })
+						.from(contact)
+						.where(or(matches(contact.firstName), matches(contact.lastName))),
+				),
+			),
+		);
 	}
 
 	private async taskFacetCounts(q: string, now: Date) {
 		const where = this.taskBaseWhere(q);
 		const term = q.trim();
 		const search = term
-			? Prisma.sql`AND (
+			? sql`AND (
 				strpos(lower(COALESCE(activity."subject", '')), lower(${term})) > 0
 				OR strpos(lower(COALESCE(activity."body", '')), lower(${term})) > 0
 				OR strpos(lower(COALESCE(company."name", '')), lower(${term})) > 0
@@ -371,17 +405,17 @@ export class ActivitiesService {
 				OR strpos(lower(COALESCE(contact."firstName", '')), lower(${term})) > 0
 				OR strpos(lower(COALESCE(contact."lastName", '')), lower(${term})) > 0
 			)`
-			: Prisma.empty;
+			: sql``;
 		const { startOfToday, startOfTomorrow, startOfNextWeek } =
 			taskDayBoundaries(now);
 
 		const [authors, aggregateRows] = await Promise.all([
-			this.db.activity.groupBy({
-				by: ["createdById"],
-				where,
-				_count: { _all: true },
-			}),
-			this.db.$queryRaw`
+			this.db
+				.select({ createdById: activity.createdById, count: count() })
+				.from(activity)
+				.where(where)
+				.groupBy(activity.createdById),
+			this.db.execute(sql`
 				SELECT
 					COUNT(*) FILTER (WHERE activity."completedAt" IS NULL) AS "open",
 					COUNT(*) FILTER (WHERE activity."completedAt" IS NOT NULL) AS "done",
@@ -396,11 +430,11 @@ export class ActivitiesService {
 				LEFT JOIN "deal" deal ON deal."id" = activity."dealId"
 				WHERE activity."type" = ${ActivityType.TASK}::"ActivityType"
 				${search}
-			`,
+			`),
 		]);
 
 		const aggregate = taskAggregateRow.parse(
-			z.array(z.unknown()).length(1).parse(aggregateRows)[0],
+			z.array(z.unknown()).length(1).parse(aggregateRows.rows)[0],
 		);
 
 		return {
@@ -417,26 +451,55 @@ export class ActivitiesService {
 	}
 
 	private async requireTask(id: string, wrongType: string) {
-		const activity = await this.db.activity.findUnique({
-			where: { id },
-			select: { type: true },
-		});
+		const [row] = await this.db
+			.select({ type: activity.type })
+			.from(activity)
+			.where(eq(activity.id, id))
+			.limit(1);
 
-		if (!activity) {
+		if (!row) {
 			throw new NotFoundException(`No activity with id ${id}.`);
 		}
 
-		if (activity.type !== ActivityType.TASK) {
+		if (row.type !== ActivityType.TASK) {
 			throw new BadRequestException(wrongType);
 		}
 	}
 
+	private async entry(id: string): Promise<Entry> {
+		const row = await findEntry(this.db, eq(activity.id, id));
+		if (!row) throw new NotFoundException(`No activity with id ${id}.`);
+		return row;
+	}
+
+	private async after(cursorId: string): Promise<SQL | undefined> {
+		const [cursor] = await this.db
+			.select({ id: activity.id, occurredAt: activity.occurredAt })
+			.from(activity)
+			.where(eq(activity.id, cursorId))
+			.limit(1);
+		if (!cursor) return sql`false`;
+
+		if (cursor.occurredAt === null) {
+			return and(isNull(activity.occurredAt), lt(activity.id, cursor.id));
+		}
+
+		return or(
+			lt(activity.occurredAt, cursor.occurredAt),
+			and(
+				eq(activity.occurredAt, cursor.occurredAt),
+				lt(activity.id, cursor.id),
+			),
+			isNull(activity.occurredAt),
+		);
+	}
+
 	private anchor(
 		input: Pick<TimelineInput, "companyId" | "contactId" | "dealId">,
-	): Prisma.ActivityWhereInput {
-		if (input.dealId) return { dealId: input.dealId };
-		if (input.contactId) return { contactId: input.contactId };
-		if (input.companyId) return { companyId: input.companyId };
+	): SQL {
+		if (input.dealId) return eq(activity.dealId, input.dealId);
+		if (input.contactId) return eq(activity.contactId, input.contactId);
+		if (input.companyId) return eq(activity.companyId, input.companyId);
 		throw new BadRequestException(
 			"A timeline needs a company, a contact or a deal.",
 		);
@@ -448,53 +511,81 @@ export class ActivitiesService {
 		if (input.companyId) return input.companyId;
 
 		if (input.dealId) {
-			const deal = await this.db.deal.findUnique({
-				where: { id: input.dealId },
-				select: { companyId: true },
-			});
-			if (!deal) {
+			const [row] = await this.db
+				.select({ companyId: deal.companyId })
+				.from(deal)
+				.where(eq(deal.id, input.dealId))
+				.limit(1);
+			if (!row) {
 				throw new NotFoundException(`No deal with id ${input.dealId}.`);
 			}
-			return deal.companyId;
+			return row.companyId;
 		}
 
 		if (input.contactId) {
-			const contact = await this.db.contact.findUnique({
-				where: { id: input.contactId },
-				select: { companyId: true },
-			});
-			if (!contact) {
+			const [row] = await this.db
+				.select({ companyId: contact.companyId })
+				.from(contact)
+				.where(eq(contact.id, input.contactId))
+				.limit(1);
+			if (!row) {
 				throw new NotFoundException(`No contact with id ${input.contactId}.`);
 			}
-			return contact.companyId;
+			return row.companyId;
 		}
 
 		return null;
 	}
 }
 
-function filterClause(filter: TimelineFilter): Prisma.ActivityWhereInput {
+function filterClause(filter: TimelineFilter): SQL | undefined {
 	switch (filter) {
 		case "notes":
-			return { type: { in: NOTE_TYPES } };
+			return inArray(activity.type, NOTE_TYPES);
 		case "upcoming":
-			return { type: ActivityType.TASK, completedAt: null };
+			return and(
+				eq(activity.type, ActivityType.TASK),
+				isNull(activity.completedAt),
+			);
 		case "done":
-			return { type: ActivityType.TASK, completedAt: { not: null } };
+			return and(
+				eq(activity.type, ActivityType.TASK),
+				isNotNull(activity.completedAt),
+			);
 		case "history":
-			return { NOT: { type: ActivityType.TASK, completedAt: null } };
+			return not(
+				and(
+					eq(activity.type, ActivityType.TASK),
+					isNull(activity.completedAt),
+				) as SQL,
+			);
 		case "email":
-			return { type: ActivityType.EMAIL };
+			return eq(activity.type, ActivityType.EMAIL);
 		case "meetings":
-			return { type: ActivityType.MEETING };
+			return eq(activity.type, ActivityType.MEETING);
 		case "all":
-			return {};
+			return undefined;
 	}
 }
 
-type Entry = Prisma.ActivityGetPayload<{ select: typeof ENTRY_SELECT }>;
+function findEntry(db: Db, where: SQL) {
+	return db.query.activity.findFirst({ ...ENTRY_QUERY, where });
+}
 
-type Task = Prisma.ActivityGetPayload<{ select: typeof TASK_SELECT }>;
+function selectTasks(db: Db) {
+	return db
+		.select(TASK_FIELDS)
+		.from(activity)
+		.innerJoin(user, eq(user.id, activity.createdById))
+		.leftJoin(company, eq(company.id, activity.companyId))
+		.leftJoin(contact, eq(contact.id, activity.contactId))
+		.leftJoin(deal, eq(deal.id, activity.dealId))
+		.$dynamic();
+}
+
+type Entry = NonNullable<Awaited<ReturnType<typeof findEntry>>>;
+
+type Task = Awaited<ReturnType<typeof selectTasks>>[number];
 
 function serializeTask(task: Task) {
 	return {
@@ -530,7 +621,7 @@ function serializeEntry(entry: Entry) {
 					isAllDay: entry.calendarEvent.isAllDay,
 					location: entry.calendarEvent.location,
 					conferenceUrl: entry.calendarEvent.conferenceUrl,
-					attendeeCount: entry.calendarEvent._count.attendees,
+					attendeeCount: entry.calendarEvent.attendeeCount,
 				}
 			: null,
 	};

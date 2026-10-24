@@ -6,7 +6,24 @@ import {
 	expect,
 	it,
 } from "bun:test";
-import { db, type FieldEntity } from "@crm/db";
+import {
+	agentTask,
+	and,
+	company as companyTable,
+	contact as contactTable,
+	contains,
+	db,
+	deal as dealTable,
+	endsWith,
+	eq,
+	type FieldEntity,
+	fieldDefinition,
+	fieldValue,
+	inArray,
+	or,
+	startsWith,
+	user,
+} from "@crm/db";
 import { AgentQueueService } from "../src/agent/agent-queue.service";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import { CompaniesService } from "../src/companies/companies.service";
@@ -18,6 +35,7 @@ import { ConversionService } from "../src/currency/conversion.service";
 import { DealsService } from "../src/deals/deals.service";
 import { FieldsService } from "../src/fields/fields.service";
 import { withDiscardedCrmEvents } from "./agent-trigger.stub";
+import { one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "fields-spec";
 const domain = `fields-${suffix}.test`;
@@ -74,44 +92,48 @@ let companyId: string;
 let bridgeSecret: string | undefined;
 
 async function clean() {
-	const owned = await db.company.findMany({
-		where: { domain: { endsWith: domain } },
-		select: { id: true },
-	});
+	const owned = await db
+		.select({ id: companyTable.id })
+		.from(companyTable)
+		.where(endsWith(companyTable.domain, domain));
 	const companyIds = owned.map((row) => row.id);
-	const ownedContacts = await db.contact.findMany({
-		where: { companyId: { in: companyIds } },
-		select: { id: true },
-	});
+	const ownedContacts = await db
+		.select({ id: contactTable.id })
+		.from(contactTable)
+		.where(inArray(contactTable.companyId, companyIds));
 	const contactIds = ownedContacts.map((row) => row.id);
 
-	await db.agentTask.deleteMany({
-		where: {
-			kind: "field-backfill",
-			OR: [
-				{ reason: { contains: "spec_" } },
-				{ companyId: { in: companyIds } },
-				{ contactId: { in: contactIds } },
-			],
-		},
-	});
-	await db.deal.deleteMany({ where: { companyId: { in: companyIds } } });
-	await db.contact.deleteMany({ where: { companyId: { in: companyIds } } });
-	await db.fieldValue.deleteMany({
-		where: { companyId: { in: companyIds } },
-	});
-	await db.fieldDefinition.deleteMany({
-		where: { key: { startsWith: "spec_" } },
-	});
-	await db.company.deleteMany({ where: { domain: { endsWith: domain } } });
-	await db.user.deleteMany({ where: { id: ownerId } });
+	await db
+		.delete(agentTask)
+		.where(
+			and(
+				eq(agentTask.kind, "field-backfill"),
+				or(
+					contains(agentTask.reason, "spec_"),
+					inArray(agentTask.companyId, companyIds),
+					inArray(agentTask.contactId, contactIds),
+				),
+			),
+		);
+	await db.delete(dealTable).where(inArray(dealTable.companyId, companyIds));
+	await db
+		.delete(contactTable)
+		.where(inArray(contactTable.companyId, companyIds));
+	await db.delete(fieldValue).where(inArray(fieldValue.companyId, companyIds));
+	await db
+		.delete(fieldDefinition)
+		.where(startsWith(fieldDefinition.key, "spec_"));
+	await db.delete(companyTable).where(endsWith(companyTable.domain, domain));
+	await db.delete(user).where(eq(user.id, ownerId));
 }
 
 async function makeCompany(name: string): Promise<string> {
-	const company = await db.company.create({
-		data: { name: `${name} ${suffix}`, domain: `${name}-${domain}` },
-		select: { id: true },
-	});
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: `${name} ${suffix}`, domain: `${name}-${domain}` })
+			.returning({ id: companyTable.id }),
+	);
 
 	return company.id;
 }
@@ -122,9 +144,12 @@ beforeAll(async () => {
 
 	await clean();
 
-	await db.user.create({
-		data: { id: ownerId, name: "Fields Rep", email: `rep@${domain}` },
-	});
+	await one(
+		db
+			.insert(user)
+			.values({ id: ownerId, name: "Fields Rep", email: `rep@${domain}` })
+			.returning(),
+	);
 
 	companyId = await makeCompany("fields-co");
 });
@@ -245,7 +270,9 @@ describe("field definitions", () => {
 		expect(
 			(await fields.valuesFor("COMPANY", companyId)).map((entry) => entry.key),
 		).not.toContain("spec_runs_on");
-		expect(await db.fieldValue.count({ where: { fieldId: field.id } })).toBe(1);
+		expect(await db.$count(fieldValue, eq(fieldValue.fieldId, field.id))).toBe(
+			1,
+		);
 
 		await fields.restore(field.id);
 
@@ -380,7 +407,9 @@ describe("field values", () => {
 		}
 		expect(refused?.message).toMatch(/takes a date/);
 
-		expect(await db.fieldValue.count({ where: { companyId: record } })).toBe(0);
+		expect(await db.$count(fieldValue, eq(fieldValue.companyId, record))).toBe(
+			0,
+		);
 	});
 
 	it("refuses a user who does not work here, and keeps the batch out", async () => {
@@ -410,7 +439,9 @@ describe("field values", () => {
 		}
 		expect(refused?.message).toMatch(/works here/);
 
-		expect(await db.fieldValue.count({ where: { companyId: record } })).toBe(0);
+		expect(await db.$count(fieldValue, eq(fieldValue.companyId, record))).toBe(
+			0,
+		);
 
 		await fields.applyValues(db, "COMPANY", record, {
 			spec_champion: ownerId,
@@ -439,9 +470,13 @@ describe("field values", () => {
 			spec_renewal: "2027-01-01",
 		});
 
-		await db.company.delete({ where: { id: doomed } });
+		await one(
+			db.delete(companyTable).where(eq(companyTable.id, doomed)).returning(),
+		);
 
-		expect(await db.fieldValue.count({ where: { companyId: doomed } })).toBe(0);
+		expect(await db.$count(fieldValue, eq(fieldValue.companyId, doomed))).toBe(
+			0,
+		);
 	});
 });
 
@@ -541,7 +576,9 @@ describe("a record update that fails", () => {
 		}
 		expect(refused).not.toBeNull();
 
-		expect(await db.fieldValue.count({ where: { companyId: record } })).toBe(0);
+		expect(await db.$count(fieldValue, eq(fieldValue.companyId, record))).toBe(
+			0,
+		);
 	});
 
 	it("leaves a contact's field values as they were", async () => {
@@ -558,14 +595,16 @@ describe("a record update that fails", () => {
 			showOnFilter: false,
 		});
 
-		const contact = await db.contact.create({
-			data: {
-				firstName: "Ada",
-				email: `ada@${domain}`,
-				companyId,
-			},
-			select: { id: true },
-		});
+		const contact = await one(
+			db
+				.insert(contactTable)
+				.values({
+					firstName: "Ada",
+					email: `ada@${domain}`,
+					companyId,
+				})
+				.returning({ id: contactTable.id }),
+		);
 
 		let refused: Error | null = null;
 		try {
@@ -579,7 +618,7 @@ describe("a record update that fails", () => {
 		expect(refused).not.toBeNull();
 
 		expect(
-			await db.fieldValue.count({ where: { contactId: contact.id } }),
+			await db.$count(fieldValue, eq(fieldValue.contactId, contact.id)),
 		).toBe(0);
 	});
 
@@ -597,10 +636,12 @@ describe("a record update that fails", () => {
 			showOnFilter: false,
 		});
 
-		const deal = await db.deal.create({
-			data: { name: `Spec deal ${suffix}`, companyId, ownerId },
-			select: { id: true },
-		});
+		const deal = await one(
+			db
+				.insert(dealTable)
+				.values({ name: `Spec deal ${suffix}`, companyId, ownerId })
+				.returning({ id: dealTable.id }),
+		);
 
 		let refused: Error | null = null;
 		try {
@@ -613,11 +654,11 @@ describe("a record update that fails", () => {
 		}
 		expect(refused).not.toBeNull();
 
-		expect(await db.fieldValue.count({ where: { dealId: deal.id } })).toBe(0);
+		expect(await db.$count(fieldValue, eq(fieldValue.dealId, deal.id))).toBe(0);
 
 		await deals.update(deal.id, { fields: { spec_risk: "Champion left" } });
 
-		expect(await db.fieldValue.count({ where: { dealId: deal.id } })).toBe(1);
+		expect(await db.$count(fieldValue, eq(fieldValue.dealId, deal.id))).toBe(1);
 	});
 });
 
@@ -642,13 +683,15 @@ describe("queueing a backfill", () => {
 		);
 		expect(second).toEqual({ queued: 0, merged: 1 });
 
-		const tasks = await db.agentTask.findMany({
-			where: {
-				kind: "field-backfill",
-				companyId: { in: [companyId, otherCompanyId] },
-			},
-			select: { companyId: true, payload: true },
-		});
+		const tasks = await db
+			.select({ companyId: agentTask.companyId, payload: agentTask.payload })
+			.from(agentTask)
+			.where(
+				and(
+					eq(agentTask.kind, "field-backfill"),
+					inArray(agentTask.companyId, [companyId, otherCompanyId]),
+				),
+			);
 
 		expect(tasks).toHaveLength(2);
 		const mine = tasks.find((task) => task.companyId === companyId);
@@ -660,10 +703,16 @@ describe("queueing a backfill", () => {
 
 	it("keeps a company's field apart from a contact's field with the same key", async () => {
 		const trigger = new AgentTriggerService(db);
-		const contact = await db.contact.create({
-			data: { firstName: "Backfill", email: `backfill@${domain}`, companyId },
-			select: { id: true },
-		});
+		const contact = await one(
+			db
+				.insert(contactTable)
+				.values({
+					firstName: "Backfill",
+					email: `backfill@${domain}`,
+					companyId,
+				})
+				.returning({ id: contactTable.id }),
+		);
 
 		await trigger.fieldBackfillRecords(
 			"CONTACT",
@@ -672,10 +721,15 @@ describe("queueing a backfill", () => {
 			"New field",
 		);
 
-		const tasks = await db.agentTask.findMany({
-			where: { kind: "field-backfill", contactId: contact.id },
-			select: { payload: true },
-		});
+		const tasks = await db
+			.select({ payload: agentTask.payload })
+			.from(agentTask)
+			.where(
+				and(
+					eq(agentTask.kind, "field-backfill"),
+					eq(agentTask.contactId, contact.id),
+				),
+			);
 
 		expect(tasks).toHaveLength(1);
 		expect(tasks[0]?.payload).toEqual({

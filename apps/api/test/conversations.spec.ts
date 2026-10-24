@@ -1,6 +1,20 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { DEFAULT_WORKSPACE_NAME, WORKSPACE_ID } from "@crm/auth/organization";
-import { db } from "@crm/db";
+import {
+	agentBuilderArtifact,
+	agentConversation,
+	agentConversationSubmission,
+	agentEvent,
+	and,
+	contact as contactTable,
+	db,
+	eq,
+	member,
+	or,
+	organization,
+	startsWith,
+	user,
+} from "@crm/db";
 import { workspaceSlug } from "@crm/db/workspace";
 import { z } from "zod";
 import {
@@ -9,6 +23,7 @@ import {
 	conversationSaveInput,
 } from "../src/conversations/conversations.contracts";
 import { ConversationsService } from "../src/conversations/conversations.service";
+import { first, one } from "./rows";
 
 const record = z.record(z.string(), z.unknown()).catch({});
 
@@ -25,63 +40,74 @@ let contactId: string;
 let service: ConversationsService;
 
 beforeAll(async () => {
-	await db.agentEvent.deleteMany({
-		where: {
-			OR: [
-				{ sessionId: { startsWith: `builder-question-${suffix}` } },
-				{ sessionId: { startsWith: `ses_${suffix}` } },
-			],
-		},
-	});
-	await db.agentConversation.deleteMany({ where: { userId } });
-	await db.member.deleteMany({ where: { id: memberId } });
-	await db.user.deleteMany({ where: { id: userId } });
-	await db.contact.deleteMany({ where: { email } });
-	await db.organization.upsert({
-		where: { id: WORKSPACE_ID },
-		update: {},
-		create: {
+	await db
+		.delete(agentEvent)
+		.where(
+			or(
+				startsWith(agentEvent.sessionId, `builder-question-${suffix}`),
+				startsWith(agentEvent.sessionId, `ses_${suffix}`),
+			),
+		);
+	await db
+		.delete(agentConversation)
+		.where(eq(agentConversation.userId, userId));
+	await db.delete(member).where(eq(member.id, memberId));
+	await db.delete(user).where(eq(user.id, userId));
+	await db.delete(contactTable).where(eq(contactTable.email, email));
+	await db
+		.insert(organization)
+		.values({
 			id: WORKSPACE_ID,
 			name: DEFAULT_WORKSPACE_NAME,
 			slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
 			createdAt: new Date(),
-		},
-	});
+		})
+		.onConflictDoNothing();
 
-	await db.user.create({
-		data: { id: userId, name: "Test Rep", email: `${userId}@example.test` },
-	});
-	await db.member.create({
-		data: {
-			id: memberId,
-			organizationId: WORKSPACE_ID,
-			userId,
-			role: "member",
-			createdAt: new Date(),
-		},
-	});
-	const contact = await db.contact.create({
-		data: { firstName: "Conversation", lastName: "Subject", email },
-		select: { id: true },
-	});
+	await one(
+		db
+			.insert(user)
+			.values({ id: userId, name: "Test Rep", email: `${userId}@example.test` })
+			.returning(),
+	);
+	await one(
+		db
+			.insert(member)
+			.values({
+				id: memberId,
+				organizationId: WORKSPACE_ID,
+				userId,
+				role: "member",
+				createdAt: new Date(),
+			})
+			.returning(),
+	);
+	const contact = await one(
+		db
+			.insert(contactTable)
+			.values({ firstName: "Conversation", lastName: "Subject", email })
+			.returning({ id: contactTable.id }),
+	);
 	contactId = contact.id;
 
 	service = new ConversationsService(db);
 });
 
 afterAll(async () => {
-	await db.agentEvent.deleteMany({
-		where: {
-			OR: [
-				{ sessionId: { startsWith: `builder-question-${suffix}` } },
-				{ sessionId: { startsWith: `ses_${suffix}` } },
-			],
-		},
-	});
-	await db.contact.deleteMany({ where: { email } });
-	await db.agentConversation.deleteMany({ where: { userId } });
-	await db.member.deleteMany({ where: { id: memberId } });
-	await db.user.deleteMany({ where: { id: userId } });
+	await db
+		.delete(agentEvent)
+		.where(
+			or(
+				startsWith(agentEvent.sessionId, `builder-question-${suffix}`),
+				startsWith(agentEvent.sessionId, `ses_${suffix}`),
+			),
+		);
+	await db.delete(contactTable).where(eq(contactTable.email, email));
+	await db
+		.delete(agentConversation)
+		.where(eq(agentConversation.userId, userId));
+	await db.delete(member).where(eq(member.id, memberId));
+	await db.delete(user).where(eq(user.id, userId));
 });
 
 describe("ConversationsService", () => {
@@ -205,10 +231,16 @@ describe("ConversationsService", () => {
 		expect(ownershipError).toBeDefined();
 
 		expect(
-			await db.agentConversation.findUnique({
-				where: { sessionId },
-				select: { continuationToken: true, streamIndex: true },
-			}),
+			await first(
+				db
+					.select({
+						continuationToken: agentConversation.continuationToken,
+						streamIndex: agentConversation.streamIndex,
+					})
+					.from(agentConversation)
+					.where(eq(agentConversation.sessionId, sessionId))
+					.limit(1),
+			),
 		).toEqual({ continuationToken: "owner-token", streamIndex: 3 });
 	});
 
@@ -235,7 +267,12 @@ describe("ConversationsService", () => {
 		);
 
 		expect(new Set(results.map((result) => result.id)).size).toBe(1);
-		expect(await db.agentConversation.count({ where: { sessionId } })).toBe(1);
+		expect(
+			await db.$count(
+				agentConversation,
+				eq(agentConversation.sessionId, sessionId),
+			),
+		).toBe(1);
 	});
 
 	it("does not treat a builder session as a record conversation", async () => {
@@ -250,10 +287,13 @@ describe("ConversationsService", () => {
 			userId,
 		);
 		const sessionId = `ses_${suffix}_builder`;
-		await db.agentConversation.update({
-			where: { id: builder.id },
-			data: { sessionId },
-		});
+		await one(
+			db
+				.update(agentConversation)
+				.set({ sessionId })
+				.where(eq(agentConversation.id, builder.id))
+				.returning(),
+		);
 
 		let saveError: unknown;
 		try {
@@ -263,10 +303,16 @@ describe("ConversationsService", () => {
 		}
 		expect(saveError).toBeDefined();
 		expect(
-			await db.agentConversation.findUnique({
-				where: { id: builder.id },
-				select: { kind: true, contactId: true },
-			}),
+			await first(
+				db
+					.select({
+						kind: agentConversation.kind,
+						contactId: agentConversation.contactId,
+					})
+					.from(agentConversation)
+					.where(eq(agentConversation.id, builder.id))
+					.limit(1),
+			),
 		).toEqual({ kind: "BUILDER", contactId: null });
 	});
 
@@ -280,8 +326,8 @@ describe("ConversationsService", () => {
 			"step.started",
 			"step.completed",
 		];
-		await db.agentEvent.createMany({
-			data: eventTypes.map((type, position) => ({
+		await db.insert(agentEvent).values(
+			eventTypes.map((type, position) => ({
 				id: `evt_${suffix}_window_${position}`,
 				sessionId,
 				contactId,
@@ -289,7 +335,7 @@ describe("ConversationsService", () => {
 				data: {},
 				emittedAt: new Date(emittedAt.getTime() + position),
 			})),
-		});
+		);
 
 		expect(
 			(await service.events({ id: saved.id, limit: 2 }, userId)).map(
@@ -310,54 +356,55 @@ describe("ConversationsService", () => {
 			userId,
 		);
 		const rootSessionId = `builder-question-${suffix}-root`;
-		await db.agentConversation.update({
-			where: { id: builder.id },
-			data: { sessionId: rootSessionId },
-		});
+		await one(
+			db
+				.update(agentConversation)
+				.set({ sessionId: rootSessionId })
+				.where(eq(agentConversation.id, builder.id))
+				.returning(),
+		);
 		const emittedAt = new Date("2026-08-05T13:00:00.000Z");
-		await db.agentEvent.createMany({
-			data: [
-				{
-					id: `evt_${suffix}_builder_root`,
-					sessionId: rootSessionId,
-					conversationId: builder.id,
-					type: "actions.requested",
-					data: {
-						actions: [
-							{
+		await db.insert(agentEvent).values([
+			{
+				id: `evt_${suffix}_builder_root`,
+				sessionId: rootSessionId,
+				conversationId: builder.id,
+				type: "actions.requested",
+				data: {
+					actions: [
+						{
+							kind: "tool-call",
+							callId: "call-root",
+							toolName: "search_crm",
+							input: {},
+						},
+					],
+				},
+				emittedAt,
+			},
+			{
+				id: `evt_${suffix}_builder_child`,
+				sessionId: `builder-question-${suffix}-child`,
+				conversationId: builder.id,
+				type: "input.requested",
+				data: {
+					requests: [
+						{
+							requestId: "request-child",
+							kind: "question",
+							action: {
 								kind: "tool-call",
-								callId: "call-root",
-								toolName: "search_crm",
+								callId: "call-child",
+								toolName: "ask_user",
 								input: {},
 							},
-						],
-					},
-					emittedAt,
+							prompt: "Choose one option.",
+						},
+					],
 				},
-				{
-					id: `evt_${suffix}_builder_child`,
-					sessionId: `builder-question-${suffix}-child`,
-					conversationId: builder.id,
-					type: "input.requested",
-					data: {
-						requests: [
-							{
-								requestId: "request-child",
-								kind: "question",
-								action: {
-									kind: "tool-call",
-									callId: "call-child",
-									toolName: "ask_user",
-									input: {},
-								},
-								prompt: "Choose one option.",
-							},
-						],
-					},
-					emittedAt: new Date(emittedAt.getTime() + 1),
-				},
-			],
-		});
+				emittedAt: new Date(emittedAt.getTime() + 1),
+			},
+		]);
 
 		expect(
 			(await service.events({ id: builder.id, limit: 10 }, userId)).map(
@@ -380,12 +427,15 @@ describe("ConversationsService resume", () => {
 			userId,
 		);
 		const sessionId = `builder-resume-${suffix}`;
-		await db.agentConversation.update({
-			where: { id: builder.id },
-			data: { sessionId, streamIndex: 2 },
-		});
-		await db.agentEvent.createMany({
-			data: [0, 1].map((streamIndex) => ({
+		await one(
+			db
+				.update(agentConversation)
+				.set({ sessionId, streamIndex: 2 })
+				.where(eq(agentConversation.id, builder.id))
+				.returning(),
+		);
+		await db.insert(agentEvent).values(
+			[0, 1].map((streamIndex) => ({
 				id: `evt_${suffix}_resume_${streamIndex}`,
 				sessionId,
 				conversationId: builder.id,
@@ -395,7 +445,7 @@ describe("ConversationsService resume", () => {
 				data: { message: `Message ${streamIndex}` },
 				emittedAt: new Date(1_786_000_000_000 + streamIndex),
 			})),
-		});
+		);
 
 		const reloaded = await service.builderById(builder.id, userId);
 
@@ -412,40 +462,51 @@ describe("ConversationsService continued", () => {
 		const sessionId = `ses_${suffix}_delete`;
 		const conversation = await service.save({ contactId, sessionId }, userId);
 
-		await db.agentEvent.create({
-			data: {
-				id: `evt_${suffix}`,
-				sessionId,
-				contactId,
-				type: "turn.completed",
-				data: {},
-				emittedAt: new Date(),
-			},
-		});
-		await db.agentBuilderArtifact.create({
-			data: {
-				conversationId: conversation.id,
-				path: "agent/instructions.md",
-				language: "markdown",
-				content: "Temporary draft",
-				revision: 1,
-			},
-		});
+		await one(
+			db
+				.insert(agentEvent)
+				.values({
+					id: `evt_${suffix}`,
+					sessionId,
+					contactId,
+					type: "turn.completed",
+					data: {},
+					emittedAt: new Date(),
+				})
+				.returning(),
+		);
+		await one(
+			db
+				.insert(agentBuilderArtifact)
+				.values({
+					conversationId: conversation.id,
+					path: "agent/instructions.md",
+					language: "markdown",
+					content: "Temporary draft",
+					revision: 1,
+				})
+				.returning(),
+		);
 
 		await service.remove(conversation.id, userId);
 
 		expect(
-			await db.agentConversation.findUnique({ where: { id: conversation.id } }),
+			await first(
+				db
+					.select()
+					.from(agentConversation)
+					.where(eq(agentConversation.id, conversation.id))
+					.limit(1),
+			),
 		).toBeNull();
 		expect(
-			await db.agentEvent.count({
-				where: { sessionId },
-			}),
+			await db.$count(agentEvent, eq(agentEvent.sessionId, sessionId)),
 		).toBe(0);
 		expect(
-			await db.agentBuilderArtifact.count({
-				where: { conversationId: conversation.id },
-			}),
+			await db.$count(
+				agentBuilderArtifact,
+				eq(agentBuilderArtifact.conversationId, conversation.id),
+			),
 		).toBe(0);
 	});
 
@@ -463,7 +524,13 @@ describe("ConversationsService continued", () => {
 		}
 		expect(removeError).toBeDefined();
 		expect(
-			await db.agentConversation.findUnique({ where: { id: conversation.id } }),
+			await first(
+				db
+					.select()
+					.from(agentConversation)
+					.where(eq(agentConversation.id, conversation.id))
+					.limit(1),
+			),
 		).not.toBeNull();
 	});
 
@@ -710,9 +777,10 @@ describe("ConversationsService continued", () => {
 
 		expect(new Set(results.map((result) => result.id)).size).toBe(1);
 		expect(
-			await db.agentConversationSubmission.count({
-				where: { clientRequestId },
-			}),
+			await db.$count(
+				agentConversationSubmission,
+				eq(agentConversationSubmission.clientRequestId, clientRequestId),
+			),
 		).toBe(1);
 	});
 
@@ -746,9 +814,10 @@ describe("ConversationsService continued", () => {
 
 		expect(new Set(results.map((result) => result.id)).size).toBe(1);
 		expect(
-			await db.agentConversationSubmission.count({
-				where: { clientRequestId },
-			}),
+			await db.$count(
+				agentConversationSubmission,
+				eq(agentConversationSubmission.clientRequestId, clientRequestId),
+			),
 		).toBe(1);
 	});
 
@@ -764,28 +833,31 @@ describe("ConversationsService continued", () => {
 			userId,
 		);
 		const sessionId = `builder-question-${suffix}-1`;
-		await db.agentConversation.update({
-			where: { id: conversation.id },
-			data: {
-				sessionId,
-				continuationToken: `crm:builder:${conversation.id}`,
-				pendingInputRequests: [
-					{
-						kind: "question",
-						requestId: "question-1",
-						prompt: "Where should this go?",
-						action: {
-							kind: "tool-call",
-							callId: "call-question-1",
-							toolName: "ask_question",
-							input: { prompt: "Where should this go?" },
+		await one(
+			db
+				.update(agentConversation)
+				.set({
+					sessionId,
+					continuationToken: `crm:builder:${conversation.id}`,
+					pendingInputRequests: [
+						{
+							kind: "question",
+							requestId: "question-1",
+							prompt: "Where should this go?",
+							action: {
+								kind: "tool-call",
+								callId: "call-question-1",
+								toolName: "ask_question",
+								input: { prompt: "Where should this go?" },
+							},
+							display: "select",
+							options: [{ id: "crm-task", label: "Create a CRM task" }],
 						},
-						display: "select",
-						options: [{ id: "crm-task", label: "Create a CRM task" }],
-					},
-				],
-			},
-		});
+					],
+				})
+				.where(eq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
 		expect(
 			(await service.builderById(conversation.id, userId)).pendingQuestion,
@@ -803,15 +875,18 @@ describe("ConversationsService continued", () => {
 			},
 			userId,
 		);
-		const submission = await db.agentConversationSubmission.findUnique({
-			where: { id: response.id },
-			select: {
-				commandType: true,
-				inputRequestId: true,
-				message: true,
-				status: true,
-			},
-		});
+		const submission = await first(
+			db
+				.select({
+					commandType: agentConversationSubmission.commandType,
+					inputRequestId: agentConversationSubmission.inputRequestId,
+					message: agentConversationSubmission.message,
+					status: agentConversationSubmission.status,
+				})
+				.from(agentConversationSubmission)
+				.where(eq(agentConversationSubmission.id, response.id))
+				.limit(1),
+		);
 
 		expect(submission).toMatchObject({
 			commandType: "CREATE_AGENT",
@@ -839,30 +914,33 @@ describe("ConversationsService continued", () => {
 			userId,
 		);
 		const sessionId = `builder-question-${suffix}-approval`;
-		await db.agentConversation.update({
-			where: { id: conversation.id },
-			data: {
-				sessionId,
-				continuationToken: `crm:builder:${conversation.id}`,
-				pendingInputRequests: [
-					{
-						kind: "tool-approval",
-						requestId: "approval-1",
-						prompt: "Archive the Renewal date field?",
-						action: {
-							kind: "tool-call",
-							callId: "call-approval-1",
-							toolName: "archive_field",
-							input: { fieldId: "field-1" },
+		await one(
+			db
+				.update(agentConversation)
+				.set({
+					sessionId,
+					continuationToken: `crm:builder:${conversation.id}`,
+					pendingInputRequests: [
+						{
+							kind: "tool-approval",
+							requestId: "approval-1",
+							prompt: "Archive the Renewal date field?",
+							action: {
+								kind: "tool-call",
+								callId: "call-approval-1",
+								toolName: "archive_field",
+								input: { fieldId: "field-1" },
+							},
+							options: [
+								{ id: "approve", label: "Approve", style: "primary" },
+								{ id: "cancel", label: "Decline", style: "danger" },
+							],
 						},
-						options: [
-							{ id: "approve", label: "Approve", style: "primary" },
-							{ id: "cancel", label: "Decline", style: "danger" },
-						],
-					},
-				],
-			},
-		});
+					],
+				})
+				.where(eq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
 		expect(
 			(await service.builderById(conversation.id, userId)).permissionMode,
@@ -887,15 +965,18 @@ describe("ConversationsService continued", () => {
 			},
 			userId,
 		);
-		const submission = await db.agentConversationSubmission.findUnique({
-			where: { id: response.id },
-			select: {
-				commandType: true,
-				inputRequestId: true,
-				message: true,
-				status: true,
-			},
-		});
+		const submission = await first(
+			db
+				.select({
+					commandType: agentConversationSubmission.commandType,
+					inputRequestId: agentConversationSubmission.inputRequestId,
+					message: agentConversationSubmission.message,
+					status: agentConversationSubmission.status,
+				})
+				.from(agentConversationSubmission)
+				.where(eq(agentConversationSubmission.id, response.id))
+				.limit(1),
+		);
 
 		expect(submission).toMatchObject({
 			commandType: "CHAT",
@@ -922,57 +1003,60 @@ describe("ConversationsService continued", () => {
 			},
 			userId,
 		);
-		await db.agentConversation.update({
-			where: { id: conversation.id },
-			data: {
-				sessionId: `builder-input-priority-${suffix}`,
-				continuationToken: `crm:builder:${conversation.id}`,
-				pendingInputRequests: [
-					{
-						kind: "question",
-						requestId: "question-after-gates",
-						prompt: "Which stage?",
-						action: {
-							kind: "tool-call",
-							callId: "call-question-after-gates",
-							toolName: "ask_question",
-							input: { prompt: "Which stage?" },
+		await one(
+			db
+				.update(agentConversation)
+				.set({
+					sessionId: `builder-input-priority-${suffix}`,
+					continuationToken: `crm:builder:${conversation.id}`,
+					pendingInputRequests: [
+						{
+							kind: "question",
+							requestId: "question-after-gates",
+							prompt: "Which stage?",
+							action: {
+								kind: "tool-call",
+								callId: "call-question-after-gates",
+								toolName: "ask_question",
+								input: { prompt: "Which stage?" },
+							},
+							display: "text",
 						},
-						display: "text",
-					},
-					{
-						kind: "tool-approval",
-						requestId: "approval-after-limit",
-						prompt: "Save the draft?",
-						action: {
-							kind: "tool-call",
-							callId: "call-approval-after-limit",
-							toolName: "save_agent_draft",
-							input: { name: "Deal review" },
+						{
+							kind: "tool-approval",
+							requestId: "approval-after-limit",
+							prompt: "Save the draft?",
+							action: {
+								kind: "tool-call",
+								callId: "call-approval-after-limit",
+								toolName: "save_agent_draft",
+								input: { name: "Deal review" },
+							},
+							options: [
+								{ id: "approve", label: "Approve" },
+								{ id: "cancel", label: "Decline" },
+							],
 						},
-						options: [
-							{ id: "approve", label: "Approve" },
-							{ id: "cancel", label: "Decline" },
-						],
-					},
-					{
-						kind: "session-limit",
-						requestId: "limit-before-approval",
-						prompt: "Continue this builder session?",
-						action: {
-							kind: "tool-call",
-							callId: "call-limit-before-approval",
-							toolName: "session_limit_continuation",
-							input: { kind: "output", limit: 40_000 },
+						{
+							kind: "session-limit",
+							requestId: "limit-before-approval",
+							prompt: "Continue this builder session?",
+							action: {
+								kind: "tool-call",
+								callId: "call-limit-before-approval",
+								toolName: "session_limit_continuation",
+								input: { kind: "output", limit: 40_000 },
+							},
+							options: [
+								{ id: "continue", label: "Continue" },
+								{ id: "stop", label: "Stop" },
+							],
 						},
-						options: [
-							{ id: "continue", label: "Continue" },
-							{ id: "stop", label: "Stop" },
-						],
-					},
-				],
-			},
-		});
+					],
+				})
+				.where(eq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
 		const first = await service.builderById(conversation.id, userId);
 		expect(first.pendingSessionLimit?.requestId).toBe("limit-before-approval");
@@ -1017,13 +1101,16 @@ describe("ConversationsService continued", () => {
 			},
 			userId,
 		);
-		await db.agentConversation.update({
-			where: { id: conversation.id },
-			data: {
-				sessionId: `builder-question-${suffix}-recovery`,
-				continuationToken: `builder:${conversation.id}`,
-			},
-		});
+		await one(
+			db
+				.update(agentConversation)
+				.set({
+					sessionId: `builder-question-${suffix}-recovery`,
+					continuationToken: `builder:${conversation.id}`,
+				})
+				.where(eq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
 		let error: Error | null = null;
 		try {
@@ -1056,31 +1143,34 @@ describe("ConversationsService continued", () => {
 			userId,
 		);
 		const sessionId = `builder-question-${suffix}-2`;
-		await db.agentConversation.update({
-			where: { id: conversation.id },
-			data: {
-				sessionId,
-				continuationToken: `crm:builder:${conversation.id}`,
-				pendingInputRequests: [
-					{
-						kind: "question",
-						requestId: "question-concurrent",
-						prompt: "Which output?",
-						action: {
-							kind: "tool-call",
-							callId: "call-question-concurrent",
-							toolName: "ask_question",
-							input: { prompt: "Which output?" },
+		await one(
+			db
+				.update(agentConversation)
+				.set({
+					sessionId,
+					continuationToken: `crm:builder:${conversation.id}`,
+					pendingInputRequests: [
+						{
+							kind: "question",
+							requestId: "question-concurrent",
+							prompt: "Which output?",
+							action: {
+								kind: "tool-call",
+								callId: "call-question-concurrent",
+								toolName: "ask_question",
+								input: { prompt: "Which output?" },
+							},
+							display: "select",
+							options: [
+								{ id: "note", label: "Create a note" },
+								{ id: "task", label: "Create a task" },
+							],
 						},
-						display: "select",
-						options: [
-							{ id: "note", label: "Create a note" },
-							{ id: "task", label: "Create a task" },
-						],
-					},
-				],
-			},
-		});
+					],
+				})
+				.where(eq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
 		const results = await Promise.allSettled([
 			service.answerBuilderQuestion(
@@ -1110,12 +1200,13 @@ describe("ConversationsService continued", () => {
 			results.filter((result) => result.status === "rejected"),
 		).toHaveLength(1);
 		expect(
-			await db.agentConversationSubmission.count({
-				where: {
-					conversationId: conversation.id,
-					inputRequestId: "question-concurrent",
-				},
-			}),
+			await db.$count(
+				agentConversationSubmission,
+				and(
+					eq(agentConversationSubmission.conversationId, conversation.id),
+					eq(agentConversationSubmission.inputRequestId, "question-concurrent"),
+				),
+			),
 		).toBe(1);
 	});
 });

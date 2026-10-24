@@ -5,7 +5,15 @@ import {
 	type WorkspaceRole,
 	workspaceRoleOf,
 } from "@crm/auth/organization";
-import type { Db, Prisma } from "@crm/db";
+import {
+	agentDefinition,
+	and,
+	type Db,
+	type Executor,
+	eq,
+	member,
+	ne,
+} from "@crm/db";
 import {
 	ForbiddenException,
 	Injectable,
@@ -29,33 +37,39 @@ export class AgentAccessService {
 	}
 
 	async assertCanManageInTransaction(
-		tx: Prisma.TransactionClient,
+		tx: Executor,
 		agentId: string,
 		userId: string,
 	) {
-		const [member] = await tx.$queryRaw<Array<{ role: string }>>`
-			SELECT role
-			FROM "member"
-			WHERE "organizationId" = ${WORKSPACE_ID}
-				AND "userId" = ${userId}
-			FOR SHARE
-		`;
+		const [membership] = await tx
+			.select({ role: member.role })
+			.from(member)
+			.where(
+				and(eq(member.organizationId, WORKSPACE_ID), eq(member.userId, userId)),
+			)
+			.for("share");
 
-		if (!member) {
+		if (!membership) {
 			throw new ForbiddenException("You are not a member of this workspace.");
 		}
 
-		const role = toWorkspaceRole(member.role);
-		const agent = await tx.agentDefinition.findFirst({
-			where: { id: agentId, status: { not: "DELETED" } },
-			select: {
-				id: true,
-				createdById: true,
-				status: true,
-				name: true,
-				description: true,
-			},
-		});
+		const role = toWorkspaceRole(membership.role);
+		const [agent] = await tx
+			.select({
+				id: agentDefinition.id,
+				createdById: agentDefinition.createdById,
+				status: agentDefinition.status,
+				name: agentDefinition.name,
+				description: agentDefinition.description,
+			})
+			.from(agentDefinition)
+			.where(
+				and(
+					eq(agentDefinition.id, agentId),
+					ne(agentDefinition.status, "DELETED"),
+				),
+			)
+			.limit(1);
 
 		if (!agent) {
 			throw new NotFoundException(`No agent with id ${agentId}.`);
@@ -76,15 +90,21 @@ export class AgentAccessService {
 
 	async assertCanRead(agentId: string, userId: string) {
 		const role = await this.assertMember(userId);
-		const agent = await this.db.agentDefinition.findFirst({
-			where: { id: agentId, status: { not: "DELETED" } },
-			select: {
-				id: true,
-				createdById: true,
-				status: true,
-				currentVersionId: true,
-			},
-		});
+		const [agent] = await this.db
+			.select({
+				id: agentDefinition.id,
+				createdById: agentDefinition.createdById,
+				status: agentDefinition.status,
+				currentVersionId: agentDefinition.currentVersionId,
+			})
+			.from(agentDefinition)
+			.where(
+				and(
+					eq(agentDefinition.id, agentId),
+					ne(agentDefinition.status, "DELETED"),
+				),
+			)
+			.limit(1);
 
 		if (!agent || !canReadAgent(agent.status, agent.createdById, userId)) {
 			throw new NotFoundException(`No agent with id ${agentId}.`);

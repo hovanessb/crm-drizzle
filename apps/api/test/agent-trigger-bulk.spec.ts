@@ -1,22 +1,26 @@
 import { describe, expect, it } from "bun:test";
-import type { Db, Prisma } from "@crm/db";
+import type { Db, NewAgentTask } from "@crm/db";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
 
 function service() {
-	const writes: Prisma.AgentTaskCreateManyInput[][] = [];
-	const agentTask = {
-		createMany: async ({ data }: Prisma.AgentTaskCreateManyArgs) => {
+	const writes: NewAgentTask[][] = [];
+	const insert = () => ({
+		values: (data: NewAgentTask | NewAgentTask[]) => {
 			const rows = Array.isArray(data) ? data : [data];
 			writes.push(rows);
-			return { count: rows.length };
+			const result = Promise.resolve({ rowCount: rows.length });
+			return Object.assign(result, {
+				returning: async () =>
+					rows.map((_, index) => ({ id: `task-${index}` })),
+			});
 		},
-	};
-	const transaction = { agentTask } as unknown as Prisma.TransactionClient;
+	});
+	type Transaction = { insert: typeof insert };
+	const transaction: Transaction = { insert };
 	const db = {
-		agentTask,
-		$transaction: async <Result>(
-			work: (tx: Prisma.TransactionClient) => Promise<Result>,
-		) => work(transaction),
+		insert,
+		transaction: async <Result>(work: (tx: Transaction) => Promise<Result>) =>
+			work(transaction),
 	} as unknown as Db;
 
 	return { trigger: new AgentTriggerService(db), writes };

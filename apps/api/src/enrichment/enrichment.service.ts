@@ -1,4 +1,18 @@
-import type { Db, Prisma } from "@crm/db";
+import {
+	agentTask,
+	and,
+	asc,
+	company,
+	contact,
+	type Db,
+	desc,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	lte,
+	or,
+} from "@crm/db";
 import { ENRICHMENT_PAGE, pageSize } from "@crm/validation/enrichment-queue";
 import { Injectable } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
@@ -47,16 +61,16 @@ export type EnrichmentQueue = {
 	scheduledTotal: number;
 };
 
-const TASK_SELECT = {
-	id: true,
-	contactId: true,
-	companyId: true,
-	kind: true,
-	attempts: true,
-	leasedUntil: true,
-	startedAt: true,
-	dueAt: true,
-} as const;
+const TASK_FIELDS = {
+	id: agentTask.id,
+	contactId: agentTask.contactId,
+	companyId: agentTask.companyId,
+	kind: agentTask.kind,
+	attempts: agentTask.attempts,
+	leasedUntil: agentTask.leasedUntil,
+	startedAt: agentTask.startedAt,
+	dueAt: agentTask.dueAt,
+};
 
 type QueuedTask = {
 	id: string;
@@ -77,36 +91,30 @@ export class EnrichmentService {
 		const take = pageSize(limit);
 		const now = new Date();
 
-		const named: Prisma.AgentTaskWhereInput = {
-			finishedAt: null,
-			OR: [{ contactId: { not: null } }, { companyId: { not: null } }],
-		};
+		const named = and(
+			isNull(agentTask.finishedAt),
+			or(isNotNull(agentTask.contactId), isNotNull(agentTask.companyId)),
+		);
 
-		const dueWhere: Prisma.AgentTaskWhereInput = {
-			...named,
-			dueAt: { lte: now },
-		};
+		const dueWhere = and(named, lte(agentTask.dueAt, now));
 
-		const scheduledWhere: Prisma.AgentTaskWhereInput = {
-			...named,
-			dueAt: { gt: now },
-		};
+		const scheduledWhere = and(named, gt(agentTask.dueAt, now));
 
 		const [tasks, total, booked, scheduledTotal] = await Promise.all([
-			this.db.agentTask.findMany({
-				where: dueWhere,
-				orderBy: [{ priority: "desc" }, { dueAt: "asc" }],
-				take,
-				select: TASK_SELECT,
-			}),
-			this.db.agentTask.count({ where: dueWhere }),
-			this.db.agentTask.findMany({
-				where: scheduledWhere,
-				orderBy: [{ dueAt: "asc" }],
-				take,
-				select: TASK_SELECT,
-			}),
-			this.db.agentTask.count({ where: scheduledWhere }),
+			this.db
+				.select(TASK_FIELDS)
+				.from(agentTask)
+				.where(dueWhere)
+				.orderBy(desc(agentTask.priority), asc(agentTask.dueAt))
+				.limit(take),
+			this.db.$count(agentTask, dueWhere),
+			this.db
+				.select(TASK_FIELDS)
+				.from(agentTask)
+				.where(scheduledWhere)
+				.orderBy(asc(agentTask.dueAt))
+				.limit(take),
+			this.db.$count(agentTask, scheduledWhere),
 		]);
 
 		const everyTask: QueuedTask[] = [...tasks, ...booked];
@@ -116,30 +124,30 @@ export class EnrichmentService {
 		const [contacts, companies] = await Promise.all([
 			contactIds.length === 0
 				? []
-				: this.db.contact.findMany({
-						where: { id: { in: contactIds } },
-						select: {
-							id: true,
-							firstName: true,
-							lastName: true,
-							email: true,
-							imageUrl: true,
-						},
-					}),
+				: this.db
+						.select({
+							id: contact.id,
+							firstName: contact.firstName,
+							lastName: contact.lastName,
+							email: contact.email,
+							imageUrl: contact.imageUrl,
+						})
+						.from(contact)
+						.where(inArray(contact.id, contactIds)),
 			companyIds.length === 0
 				? []
-				: this.db.company.findMany({
-						where: { id: { in: companyIds } },
-						select: {
-							id: true,
-							name: true,
-							iconUrl: true,
-							logoUrl: true,
-							iconDarkUrl: true,
-							logoDarkUrl: true,
-							iconTone: true,
-						},
-					}),
+				: this.db
+						.select({
+							id: company.id,
+							name: company.name,
+							iconUrl: company.iconUrl,
+							logoUrl: company.logoUrl,
+							iconDarkUrl: company.iconDarkUrl,
+							logoDarkUrl: company.logoDarkUrl,
+							iconTone: company.iconTone,
+						})
+						.from(company)
+						.where(inArray(company.id, companyIds)),
 		]);
 
 		const contactById = new Map(

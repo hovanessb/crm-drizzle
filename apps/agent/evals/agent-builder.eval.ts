@@ -1,4 +1,22 @@
-import { db } from "@crm/db";
+import {
+	agentAuditEvent,
+	agentBuilderArtifact,
+	agentConversation,
+	agentConversationSubmission,
+	agentDefinition,
+	agentEvent,
+	agentTrigger,
+	agentVersion,
+	db,
+	desc,
+	eq,
+	firstRow,
+	inArray,
+	orThrow,
+	requireRow,
+	user,
+	whereEq,
+} from "@crm/db";
 import { agentManifest } from "@crm/validation/agent-manifest";
 import { defineEval } from "eve/evals";
 import { equals, satisfies } from "eve/evals/expect";
@@ -27,30 +45,33 @@ export default defineEval({
 		let sessionId: string | null = null;
 
 		try {
-			await db.user.create({
-				data: {
-					id: userId,
-					name: "Agent Builder Eval",
-					email: `${userId}@example.test`,
-				},
-			});
-			const conversation = await db.agentConversation.create({
-				data: {
-					kind: "BUILDER",
-					userId,
-					submissions: {
-						create: {
-							submittedById: userId,
-							clientRequestId: crypto.randomUUID(),
-							commandType: "CREATE_AGENT",
-							message: {
-								text: "Build me an agent that gives me a snapshot of our CRM accounts.",
-								resources: [],
-							},
-						},
+			await requireRow(
+				db
+					.insert(user)
+					.values({
+						id: userId,
+						name: "Agent Builder Eval",
+						email: `${userId}@example.test`,
+					})
+					.returning(),
+			);
+			const conversation = await requireRow(
+				db
+					.insert(agentConversation)
+					.values({ kind: "BUILDER", userId })
+					.returning({ id: agentConversation.id }),
+			);
+			await db.insert(agentConversationSubmission).values({
+				conversationId: conversation.id,
+				...{
+					submittedById: userId,
+					clientRequestId: crypto.randomUUID(),
+					commandType: "CREATE_AGENT",
+					message: {
+						text: "Build me an agent that gives me a snapshot of our CRM accounts.",
+						resources: [],
 					},
 				},
-				select: { id: true },
 			});
 			conversationId = conversation.id;
 
@@ -74,25 +95,28 @@ export default defineEval({
 			session.notCalledTool("record_fact");
 			session.notCalledTool("record_job_change");
 
-			const saved = await db.agentConversation.findUniqueOrThrow({
-				where: { id: conversation.id },
-				select: {
-					agent: {
-						select: {
-							status: true,
-							versions: {
-								orderBy: { number: "desc" },
-								take: 1,
-								select: { status: true, manifest: true },
+			const saved = await db.query.agentConversation
+				.findFirst({
+					where: whereEq(agentConversation.id, conversation.id),
+					columns: {},
+					with: {
+						agent: {
+							columns: { status: true },
+							with: {
+								versions: {
+									orderBy: [desc(agentVersion.number)],
+									limit: 1,
+									columns: { status: true, manifest: true },
+								},
 							},
 						},
+						builderArtifacts: {
+							where: eq(agentBuilderArtifact.status, "READY"),
+							columns: { path: true },
+						},
 					},
-					builderArtifacts: {
-						where: { status: "READY" },
-						select: { path: true },
-					},
-				},
-			});
+				})
+				.then(orThrow);
 			t.check(saved.agent?.status, equals("DRAFT"));
 			t.check(saved.agent?.versions[0]?.status, equals("READY"));
 			t.check(saved.builderArtifacts.length, equals(3));
@@ -120,10 +144,13 @@ async function waitForBuilderSession(
 ): Promise<string | null> {
 	for (let attempt = 0; attempt < 600; attempt += 1) {
 		if (signal.aborted) return null;
-		const conversation = await db.agentConversation.findUnique({
-			where: { id: conversationId },
-			select: { sessionId: true },
-		});
+		const conversation = await firstRow(
+			db
+				.select({ sessionId: agentConversation.sessionId })
+				.from(agentConversation)
+				.where(whereEq(agentConversation.id, conversationId))
+				.limit(1),
+		);
 		if (conversation?.sessionId) return conversation.sessionId;
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
@@ -135,32 +162,51 @@ async function cleanupBuilderEval(
 	conversationId: string | null,
 	sessionId: string | null,
 ) {
-	const agents = await db.agentDefinition.findMany({
-		where: { createdById: userId },
-		select: { id: true },
-	});
+	const agents = await db
+		.select({ id: agentDefinition.id })
+		.from(agentDefinition)
+		.where(whereEq(agentDefinition.createdById, userId));
 	const agentIds = agents.map((agent) => agent.id);
-	if (sessionId) await db.agentEvent.deleteMany({ where: { sessionId } });
+	if (sessionId)
+		await db.delete(agentEvent).where(whereEq(agentEvent.sessionId, sessionId));
 	if (conversationId) {
-		await db.agentBuilderArtifact.deleteMany({ where: { conversationId } });
+		await db
+			.delete(agentBuilderArtifact)
+			.where(whereEq(agentBuilderArtifact.conversationId, conversationId));
 	}
 	if (agentIds.length > 0) {
-		await db.agentBuilderArtifact.deleteMany({
-			where: { version: { agentId: { in: agentIds } } },
-		});
-		await db.agentAuditEvent.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentTrigger.deleteMany({ where: { agentId: { in: agentIds } } });
-		await db.agentDefinition.updateMany({
-			where: { id: { in: agentIds } },
-			data: { currentVersionId: null },
-		});
-		await db.agentVersion.deleteMany({ where: { agentId: { in: agentIds } } });
-		await db.agentDefinition.deleteMany({ where: { id: { in: agentIds } } });
+		await db
+			.delete(agentBuilderArtifact)
+			.where(
+				inArray(
+					agentBuilderArtifact.versionId,
+					db
+						.select({ id: agentVersion.id })
+						.from(agentVersion)
+						.where(inArray(agentVersion.agentId, agentIds)),
+				),
+			);
+		await db
+			.delete(agentAuditEvent)
+			.where(inArray(agentAuditEvent.agentId, agentIds));
+		await db
+			.delete(agentTrigger)
+			.where(inArray(agentTrigger.agentId, agentIds));
+		await db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(inArray(agentDefinition.id, agentIds));
+		await db
+			.delete(agentVersion)
+			.where(inArray(agentVersion.agentId, agentIds));
+		await db
+			.delete(agentDefinition)
+			.where(inArray(agentDefinition.id, agentIds));
 	}
 	if (conversationId) {
-		await db.agentConversation.deleteMany({ where: { id: conversationId } });
+		await db
+			.delete(agentConversation)
+			.where(whereEq(agentConversation.id, conversationId));
 	}
-	await db.user.deleteMany({ where: { id: userId } });
+	await db.delete(user).where(whereEq(user.id, userId));
 }

@@ -1,10 +1,25 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { DEFAULT_WORKSPACE_NAME, WORKSPACE_ID } from "@crm/auth/organization";
-import { db } from "@crm/db";
+import {
+	agentConversation,
+	agentConversationAttachment,
+	agentConversationShare,
+	agentConversationSubmission,
+	agentEvent,
+	and,
+	db,
+	eq,
+	inArray,
+	isNull,
+	member,
+	organization,
+	user,
+} from "@crm/db";
 import { workspaceSlug } from "@crm/db/workspace";
 import { z } from "zod";
 import { ConversationSharingService } from "../src/conversations/conversation-sharing.service";
 import { ConversationsService } from "../src/conversations/conversations.service";
+import { one } from "./rows";
 
 const record = z.record(z.string(), z.unknown()).catch({});
 
@@ -23,93 +38,94 @@ const service = new ConversationSharingService(db);
 const conversations = new ConversationsService(db);
 
 beforeAll(async () => {
-	await db.organization.upsert({
-		where: { id: WORKSPACE_ID },
-		update: {},
-		create: {
+	await db
+		.insert(organization)
+		.values({
 			id: WORKSPACE_ID,
 			name: DEFAULT_WORKSPACE_NAME,
 			slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
 			createdAt: new Date(),
+		})
+		.onConflictDoNothing();
+	await db.insert(user).values([
+		{ id: userId, name: "Share Owner", email: `${userId}@example.test` },
+		{
+			id: outsiderId,
+			name: "Share Outsider",
+			email: `${outsiderId}@example.test`,
 		},
-	});
-	await db.user.createMany({
-		data: [
-			{ id: userId, name: "Share Owner", email: `${userId}@example.test` },
-			{
-				id: outsiderId,
-				name: "Share Outsider",
-				email: `${outsiderId}@example.test`,
-			},
-			{
-				id: viewerId,
-				name: "Share Viewer",
-				email: `${viewerId}@example.test`,
-			},
-		],
-	});
-	await db.member.createMany({
-		data: [
-			{
-				id: memberId,
-				organizationId: WORKSPACE_ID,
-				userId,
-				role: "member",
-				createdAt: new Date(),
-			},
-			{
-				id: viewerMemberId,
-				organizationId: WORKSPACE_ID,
-				userId: viewerId,
-				role: "member",
-				createdAt: new Date(),
-			},
-		],
-	});
-	const conversation = await db.agentConversation.create({
-		data: {
-			kind: "BUILDER",
+		{
+			id: viewerId,
+			name: "Share Viewer",
+			email: `${viewerId}@example.test`,
+		},
+	]);
+	await db.insert(member).values([
+		{
+			id: memberId,
+			organizationId: WORKSPACE_ID,
 			userId,
-			title: "Share safely",
-			sessionId,
+			role: "member",
+			createdAt: new Date(),
 		},
-		select: { id: true },
-	});
+		{
+			id: viewerMemberId,
+			organizationId: WORKSPACE_ID,
+			userId: viewerId,
+			role: "member",
+			createdAt: new Date(),
+		},
+	]);
+	const conversation = await one(
+		db
+			.insert(agentConversation)
+			.values({
+				kind: "BUILDER",
+				userId,
+				title: "Share safely",
+				sessionId,
+			})
+			.returning({ id: agentConversation.id }),
+	);
 	conversationId = conversation.id;
-	const submission = await db.agentConversationSubmission.create({
-		data: {
-			conversationId,
-			submittedById: userId,
-			clientRequestId: crypto.randomUUID(),
-			message: {
-				text: "Review the image",
-				resources: [],
-				attachments: [{ name: "shared.png", type: "image/png", size: 4 }],
-			},
-			attachments: {
-				create: {
-					name: "shared.png",
-					mediaType: "image/png",
-					size: 4,
-					content: Buffer.from([1, 2, 3, 4]),
-					position: 0,
+	const submission = await one(
+		db
+			.insert(agentConversationSubmission)
+			.values({
+				conversationId,
+				submittedById: userId,
+				clientRequestId: crypto.randomUUID(),
+				message: {
+					text: "Review the image",
+					resources: [],
+					attachments: [{ name: "shared.png", type: "image/png", size: 4 }],
 				},
-			},
-		},
-		select: { attachments: { select: { id: true } } },
-	});
-	attachmentId = submission.attachments[0]?.id ?? "";
+			})
+			.returning({ id: agentConversationSubmission.id }),
+	);
+	const attachment = await one(
+		db
+			.insert(agentConversationAttachment)
+			.values({
+				submissionId: submission.id,
+				name: "shared.png",
+				mediaType: "image/png",
+				size: 4,
+				content: Buffer.from([1, 2, 3, 4]),
+				position: 0,
+			})
+			.returning({ id: agentConversationAttachment.id }),
+	);
+	attachmentId = attachment.id;
 });
 
 afterAll(async () => {
-	await db.agentEvent.deleteMany({ where: { sessionId } });
-	await db.agentConversation.deleteMany({ where: { id: conversationId } });
-	await db.member.deleteMany({
-		where: { id: { in: [memberId, viewerMemberId] } },
-	});
-	await db.user.deleteMany({
-		where: { id: { in: [userId, outsiderId, viewerId] } },
-	});
+	await db.delete(agentEvent).where(eq(agentEvent.sessionId, sessionId));
+	await db
+		.delete(agentConversation)
+		.where(eq(agentConversation.id, conversationId));
+	await db.delete(member).where(inArray(member.id, [memberId, viewerMemberId]));
+	await db.delete(user).where(inArray(user.id, [userId, outsiderId, viewerId]));
 });
 
 describe("conversation sharing", () => {
@@ -149,10 +165,15 @@ describe("conversation sharing", () => {
 		const results = await Promise.all(
 			Array.from({ length: 4 }, () => service.create(conversationId, userId)),
 		);
-		const activeShares = await db.agentConversationShare.findMany({
-			where: { conversationId, revokedAt: null },
-			select: { tokenHash: true },
-		});
+		const activeShares = await db
+			.select({ tokenHash: agentConversationShare.tokenHash })
+			.from(agentConversationShare)
+			.where(
+				and(
+					eq(agentConversationShare.conversationId, conversationId),
+					isNull(agentConversationShare.revokedAt),
+				),
+			);
 
 		expect(activeShares).toHaveLength(1);
 		const resolutions = await Promise.allSettled(
@@ -206,9 +227,13 @@ describe("conversation sharing", () => {
 		await service.revoke(conversationId, userId);
 
 		expect(
-			await db.agentConversationShare.count({
-				where: { conversationId, revokedAt: null },
-			}),
+			await db.$count(
+				agentConversationShare,
+				and(
+					eq(agentConversationShare.conversationId, conversationId),
+					isNull(agentConversationShare.revokedAt),
+				),
+			),
 		).toBe(0);
 		let unavailable: unknown;
 		try {

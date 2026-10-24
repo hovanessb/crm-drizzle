@@ -1,11 +1,21 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	company as companyTable,
+	contact,
+	contact as contactTable,
+	db,
+	deal as dealTable,
+	eq,
+	inArray,
+	user,
+} from "@crm/db";
 import type { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import { ActivityStampService } from "../src/crm/activity-stamp.service";
 import { ConversionService } from "../src/currency/conversion.service";
 import { DealsService } from "../src/deals/deals.service";
 import { FieldsService } from "../src/fields/fields.service";
 import { withDiscardedCrmEvents } from "./agent-trigger.stub";
+import { one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "deal-contacts-spec";
 const userId = `user-${suffix}`;
@@ -31,55 +41,84 @@ let colleagueId: string;
 let outsiderId: string;
 
 async function clean() {
-	await db.deal.deleteMany({ where: { company: { domain } } });
-	await db.contact.deleteMany({
-		where: { company: { domain: { in: [domain, otherDomain] } } },
-	});
-	await db.company.deleteMany({
-		where: { domain: { in: [domain, otherDomain] } },
-	});
-	await db.user.deleteMany({ where: { id: userId } });
+	await db
+		.delete(dealTable)
+		.where(
+			inArray(
+				dealTable.companyId,
+				db
+					.select({ id: companyTable.id })
+					.from(companyTable)
+					.where(eq(companyTable.domain, domain)),
+			),
+		);
+	await db.delete(contactTable).where(
+		inArray(
+			contactTable.companyId,
+			db
+				.select({ id: companyTable.id })
+				.from(companyTable)
+				.where(inArray(companyTable.domain, [domain, otherDomain])),
+		),
+	);
+	await db
+		.delete(companyTable)
+		.where(inArray(companyTable.domain, [domain, otherDomain]));
+	await db.delete(user).where(eq(user.id, userId));
 }
 
 beforeAll(async () => {
 	await clean();
 
-	await db.user.create({
-		data: {
-			id: userId,
-			name: "Deal Rep",
-			email: `${userId}@example.test`,
-			emailVerified: true,
-		},
-	});
+	await one(
+		db
+			.insert(user)
+			.values({
+				id: userId,
+				name: "Deal Rep",
+				email: `${userId}@example.test`,
+				emailVerified: true,
+			})
+			.returning(),
+	);
 
-	const company = await db.company.create({
-		data: { name: `People Co ${suffix}`, domain },
-		select: { id: true },
-	});
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: `People Co ${suffix}`, domain })
+			.returning({ id: companyTable.id }),
+	);
 	companyId = company.id;
 
-	const other = await db.company.create({
-		data: { name: `Other Co ${suffix}`, domain: otherDomain },
-		select: { id: true },
-	});
+	const other = await one(
+		db
+			.insert(companyTable)
+			.values({ name: `Other Co ${suffix}`, domain: otherDomain })
+			.returning({ id: companyTable.id }),
+	);
 
-	const champion = await db.contact.create({
-		data: { firstName: "Ada", lastName: "Champion", companyId },
-		select: { id: true },
-	});
+	const champion = await one(
+		db
+			.insert(contact)
+			.values({ firstName: "Ada", lastName: "Champion", companyId })
+			.returning({ id: contact.id }),
+	);
 	championId = champion.id;
 
-	const colleague = await db.contact.create({
-		data: { firstName: "Beau", lastName: "Colleague", companyId },
-		select: { id: true },
-	});
+	const colleague = await one(
+		db
+			.insert(contact)
+			.values({ firstName: "Beau", lastName: "Colleague", companyId })
+			.returning({ id: contact.id }),
+	);
 	colleagueId = colleague.id;
 
-	const outsider = await db.contact.create({
-		data: { firstName: "Cass", lastName: "Outsider", companyId: other.id },
-		select: { id: true },
-	});
+	const outsider = await one(
+		db
+			.insert(contact)
+			.values({ firstName: "Cass", lastName: "Outsider", companyId: other.id })
+			.returning({ id: contact.id }),
+	);
 	outsiderId = outsider.id;
 
 	const deal = await deals.create({
@@ -161,7 +200,7 @@ describe("bringing a contact onto a deal", () => {
 		const deal = await deals.byId(dealId);
 
 		expect(deal.contacts).toHaveLength(0);
-		expect(await db.contact.count({ where: { id: championId } })).toBe(1);
+		expect(await db.$count(contact, eq(contact.id, championId))).toBe(1);
 	});
 
 	it("says so when they were never on it", async () => {

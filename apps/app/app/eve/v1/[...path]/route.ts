@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { agentConversation, db, eq } from "@crm/db";
 import { connection } from "next/server";
 import { z } from "zod";
 import {
@@ -51,17 +51,18 @@ async function handler(request: Request): Promise<Response> {
 		if (!requested) return failure("Name one CRM record.", 400);
 		record = requested;
 	} else {
-		const conversation = await db.agentConversation.findUnique({
-			where: { sessionId: route.sessionId },
-			select: {
-				id: true,
-				kind: true,
-				userId: true,
-				contactId: true,
-				companyId: true,
-				dealId: true,
-			},
-		});
+		const [conversation] = await db
+			.select({
+				id: agentConversation.id,
+				kind: agentConversation.kind,
+				userId: agentConversation.userId,
+				contactId: agentConversation.contactId,
+				companyId: agentConversation.companyId,
+				dealId: agentConversation.dealId,
+			})
+			.from(agentConversation)
+			.where(eq(agentConversation.sessionId, route.sessionId))
+			.limit(1);
 		const builderId = request.headers.get("x-crm-builder-conversation");
 		if (
 			!conversation ||
@@ -168,14 +169,12 @@ async function handler(request: Request): Promise<Response> {
 		}
 		response = { ...response, sessionId: createdSessionId };
 		try {
-			await db.agentConversation.create({
-				data: {
-					kind: "RECORD",
-					sessionId: createdSessionId,
-					userId: session.user.id,
-					title: eveProxyMessageTitle(body),
-					...record,
-				},
+			await db.insert(agentConversation).values({
+				kind: "RECORD",
+				sessionId: createdSessionId,
+				userId: session.user.id,
+				title: eveProxyMessageTitle(body),
+				...record,
 			});
 		} catch {
 			await cancelSession(createdSessionId, authorization);

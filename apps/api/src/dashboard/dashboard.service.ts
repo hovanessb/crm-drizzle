@@ -1,4 +1,24 @@
-import { ActivityType, type Db, DealStage } from "@crm/db";
+import {
+	ActivityType,
+	activity,
+	and,
+	asc,
+	company,
+	count,
+	type Db,
+	DealStage,
+	deal,
+	desc,
+	eq,
+	gte,
+	inArray,
+	isNull,
+	lt,
+	or,
+	sql,
+	sum,
+	user,
+} from "@crm/db";
 import { OPEN_DEAL_STAGES } from "@crm/db/deal-stage";
 import { activityMeta } from "@crm/validation/activity-meta";
 import { Injectable } from "@nestjs/common";
@@ -8,12 +28,12 @@ import { ConversionService } from "../currency/conversion.service";
 import { InjectDatabase } from "../database/database.constants";
 import type { DashboardSummaryInput } from "./dashboard.contracts";
 
-const OWNER_SELECT = {
-	id: true,
-	name: true,
-	email: true,
-	image: true,
-} as const;
+const OWNER_FIELDS = {
+	id: user.id,
+	name: user.name,
+	email: user.email,
+	image: user.image,
+};
 
 const TREND_MONTHS = 6;
 
@@ -40,7 +60,8 @@ export class DashboardService {
 
 	async summary(actingUserId: string, input: DashboardSummaryInput) {
 		const mine = input.scope === "me";
-		const owned = mine ? { ownerId: actingUserId } : {};
+		const owned = mine ? eq(deal.ownerId, actingUserId) : undefined;
+		const open = and(owned, inArray(deal.stage, [...OPEN_DEAL_STAGES]));
 
 		const now = new Date();
 		const { startOfToday } = taskDayBoundaries(now);
@@ -63,108 +84,111 @@ export class DashboardService {
 			recentActivity,
 			unconverted,
 		] = await Promise.all([
-			this.db.deal.groupBy({
-				by: ["stage"],
-				where: { ...owned, stage: { in: [...OPEN_DEAL_STAGES] } },
-				_count: { _all: true },
-			}),
-			this.db.deal.groupBy({
-				by: ["stage"],
-				where: {
-					AND: [{ ...owned, stage: { in: [...OPEN_DEAL_STAGES] } }, counted],
-				},
-				_sum: { baseAmount: true },
-			}),
-			this.db.deal.findMany({
-				where: {
-					...owned,
-					OR: [
-						{ createdAt: { gte: trendStart } },
-						{ closedAt: { gte: trendStart } },
-					],
-				},
-				select: {
-					baseAmount: true,
-					baseCurrency: true,
-					stage: true,
-					createdAt: true,
-					closedAt: true,
-				},
-			}),
-			this.db.deal.aggregate({
-				where: {
-					AND: [
-						{
-							...owned,
-							stage: { in: [...OPEN_DEAL_STAGES] },
-							expectedCloseDate: { gte: startOfMonth, lt: startOfNextMonth },
-						},
+			this.db
+				.select({ stage: deal.stage, count: count() })
+				.from(deal)
+				.where(open)
+				.groupBy(deal.stage),
+			this.db
+				.select({
+					stage: deal.stage,
+					baseAmount: sum(deal.baseAmount).mapWith(deal.baseAmount),
+				})
+				.from(deal)
+				.where(and(open, counted))
+				.groupBy(deal.stage),
+			this.db
+				.select({
+					baseAmount: deal.baseAmount,
+					baseCurrency: deal.baseCurrency,
+					stage: deal.stage,
+					createdAt: deal.createdAt,
+					closedAt: deal.closedAt,
+				})
+				.from(deal)
+				.where(
+					and(
+						owned,
+						or(gte(deal.createdAt, trendStart), gte(deal.closedAt, trendStart)),
+					),
+				),
+			this.db
+				.select({
+					count: count(),
+					baseAmount: sum(deal.baseAmount).mapWith(deal.baseAmount),
+				})
+				.from(deal)
+				.where(
+					and(
+						open,
+						gte(deal.expectedCloseDate, startOfMonth),
+						lt(deal.expectedCloseDate, startOfNextMonth),
 						counted,
-					],
-				},
-				_count: { _all: true },
-				_sum: { baseAmount: true },
-			}),
-			this.db.deal.findMany({
-				where: { ...owned, stage: { in: [...OPEN_DEAL_STAGES] } },
-				orderBy: [
-					{ baseAmount: { sort: "desc", nulls: "last" } },
-					{ expectedCloseDate: "asc" },
-				],
-				take: 6,
-				select: {
-					id: true,
-					name: true,
-					stage: true,
-					amount: true,
-					currency: true,
-					baseAmount: true,
-					baseCurrency: true,
-					expectedCloseDate: true,
-					stageChangedAt: true,
+					),
+				)
+				.then(([row]) => row ?? { count: 0, baseAmount: null }),
+			this.db
+				.select({
+					id: deal.id,
+					name: deal.name,
+					stage: deal.stage,
+					amount: deal.amount,
+					currency: deal.currency,
+					baseAmount: deal.baseAmount,
+					baseCurrency: deal.baseCurrency,
+					expectedCloseDate: deal.expectedCloseDate,
+					stageChangedAt: deal.stageChangedAt,
 					company: {
-						select: {
-							id: true,
-							name: true,
-							iconUrl: true,
-							iconDarkUrl: true,
-							iconTone: true,
-						},
+						id: company.id,
+						name: company.name,
+						iconUrl: company.iconUrl,
+						iconDarkUrl: company.iconDarkUrl,
+						iconTone: company.iconTone,
 					},
-					owner: { select: OWNER_SELECT },
+					owner: OWNER_FIELDS,
+				})
+				.from(deal)
+				.innerJoin(company, eq(company.id, deal.companyId))
+				.innerJoin(user, eq(user.id, deal.ownerId))
+				.where(open)
+				.orderBy(
+					sql`${deal.baseAmount} desc nulls last`,
+					asc(deal.expectedCloseDate),
+				)
+				.limit(6),
+			this.db.query.activity.findMany({
+				where: and(
+					eq(activity.type, ActivityType.TASK),
+					isNull(activity.completedAt),
+					lt(activity.dueAt, startOfToday),
+					eq(activity.createdById, actingUserId),
+				),
+				orderBy: [asc(activity.dueAt)],
+				limit: 10,
+				columns: { id: true, subject: true, dueAt: true },
+				with: {
+					company: { columns: { id: true, name: true } },
+					deal: { columns: { id: true, name: true } },
 				},
 			}),
-			this.db.activity.findMany({
-				where: {
-					type: ActivityType.TASK,
-					completedAt: null,
-					dueAt: { lt: startOfToday },
-					createdById: actingUserId,
-				},
-				orderBy: [{ dueAt: "asc" }],
-				take: 10,
-				select: {
-					id: true,
-					subject: true,
-					dueAt: true,
-					company: { select: { id: true, name: true } },
-					deal: { select: { id: true, name: true } },
-				},
-			}),
-			this.db.activity.findMany({
-				where: mine ? { createdById: actingUserId } : {},
-				orderBy: [{ createdAt: "desc" }],
-				take: 12,
-				select: {
+			this.db.query.activity.findMany({
+				where: mine ? eq(activity.createdById, actingUserId) : undefined,
+				orderBy: [desc(activity.createdAt)],
+				limit: 12,
+				columns: {
 					id: true,
 					type: true,
 					subject: true,
 					body: true,
 					createdAt: true,
 					meta: true,
-					createdBy: { select: OWNER_SELECT },
-					company: { select: { id: true, name: true } },
-					deal: { select: { id: true, name: true } },
+				},
+				with: {
+					createdBy: {
+						columns: { id: true, name: true, email: true, image: true },
+					},
+					company: { columns: { id: true, name: true } },
+					deal: { columns: { id: true, name: true } },
 				},
 			}),
 			this.conversion.unconverted(owned),
@@ -175,8 +199,8 @@ export class DashboardService {
 			const value = openValueByStage.find((row) => row.stage === stage);
 			return {
 				stage: stage as DealStage,
-				count: group?._count._all ?? 0,
-				valueCents: toCents(value?._sum.baseAmount ?? null) ?? 0,
+				count: group?.count ?? 0,
+				valueCents: toCents(value?.baseAmount ?? null) ?? 0,
 			};
 		});
 
@@ -195,15 +219,15 @@ export class DashboardService {
 		let wonCents = 0;
 		let cycleDays = 0;
 
-		for (const deal of recentDeals) {
+		for (const recent of recentDeals) {
 			const valued =
-				deal.baseCurrency === base ? toCents(deal.baseAmount) : null;
+				recent.baseCurrency === base ? toCents(recent.baseAmount) : null;
 			const cents = valued ?? 0;
 
-			const created = trend[monthKey(deal.createdAt) - firstBucket];
+			const created = trend[monthKey(recent.createdAt) - firstBucket];
 			if (created) created.created += cents;
 
-			const { closedAt, stage } = deal;
+			const { closedAt, stage } = recent;
 			if (!closedAt) continue;
 			const won = stage === DealStage.CLOSED_WON;
 
@@ -227,7 +251,7 @@ export class DashboardService {
 					valuedWins += 1;
 					wonCents += cents;
 				}
-				cycleDays += (closedAt.getTime() - deal.createdAt.getTime()) / DAY_MS;
+				cycleDays += (closedAt.getTime() - recent.createdAt.getTime()) / DAY_MS;
 			} else if (stage === DealStage.CLOSED_LOST) {
 				losses += 1;
 			}
@@ -257,8 +281,8 @@ export class DashboardService {
 			},
 			trend,
 			closingThisMonthTotal: {
-				count: closingThisMonthTotals._count._all,
-				valueCents: toCents(closingThisMonthTotals._sum.baseAmount) ?? 0,
+				count: closingThisMonthTotals.count,
+				valueCents: toCents(closingThisMonthTotals.baseAmount) ?? 0,
 			},
 			biggestOpen: biggestOpen
 				.map(
@@ -268,9 +292,9 @@ export class DashboardService {
 						baseCurrency,
 						expectedCloseDate,
 						stageChangedAt,
-						...deal
+						...row
 					}) => ({
-						...deal,
+						...row,
 						amountCents: toCents(amount),
 						baseAmountCents: baseCurrency === base ? toCents(baseAmount) : null,
 						expectedCloseDate: expectedCloseDate?.toISOString() ?? null,

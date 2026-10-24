@@ -1,6 +1,22 @@
 import { isMicrosoftConfigured } from "@crm/auth/env";
 import { MICROSOFT_PROVIDER_ID, signsInWithMicrosoft } from "@crm/auth/scopes";
-import type { Db, Prisma } from "@crm/db";
+import {
+	account,
+	activity,
+	and,
+	asc,
+	contains,
+	type Db,
+	type Executor,
+	emailMessage,
+	emailThread,
+	eq,
+	inArray,
+	isNotNull,
+	notExists,
+	or,
+	sql,
+} from "@crm/db";
 import { Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { ActivityStampService } from "../crm/activity-stamp.service";
 import { InjectDatabase } from "../database/database.constants";
@@ -99,15 +115,19 @@ export class MicrosoftConnectionService {
 	}
 
 	async reconcileAll(): Promise<void> {
-		const accounts = await this.db.account.findMany({
-			where: {
-				providerId: MICROSOFT_PROVIDER_ID,
-				OR: MICROSOFT_SYNC_SOURCES.map((source) => ({
-					scope: { contains: SCOPE_FOR_SOURCE[source] },
-				})),
-			},
-			select: { userId: true },
-		});
+		const accounts = await this.db
+			.select({ userId: account.userId })
+			.from(account)
+			.where(
+				and(
+					eq(account.providerId, MICROSOFT_PROVIDER_ID),
+					or(
+						...MICROSOFT_SYNC_SOURCES.map((source) =>
+							contains(account.scope, SCOPE_FOR_SOURCE[source]),
+						),
+					),
+				),
+			);
 
 		for (const userId of new Set(accounts.map((row) => row.userId))) {
 			await this.onConnected(userId);
@@ -115,32 +135,47 @@ export class MicrosoftConnectionService {
 	}
 
 	async purgeSyncedData(userId: string): Promise<PurgeSyncedDataOutput> {
-		const mine: Prisma.EmailMessageWhereInput = {
-			syncedByUserId: userId,
-			outlookMessageId: { not: null },
-		};
-
-		const purged = await this.db.$transaction(
-			async (tx) => {
-				const touched = await tx.emailMessage.findMany({
-					where: mine,
-					select: { threadId: true },
-					distinct: ["threadId"],
-				});
-
-				const threadIds = touched.map((row) => row.threadId);
-				const messages = await tx.emailMessage.deleteMany({ where: mine });
-
-				await tx.emailThread.deleteMany({
-					where: { id: { in: threadIds }, messages: { none: {} } },
-				});
-
-				await rebuildThreads(tx, threadIds);
-
-				return messages.count;
-			},
-			{ timeout: PURGE_TIMEOUT_MS },
+		const mine = and(
+			eq(emailMessage.syncedByUserId, userId),
+			isNotNull(emailMessage.outlookMessageId),
 		);
+
+		const purged = await this.db.transaction(async (tx) => {
+			await tx.execute(
+				sql`SET LOCAL statement_timeout = ${sql.raw(String(PURGE_TIMEOUT_MS))}`,
+			);
+
+			const touched = await tx
+				.selectDistinct({ threadId: emailMessage.threadId })
+				.from(emailMessage)
+				.where(mine);
+
+			const threadIds = touched.map((row) => row.threadId);
+			const messages = await tx
+				.delete(emailMessage)
+				.where(mine)
+				.returning({ id: emailMessage.id });
+
+			if (threadIds.length > 0) {
+				await tx
+					.delete(emailThread)
+					.where(
+						and(
+							inArray(emailThread.id, threadIds),
+							notExists(
+								tx
+									.select({ id: emailMessage.id })
+									.from(emailMessage)
+									.where(eq(emailMessage.threadId, emailThread.id)),
+							),
+						),
+					);
+			}
+
+			await rebuildThreads(tx, threadIds);
+
+			return messages.length;
+		});
 
 		await this.stamp.recomputeAll();
 
@@ -173,16 +208,21 @@ export class MicrosoftConnectionService {
 }
 
 async function rebuildThreads(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	threadIds: string[],
 ): Promise<void> {
 	if (threadIds.length === 0) return;
 
-	const remaining = await tx.emailMessage.findMany({
-		where: { threadId: { in: threadIds } },
-		select: { threadId: true, sentAt: true, subject: true, snippet: true },
-		orderBy: { sentAt: "asc" },
-	});
+	const remaining = await tx
+		.select({
+			threadId: emailMessage.threadId,
+			sentAt: emailMessage.sentAt,
+			subject: emailMessage.subject,
+			snippet: emailMessage.snippet,
+		})
+		.from(emailMessage)
+		.where(inArray(emailMessage.threadId, threadIds))
+		.orderBy(asc(emailMessage.sentAt));
 
 	const byThread = new Map<string, typeof remaining>();
 
@@ -197,19 +237,19 @@ async function rebuildThreads(
 		const last = messages.at(-1);
 		if (!first || !last) continue;
 
-		await tx.emailThread.update({
-			where: { id: threadId },
-			data: {
+		await tx
+			.update(emailThread)
+			.set({
 				messageCount: messages.length,
 				firstMessageAt: first.sentAt,
 				lastMessageAt: last.sentAt,
 				subject: first.subject,
-			},
-		});
+			})
+			.where(eq(emailThread.id, threadId));
 
-		await tx.activity.updateMany({
-			where: { emailThreadId: threadId },
-			data: { body: last.snippet, occurredAt: last.sentAt },
-		});
+		await tx
+			.update(activity)
+			.set({ body: last.snippet, occurredAt: last.sentAt })
+			.where(eq(activity.emailThreadId, threadId));
 	}
 }

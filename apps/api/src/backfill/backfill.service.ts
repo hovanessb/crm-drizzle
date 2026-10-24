@@ -1,5 +1,23 @@
 import { onSignedIn } from "@crm/auth/signed-in";
-import { type Db, EnrichmentStatus, type Prisma } from "@crm/db";
+import {
+	agentTask,
+	and,
+	asc,
+	company,
+	contact,
+	type Db,
+	deal,
+	EnrichmentStatus,
+	eq,
+	exists,
+	gte,
+	inArray,
+	isNotNull,
+	isNull,
+	notInArray,
+	or,
+	type SQL,
+} from "@crm/db";
 import { PRIORITY } from "@crm/db/agent-tasks";
 import { readWorkspaceIdentity } from "@crm/db/workspace";
 import { CACHE_MANAGER } from "@nestjs/cache-manager";
@@ -23,9 +41,7 @@ const MAX_PER_RUN = 500;
 
 const MAX_FAVICONS = 25;
 
-const NEVER_SUCCEEDED: Prisma.EnumEnrichmentStatusFilter = {
-	in: [EnrichmentStatus.PENDING, EnrichmentStatus.FAILED],
-};
+const NEVER_SUCCEEDED = [EnrichmentStatus.PENDING, EnrichmentStatus.FAILED];
 
 const AUTO_KEY = "backfill:auto";
 
@@ -98,13 +114,19 @@ export class BackfillService implements OnModuleInit {
 
 		if (!us?.website || us.profile) return;
 
-		const attempted = await this.db.agentTask.findFirst({
-			where: {
-				kind: "workspace-profile",
-				finishedAt: { gte: new Date(Date.now() - RECHECK_WORKSPACE_AFTER_MS) },
-			},
-			select: { id: true },
-		});
+		const [attempted] = await this.db
+			.select({ id: agentTask.id })
+			.from(agentTask)
+			.where(
+				and(
+					eq(agentTask.kind, "workspace-profile"),
+					gte(
+						agentTask.finishedAt,
+						new Date(Date.now() - RECHECK_WORKSPACE_AFTER_MS),
+					),
+				),
+			)
+			.limit(1);
 
 		if (attempted) return;
 
@@ -121,29 +143,32 @@ export class BackfillService implements OnModuleInit {
 	}
 
 	private async runCompanies(dealsOnly: boolean): Promise<BackfillResult> {
-		const onDeals: Prisma.CompanyWhereInput = dealsOnly
-			? { deals: { some: {} } }
-			: {};
+		const onDeals = dealsOnly
+			? exists(
+					this.db
+						.select({ id: deal.id })
+						.from(deal)
+						.where(eq(deal.companyId, company.id)),
+				)
+			: undefined;
 
 		const needsBrand = this.companiesNeedingBrand();
 		const needsArtwork = await this.companiesNeedingArtwork();
 
 		const [total, rows, artworkRows] = await Promise.all([
-			this.db.company.count({
-				where: { ...onDeals, OR: [needsBrand, needsArtwork] },
-			}),
-			this.db.company.findMany({
-				where: { ...needsBrand, ...onDeals },
-				orderBy: { createdAt: "asc" },
-				take: MAX_PER_RUN,
-				select: { id: true },
-			}),
-			this.db.company.findMany({
-				where: { ...needsArtwork, ...onDeals },
-				orderBy: { createdAt: "asc" },
-				take: MAX_PER_RUN,
-				select: { id: true },
-			}),
+			this.db.$count(company, and(onDeals, or(needsBrand, needsArtwork))),
+			this.db
+				.select({ id: company.id })
+				.from(company)
+				.where(and(needsBrand, onDeals))
+				.orderBy(asc(company.createdAt))
+				.limit(MAX_PER_RUN),
+			this.db
+				.select({ id: company.id })
+				.from(company)
+				.where(and(needsArtwork, onDeals))
+				.orderBy(asc(company.createdAt))
+				.limit(MAX_PER_RUN),
 		]);
 
 		const companyIds = [
@@ -185,13 +210,13 @@ export class BackfillService implements OnModuleInit {
 		const needsPhoto = await this.contactsNeedingPhoto();
 
 		const [photoTotal, photoRows] = await Promise.all([
-			this.db.contact.count({ where: needsPhoto }),
-			this.db.contact.findMany({
-				where: needsPhoto,
-				orderBy: { createdAt: "asc" },
-				take: MAX_PER_RUN,
-				select: { id: true },
-			}),
+			this.db.$count(contact, needsPhoto),
+			this.db
+				.select({ id: contact.id })
+				.from(contact)
+				.where(needsPhoto)
+				.orderBy(asc(contact.createdAt))
+				.limit(MAX_PER_RUN),
 		]);
 
 		const photos = await this.agent.backfill({
@@ -205,14 +230,14 @@ export class BackfillService implements OnModuleInit {
 		const headroom = MAX_PER_RUN - photoRows.length;
 
 		const [researchTotal, researchRows] = await Promise.all([
-			this.db.contact.count({ where: this.contactsNeverResearched() }),
+			this.db.$count(contact, this.contactsNeverResearched()),
 			headroom > 0
-				? this.db.contact.findMany({
-						where: this.contactsNeverResearched(),
-						orderBy: { createdAt: "asc" },
-						take: headroom,
-						select: { id: true },
-					})
+				? this.db
+						.select({ id: contact.id })
+						.from(contact)
+						.where(this.contactsNeverResearched())
+						.orderBy(asc(contact.createdAt))
+						.limit(headroom)
 				: Promise.resolve([]),
 		]);
 
@@ -233,12 +258,12 @@ export class BackfillService implements OnModuleInit {
 	}
 
 	private async sweepFavicons(): Promise<number> {
-		const rows = await this.db.company.findMany({
-			where: { domain: { not: null }, iconUrl: null },
-			orderBy: { createdAt: "asc" },
-			take: MAX_FAVICONS,
-			select: { id: true, domain: true },
-		});
+		const rows = await this.db
+			.select({ id: company.id, domain: company.domain })
+			.from(company)
+			.where(and(isNotNull(company.domain), isNull(company.iconUrl)))
+			.orderBy(asc(company.createdAt))
+			.limit(MAX_FAVICONS);
 
 		if (rows.length === 0) return 0;
 
@@ -257,30 +282,35 @@ export class BackfillService implements OnModuleInit {
 		return rows.length;
 	}
 
-	private companiesNeedingBrand(): Prisma.CompanyWhereInput {
-		return { domain: { not: null }, enrichmentStatus: NEVER_SUCCEEDED };
+	private companiesNeedingBrand(): SQL | undefined {
+		return and(
+			isNotNull(company.domain),
+			inArray(company.enrichmentStatus, NEVER_SUCCEEDED),
+		);
 	}
 
-	private async companiesNeedingArtwork(): Promise<Prisma.CompanyWhereInput> {
+	private async companiesNeedingArtwork(): Promise<SQL | undefined> {
 		const since = new Date(Date.now() - RECHECK_BRAND_AFTER_MS);
 
-		const checked = await this.db.agentTask.findMany({
-			where: { kind: "brand", finishedAt: { gte: since } },
-			select: { companyId: true },
-		});
+		const checked = await this.db
+			.select({ companyId: agentTask.companyId })
+			.from(agentTask)
+			.where(
+				and(eq(agentTask.kind, "brand"), gte(agentTask.finishedAt, since)),
+			);
 
 		const recentlyChecked = checked
 			.map((row) => row.companyId)
 			.filter((id): id is string => id !== null);
 
-		const where: Prisma.CompanyWhereInput = {
-			domain: { not: null },
-			logoUrl: null,
-			iconUrl: null,
-		};
-		if (recentlyChecked.length > 0) where.id = { notIn: recentlyChecked };
-
-		return where;
+		return and(
+			isNotNull(company.domain),
+			isNull(company.logoUrl),
+			isNull(company.iconUrl),
+			recentlyChecked.length > 0
+				? notInArray(company.id, recentlyChecked)
+				: undefined,
+		);
 	}
 
 	/**
@@ -298,35 +328,40 @@ export class BackfillService implements OnModuleInit {
 	 * task is the record that we looked; a month is long enough that a rebuilt
 	 * team page or a new LinkedIn account is still picked up eventually.
 	 */
-	private async contactsNeedingPhoto(): Promise<Prisma.ContactWhereInput> {
+	private async contactsNeedingPhoto(): Promise<SQL | undefined> {
 		const since = new Date(Date.now() - RECHECK_PHOTO_AFTER_MS);
 
-		// `AgentTask.contactId` is a bare column with no Prisma relation, so this
-		// cannot be a nested `some`. Two queries, and the id list is bounded by
-		// the number of contacts we have already looked for.
-		const checked = await this.db.agentTask.findMany({
-			where: { kind: "portrait", finishedAt: { gte: since } },
-			select: { contactId: true },
-		});
+		const checked = await this.db
+			.select({ contactId: agentTask.contactId })
+			.from(agentTask)
+			.where(
+				and(eq(agentTask.kind, "portrait"), gte(agentTask.finishedAt, since)),
+			);
 
 		const recentlyChecked = checked
 			.map((row) => row.contactId)
 			.filter((id): id is string => id !== null);
 
-		const where: Prisma.ContactWhereInput = {
-			imageUrl: null,
-			OR: [
-				{ linkedinUrl: { not: null } },
-				{ githubUrl: { not: null } },
-				{ company: { domain: { not: null } } },
-			],
-		};
-		if (recentlyChecked.length > 0) where.id = { notIn: recentlyChecked };
-
-		return where;
+		return and(
+			isNull(contact.imageUrl),
+			or(
+				isNotNull(contact.linkedinUrl),
+				isNotNull(contact.githubUrl),
+				inArray(
+					contact.companyId,
+					this.db
+						.select({ id: company.id })
+						.from(company)
+						.where(isNotNull(company.domain)),
+				),
+			),
+			recentlyChecked.length > 0
+				? notInArray(contact.id, recentlyChecked)
+				: undefined,
+		);
 	}
 
-	private contactsNeverResearched(): Prisma.ContactWhereInput {
-		return { enrichmentStatus: NEVER_SUCCEEDED };
+	private contactsNeverResearched(): SQL {
+		return inArray(contact.enrichmentStatus, NEVER_SUCCEEDED);
 	}
 }

@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { agentRun, db, orNull, whereEq } from "@crm/db";
 import { DEFAULT_AGENT_MODEL } from "@crm/db/settings";
 import { defineAgent, defineDynamic } from "eve";
 import { attribute, purposeOf } from "../../lib/session-purpose";
@@ -23,14 +23,17 @@ export default defineAgent({
 					};
 				}
 
-				const run = await db.agentRun.findUnique({
-					where: { id: runId },
-					select: {
-						version: {
-							select: { modelId: true, modelContextWindowTokens: true },
+				const run = await db.query.agentRun
+					.findFirst({
+						where: whereEq(agentRun.id, runId),
+						columns: {},
+						with: {
+							version: {
+								columns: { modelId: true, modelContextWindowTokens: true },
+							},
 						},
-					},
-				});
+					})
+					.then(orNull);
 				return run
 					? {
 							model: run.version.modelId,

@@ -1,8 +1,26 @@
 import {
+	and,
+	asc,
+	company,
+	contact,
+	count,
 	type Db,
+	deal,
+	desc,
+	type Executor,
+	eq,
+	exists,
 	type FieldEntity,
-	type Prisma,
-	Prisma as PrismaNamespace,
+	fieldDefinition,
+	fieldOption,
+	fieldValue,
+	hasValues,
+	inArray,
+	isNotNull,
+	isNull,
+	notExists,
+	notInArray,
+	type SQL,
 } from "@crm/db";
 import {
 	attachValues,
@@ -34,14 +52,22 @@ import type {
 import { FIELDS_CONFIG } from "./fields-config";
 
 const WITH_OPTIONS = {
-	options: { orderBy: { position: "asc" } },
-} as const satisfies Prisma.FieldDefinitionInclude;
+	options: { orderBy: [asc(fieldOption.position)] },
+};
 
-const RELATIONS = {
-	COMPANY: "company",
-	CONTACT: "contact",
-	DEAL: "deal",
-} as const satisfies Record<FieldEntity, string>;
+const RECORD_TABLES = {
+	COMPANY: company,
+	CONTACT: contact,
+	DEAL: deal,
+} as const;
+
+function recordIdColumn(entity: FieldEntity) {
+	return RECORD_TABLES[entity].id;
+}
+
+function valueRecordColumn(entity: FieldEntity) {
+	return fieldValue[recordColumn(entity)];
+}
 
 @Injectable()
 export class FieldsService {
@@ -54,19 +80,25 @@ export class FieldsService {
 		entity: FieldEntity,
 		includeArchived: boolean,
 	): Promise<SerializedField[]> {
-		const definitions = await this.db.fieldDefinition.findMany({
-			where: { entity, archivedAt: includeArchived ? undefined : null },
-			include: WITH_OPTIONS,
-			orderBy: { position: "asc" },
+		const definitions = await this.db.query.fieldDefinition.findMany({
+			where: and(
+				eq(fieldDefinition.entity, entity),
+				includeArchived ? undefined : isNull(fieldDefinition.archivedAt),
+			),
+			with: WITH_OPTIONS,
+			orderBy: [asc(fieldDefinition.position)],
 		});
 
 		return definitions.map(serializeField);
 	}
 
 	async byKey(entity: FieldEntity, key: string): Promise<SerializedField> {
-		const definition = await this.db.fieldDefinition.findUnique({
-			where: { entity_key: { entity, key } },
-			include: WITH_OPTIONS,
+		const definition = await this.db.query.fieldDefinition.findFirst({
+			where: and(
+				eq(fieldDefinition.entity, entity),
+				eq(fieldDefinition.key, key),
+			),
+			with: WITH_OPTIONS,
 		});
 
 		if (!definition) throw new NotFoundException("That field does not exist.");
@@ -81,10 +113,16 @@ export class FieldsService {
 			throw new BadRequestException("That label does not make a usable key.");
 		}
 
-		const taken = await this.db.fieldDefinition.findUnique({
-			where: { entity_key: { entity: input.entity, key } },
-			select: { id: true },
-		});
+		const [taken] = await this.db
+			.select({ id: fieldDefinition.id })
+			.from(fieldDefinition)
+			.where(
+				and(
+					eq(fieldDefinition.entity, input.entity),
+					eq(fieldDefinition.key, key),
+				),
+			)
+			.limit(1);
 
 		if (taken) {
 			throw new ConflictException(`There is already a field called "${key}".`);
@@ -94,35 +132,43 @@ export class FieldsService {
 			throw new BadRequestException("A select needs at least one option.");
 		}
 
-		const last = await this.db.fieldDefinition.findFirst({
-			where: { entity: input.entity },
-			orderBy: { position: "desc" },
-			select: { position: true },
-		});
+		const [last] = await this.db
+			.select({ position: fieldDefinition.position })
+			.from(fieldDefinition)
+			.where(eq(fieldDefinition.entity, input.entity))
+			.orderBy(desc(fieldDefinition.position))
+			.limit(1);
 
-		const definition = await this.db.fieldDefinition.create({
-			data: {
-				entity: input.entity,
-				key,
-				label: input.label,
-				type: input.type,
-				agentFilled: input.agentFilled,
-				agentBrief: input.agentBrief,
-				required: input.required,
-				showOnSheet: input.showOnSheet,
-				showOnTable: input.showOnTable,
-				showOnFilter: input.showOnFilter,
-				position: (last?.position ?? -1) + 1,
-				options: usesOptions(input.type)
-					? {
-							create: input.options.map((option, index) => ({
-								label: option.label,
-								position: index,
-							})),
-						}
-					: undefined,
-			},
-			include: WITH_OPTIONS,
+		const definition = await this.db.transaction(async (tx) => {
+			const [created] = await tx
+				.insert(fieldDefinition)
+				.values({
+					entity: input.entity,
+					key,
+					label: input.label,
+					type: input.type,
+					agentFilled: input.agentFilled,
+					agentBrief: input.agentBrief,
+					required: input.required,
+					showOnSheet: input.showOnSheet,
+					showOnTable: input.showOnTable,
+					showOnFilter: input.showOnFilter,
+					position: (last?.position ?? -1) + 1,
+				})
+				.returning({ id: fieldDefinition.id });
+			if (!created) throw new Error("The field insert returned no row.");
+
+			if (usesOptions(input.type) && input.options.length > 0) {
+				await tx.insert(fieldOption).values(
+					input.options.map((option, index) => ({
+						fieldId: created.id,
+						label: option.label,
+						position: index,
+					})),
+				);
+			}
+
+			return this.definitionById(created.id, tx);
 		});
 
 		if (definition.agentFilled) {
@@ -143,9 +189,9 @@ export class FieldsService {
 	}
 
 	async update(id: string, data: FieldUpdateData): Promise<SerializedField> {
-		const existing = await this.db.fieldDefinition.findUnique({
-			where: { id },
-			include: WITH_OPTIONS,
+		const existing = await this.db.query.fieldDefinition.findFirst({
+			where: eq(fieldDefinition.id, id),
+			with: WITH_OPTIONS,
 		});
 
 		if (!existing) throw new NotFoundException("That field does not exist.");
@@ -153,9 +199,10 @@ export class FieldsService {
 		const type = data.type ?? existing.type;
 
 		if (data.type && data.type !== existing.type) {
-			const values = await this.db.fieldValue.count({
-				where: { fieldId: id },
-			});
+			const values = await this.db.$count(
+				fieldValue,
+				eq(fieldValue.fieldId, id),
+			);
 
 			if (values > 0) {
 				throw new ConflictException(
@@ -172,7 +219,7 @@ export class FieldsService {
 			throw new BadRequestException("A select needs at least one option.");
 		}
 
-		const definition = await this.db.$transaction(async (tx) => {
+		const definition = await this.db.transaction(async (tx) => {
 			if (data.options && usesOptions(type)) {
 				const keep = new Set(
 					data.options
@@ -180,40 +227,53 @@ export class FieldsService {
 						.filter((value): value is string => Boolean(value)),
 				);
 
-				await tx.fieldOption.updateMany({
-					where: { fieldId: id, id: { notIn: [...keep] }, archivedAt: null },
-					data: { archivedAt: new Date() },
-				});
+				await tx
+					.update(fieldOption)
+					.set({ archivedAt: new Date() })
+					.where(
+						and(
+							eq(fieldOption.fieldId, id),
+							keep.size > 0 ? notInArray(fieldOption.id, [...keep]) : undefined,
+							isNull(fieldOption.archivedAt),
+						),
+					);
 
 				for (const [index, option] of data.options.entries()) {
 					if (option.id) {
-						await tx.fieldOption.update({
-							where: { id: option.id },
-							data: { label: option.label, position: index },
-						});
+						const [moved] = await tx
+							.update(fieldOption)
+							.set({ label: option.label, position: index })
+							.where(eq(fieldOption.id, option.id))
+							.returning({ id: fieldOption.id });
+						if (!moved)
+							throw new NotFoundException("That option does not exist.");
 						continue;
 					}
 
-					await tx.fieldOption.create({
-						data: { fieldId: id, label: option.label, position: index },
-					});
+					await tx
+						.insert(fieldOption)
+						.values({ fieldId: id, label: option.label, position: index });
 				}
 			}
 
-			return tx.fieldDefinition.update({
-				where: { id },
-				data: {
-					label: data.label,
-					type: data.type,
-					agentFilled: data.agentFilled,
-					agentBrief: data.agentBrief,
-					required: data.required,
-					showOnSheet: data.showOnSheet,
-					showOnTable: data.showOnTable,
-					showOnFilter: data.showOnFilter,
-				},
-				include: WITH_OPTIONS,
-			});
+			const changes = {
+				label: data.label,
+				type: data.type,
+				agentFilled: data.agentFilled,
+				agentBrief: data.agentBrief,
+				required: data.required,
+				showOnSheet: data.showOnSheet,
+				showOnTable: data.showOnTable,
+				showOnFilter: data.showOnFilter,
+			};
+			if (hasValues(changes)) {
+				await tx
+					.update(fieldDefinition)
+					.set(changes)
+					.where(eq(fieldDefinition.id, id));
+			}
+
+			return this.definitionById(id, tx);
 		});
 
 		const briefChanged =
@@ -240,10 +300,15 @@ export class FieldsService {
 	}
 
 	async reorder(input: FieldReorderInput): Promise<SerializedField[]> {
-		const owned = await this.db.fieldDefinition.findMany({
-			where: { id: { in: input.ids }, entity: input.entity },
-			select: { id: true },
-		});
+		const owned = await this.db
+			.select({ id: fieldDefinition.id })
+			.from(fieldDefinition)
+			.where(
+				and(
+					inArray(fieldDefinition.id, input.ids),
+					eq(fieldDefinition.entity, input.entity),
+				),
+			);
 
 		if (owned.length !== input.ids.length) {
 			throw new BadRequestException(
@@ -251,67 +316,78 @@ export class FieldsService {
 			);
 		}
 
-		await this.db.$transaction(
-			input.ids.map((id, index) =>
-				this.db.fieldDefinition.update({
-					where: { id },
-					data: { position: index },
-				}),
-			),
-		);
+		await this.db.transaction(async (tx) => {
+			for (const [index, id] of input.ids.entries()) {
+				await tx
+					.update(fieldDefinition)
+					.set({ position: index })
+					.where(eq(fieldDefinition.id, id));
+			}
+		});
 
 		return this.list(input.entity, false);
 	}
 
 	async archive(id: string): Promise<SerializedField> {
-		try {
-			const definition = await this.db.fieldDefinition.update({
-				where: { id },
-				data: { archivedAt: new Date() },
-				include: WITH_OPTIONS,
-			});
-
-			return serializeField(definition);
-		} catch (error) {
-			throw this.translate(error);
-		}
+		return this.setArchivedAt(id, new Date());
 	}
 
 	async restore(id: string): Promise<SerializedField> {
-		try {
-			const definition = await this.db.fieldDefinition.update({
-				where: { id },
-				data: { archivedAt: null },
-				include: WITH_OPTIONS,
-			});
+		return this.setArchivedAt(id, null);
+	}
 
-			return serializeField(definition);
-		} catch (error) {
-			throw this.translate(error);
-		}
+	private async setArchivedAt(
+		id: string,
+		archivedAt: Date | null,
+	): Promise<SerializedField> {
+		const [updated] = await this.db
+			.update(fieldDefinition)
+			.set({ archivedAt })
+			.where(eq(fieldDefinition.id, id))
+			.returning({ id: fieldDefinition.id });
+
+		if (!updated) throw new NotFoundException("That field does not exist.");
+
+		return serializeField(await this.definitionById(id));
 	}
 
 	async delete(id: string): Promise<{ id: string }> {
-		try {
-			await this.db.fieldDefinition.delete({ where: { id } });
-		} catch (error) {
-			throw this.translate(error);
-		}
+		const [deleted] = await this.db
+			.delete(fieldDefinition)
+			.where(eq(fieldDefinition.id, id))
+			.returning({ id: fieldDefinition.id });
+
+		if (!deleted) throw new NotFoundException("That field does not exist.");
 
 		return { id };
 	}
 
-	async backfill(id: string): Promise<{ queued: boolean }> {
-		const definition = await this.db.fieldDefinition.findUnique({
-			where: { id },
-			select: {
-				entity: true,
-				key: true,
-				label: true,
-				agentFilled: true,
-				archivedAt: true,
-			},
+	private async definitionById(
+		id: string,
+		client: Executor = this.db,
+	): Promise<FieldDefinitionWithOptions> {
+		const definition = await client.query.fieldDefinition.findFirst({
+			where: eq(fieldDefinition.id, id),
+			with: WITH_OPTIONS,
 		});
+
+		if (!definition) throw new NotFoundException("That field does not exist.");
+
+		return definition;
+	}
+
+	async backfill(id: string): Promise<{ queued: boolean }> {
+		const [definition] = await this.db
+			.select({
+				entity: fieldDefinition.entity,
+				key: fieldDefinition.key,
+				label: fieldDefinition.label,
+				agentFilled: fieldDefinition.agentFilled,
+				archivedAt: fieldDefinition.archivedAt,
+			})
+			.from(fieldDefinition)
+			.where(eq(fieldDefinition.id, id))
+			.limit(1);
 
 		if (!definition) throw new NotFoundException("That field does not exist.");
 
@@ -349,10 +425,16 @@ export class FieldsService {
 		recordIds: string[],
 	): Promise<void> {
 		if (recordIds.length === 0) return;
-		const definitions = await this.db.fieldDefinition.findMany({
-			where: { entity, archivedAt: null, agentFilled: true },
-			select: { key: true },
-		});
+		const definitions = await this.db
+			.select({ key: fieldDefinition.key })
+			.from(fieldDefinition)
+			.where(
+				and(
+					eq(fieldDefinition.entity, entity),
+					isNull(fieldDefinition.archivedAt),
+					eq(fieldDefinition.agentFilled, true),
+				),
+			);
 
 		if (definitions.length === 0) return;
 
@@ -369,49 +451,46 @@ export class FieldsService {
 		fieldId: string,
 		cap: number,
 	): Promise<string[]> {
-		const where = { fieldValues: { none: { fieldId } } };
-
-		const rows =
-			entity === "COMPANY"
-				? await this.db.company.findMany({
-						where,
-						select: { id: true },
-						take: cap,
-					})
-				: entity === "CONTACT"
-					? await this.db.contact.findMany({
-							where,
-							select: { id: true },
-							take: cap,
-						})
-					: await this.db.deal.findMany({
-							where,
-							select: { id: true },
-							take: cap,
-						});
+		const table = RECORD_TABLES[entity];
+		const rows = await this.db
+			.select({ id: table.id })
+			.from(table)
+			.where(
+				notExists(
+					this.db
+						.select({ id: fieldValue.id })
+						.from(fieldValue)
+						.where(
+							and(
+								eq(fieldValue.fieldId, fieldId),
+								eq(valueRecordColumn(entity), recordIdColumn(entity)),
+							),
+						),
+				),
+			)
+			.limit(cap);
 
 		return rows.map((row) => row.id);
 	}
 
 	async coverage(id: string): Promise<{ filled: number; total: number }> {
-		const definition = await this.db.fieldDefinition.findUnique({
-			where: { id },
-			select: { entity: true },
-		});
+		const [definition] = await this.db
+			.select({ entity: fieldDefinition.entity })
+			.from(fieldDefinition)
+			.where(eq(fieldDefinition.id, id))
+			.limit(1);
 
 		if (!definition) throw new NotFoundException("That field does not exist.");
 
-		const column = recordColumn(definition.entity);
-
 		const [filled, total] = await Promise.all([
-			this.db.fieldValue.count({
-				where: { fieldId: id, [column]: { not: null } },
-			}),
-			definition.entity === "COMPANY"
-				? this.db.company.count()
-				: definition.entity === "CONTACT"
-					? this.db.contact.count()
-					: this.db.deal.count(),
+			this.db.$count(
+				fieldValue,
+				and(
+					eq(fieldValue.fieldId, id),
+					isNotNull(valueRecordColumn(definition.entity)),
+				),
+			),
+			this.db.$count(RECORD_TABLES[definition.entity]),
 		]);
 
 		return { filled, total };
@@ -419,12 +498,15 @@ export class FieldsService {
 
 	async definitionsFor(
 		entity: FieldEntity,
-		client: Prisma.TransactionClient = this.db,
+		client: Executor = this.db,
 	): Promise<FieldDefinitionWithOptions[]> {
-		return client.fieldDefinition.findMany({
-			where: { entity, archivedAt: null },
-			include: WITH_OPTIONS,
-			orderBy: { position: "asc" },
+		return client.query.fieldDefinition.findMany({
+			where: and(
+				eq(fieldDefinition.entity, entity),
+				isNull(fieldDefinition.archivedAt),
+			),
+			with: WITH_OPTIONS,
+			orderBy: [asc(fieldDefinition.position)],
 		});
 	}
 
@@ -432,11 +514,12 @@ export class FieldsService {
 		entity: FieldEntity,
 		recordId: string,
 	): Promise<RecordField[]> {
-		const column = recordColumn(entity);
-
 		const [definitions, rows] = await Promise.all([
 			this.definitionsFor(entity),
-			this.db.fieldValue.findMany({ where: { [column]: recordId } }),
+			this.db
+				.select()
+				.from(fieldValue)
+				.where(eq(valueRecordColumn(entity), recordId)),
 		]);
 
 		return attachValues(definitions, rows);
@@ -450,22 +533,32 @@ export class FieldsService {
 
 		if (recordIds.length === 0) return byRecord;
 
-		const definitions = await this.db.fieldDefinition.findMany({
-			where: { entity, archivedAt: null, showOnTable: true },
-			include: WITH_OPTIONS,
-			orderBy: { position: "asc" },
+		const definitions = await this.db.query.fieldDefinition.findMany({
+			where: and(
+				eq(fieldDefinition.entity, entity),
+				isNull(fieldDefinition.archivedAt),
+				eq(fieldDefinition.showOnTable, true),
+			),
+			with: WITH_OPTIONS,
+			orderBy: [asc(fieldDefinition.position)],
 		});
 
 		if (definitions.length === 0) return byRecord;
 
 		const column = recordColumn(entity);
 
-		const rows = await this.db.fieldValue.findMany({
-			where: {
-				[column]: { in: recordIds },
-				fieldId: { in: definitions.map((definition) => definition.id) },
-			},
-		});
+		const rows = await this.db
+			.select()
+			.from(fieldValue)
+			.where(
+				and(
+					inArray(valueRecordColumn(entity), recordIds),
+					inArray(
+						fieldValue.fieldId,
+						definitions.map((definition) => definition.id),
+					),
+				),
+			);
 
 		const byId = new Map(definitions.map((entry) => [entry.id, entry]));
 
@@ -501,15 +594,15 @@ export class FieldsService {
 	async filterableFieldsFor(
 		entity: FieldEntity,
 	): Promise<FieldDefinitionWithOptions[]> {
-		return this.db.fieldDefinition.findMany({
-			where: {
-				entity,
-				archivedAt: null,
-				showOnFilter: true,
-				type: { in: ["SELECT", "USER"] },
-			},
-			include: WITH_OPTIONS,
-			orderBy: { position: "asc" },
+		return this.db.query.fieldDefinition.findMany({
+			where: and(
+				eq(fieldDefinition.entity, entity),
+				isNull(fieldDefinition.archivedAt),
+				eq(fieldDefinition.showOnFilter, true),
+				inArray(fieldDefinition.type, ["SELECT", "USER"]),
+			),
+			with: WITH_OPTIONS,
+			orderBy: [asc(fieldDefinition.position)],
 		});
 	}
 
@@ -521,16 +614,14 @@ export class FieldsService {
 	 */
 	async filterFacetCounts(
 		entity: FieldEntity,
-		relationWhere:
-			| Prisma.CompanyWhereInput
-			| Prisma.ContactWhereInput
-			| Prisma.DealWhereInput,
+		relationWhere: SQL | undefined,
 		definitions: FieldDefinitionWithOptions[],
 	): Promise<Record<string, Record<string, number>>> {
 		const facetCounts: Record<string, Record<string, number>> = {};
 		if (definitions.length === 0) return facetCounts;
 
-		const relation = RELATIONS[entity];
+		const table = RECORD_TABLES[entity];
+		const joinOn = eq(valueRecordColumn(entity), recordIdColumn(entity));
 		const byId = new Map(
 			definitions.map((definition) => [definition.id, definition]),
 		);
@@ -543,26 +634,40 @@ export class FieldsService {
 
 		const [selectGroups, userGroups] = await Promise.all([
 			selectIds.length > 0
-				? this.db.fieldValue.groupBy({
-						by: ["fieldId", "optionId"],
-						where: {
-							fieldId: { in: selectIds },
-							optionId: { not: null },
-							[relation]: relationWhere,
-						} as Prisma.FieldValueWhereInput,
-						_count: { _all: true },
-					})
+				? this.db
+						.select({
+							fieldId: fieldValue.fieldId,
+							optionId: fieldValue.optionId,
+							count: count(),
+						})
+						.from(fieldValue)
+						.innerJoin(table, joinOn)
+						.where(
+							and(
+								inArray(fieldValue.fieldId, selectIds),
+								isNotNull(fieldValue.optionId),
+								relationWhere,
+							),
+						)
+						.groupBy(fieldValue.fieldId, fieldValue.optionId)
 				: [],
 			userIds.length > 0
-				? this.db.fieldValue.groupBy({
-						by: ["fieldId", "userId"],
-						where: {
-							fieldId: { in: userIds },
-							userId: { not: null },
-							[relation]: relationWhere,
-						} as Prisma.FieldValueWhereInput,
-						_count: { _all: true },
-					})
+				? this.db
+						.select({
+							fieldId: fieldValue.fieldId,
+							userId: fieldValue.userId,
+							count: count(),
+						})
+						.from(fieldValue)
+						.innerJoin(table, joinOn)
+						.where(
+							and(
+								inArray(fieldValue.fieldId, userIds),
+								isNotNull(fieldValue.userId),
+								relationWhere,
+							),
+						)
+						.groupBy(fieldValue.fieldId, fieldValue.userId)
 				: [],
 		]);
 
@@ -571,8 +676,7 @@ export class FieldsService {
 			if (!definition || !group.optionId) continue;
 			const bucket = facetCounts[definition.key] ?? {};
 			facetCounts[definition.key] = bucket;
-			bucket[group.optionId] =
-				(bucket[group.optionId] ?? 0) + group._count._all;
+			bucket[group.optionId] = (bucket[group.optionId] ?? 0) + group.count;
 		}
 
 		for (const group of userGroups) {
@@ -580,7 +684,7 @@ export class FieldsService {
 			if (!definition || !group.userId) continue;
 			const bucket = facetCounts[definition.key] ?? {};
 			facetCounts[definition.key] = bucket;
-			bucket[group.userId] = (bucket[group.userId] ?? 0) + group._count._all;
+			bucket[group.userId] = (bucket[group.userId] ?? 0) + group.count;
 		}
 
 		return facetCounts;
@@ -588,9 +692,10 @@ export class FieldsService {
 
 	/** Translates selected filter values (by field key) into `FieldValue` `AND` conditions. */
 	fieldFilters(
+		entity: FieldEntity,
 		definitions: FieldDefinitionWithOptions[],
 		selected: Record<string, string[]>,
-	): Array<{ fieldValues: { some: Prisma.FieldValueWhereInput } }> {
+	): SQL[] {
 		const byKey = new Map(
 			definitions.map((definition) => [definition.key, definition]),
 		);
@@ -602,20 +707,26 @@ export class FieldsService {
 				if (!definition) return [];
 
 				return [
-					{
-						fieldValues: {
-							some:
-								definition.type === "USER"
-									? { fieldId: definition.id, userId: { in: values } }
-									: { fieldId: definition.id, optionId: { in: values } },
-						},
-					},
+					exists(
+						this.db
+							.select({ id: fieldValue.id })
+							.from(fieldValue)
+							.where(
+								and(
+									eq(fieldValue.fieldId, definition.id),
+									eq(valueRecordColumn(entity), recordIdColumn(entity)),
+									definition.type === "USER"
+										? inArray(fieldValue.userId, values)
+										: inArray(fieldValue.optionId, values),
+								),
+							),
+					),
 				];
 			});
 	}
 
 	async applyValues(
-		tx: Prisma.TransactionClient,
+		tx: Executor,
 		entity: FieldEntity,
 		recordId: string,
 		values: Record<string, unknown>,
@@ -633,17 +744,6 @@ export class FieldsService {
 
 			throw error;
 		}
-	}
-
-	private translate(cause: unknown): never {
-		if (
-			cause instanceof PrismaNamespace.PrismaClientKnownRequestError &&
-			cause.code === "P2025"
-		) {
-			throw new NotFoundException("That field does not exist.");
-		}
-
-		throw cause;
 	}
 }
 

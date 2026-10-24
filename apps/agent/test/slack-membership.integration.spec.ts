@@ -1,5 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	account,
+	agentTask,
+	and,
+	db,
+	eq,
+	firstRow,
+	notInArray,
+	requireRow,
+	slackChannel,
+	slackWorkspaceGrant,
+	sql,
+	user,
+} from "@crm/db";
 import { joinSlackChannel } from "../agent/lib/slack-membership";
 
 const USER_ID = "slack-join-spec-user";
@@ -11,26 +24,36 @@ const INVENTORY_KIND = "slack-people-match";
 const realFetch = globalThis.fetch;
 
 async function connect() {
-	await db.user.upsert({
-		where: { id: USER_ID },
-		create: {
-			id: USER_ID,
-			name: "Slack Join Spec",
-			email: `${USER_ID}@example.com`,
-		},
-		update: {},
-	});
-	await db.account.upsert({
-		where: { id: ACCOUNT_ID },
-		create: {
-			id: ACCOUNT_ID,
-			accountId: "T-JOIN-SPEC",
-			providerId: "slack",
-			userId: USER_ID,
-			accessToken: "xoxb-join-spec",
-		},
-		update: { accessToken: "xoxb-join-spec" },
-	});
+	await requireRow(
+		db
+			.insert(user)
+			.values({
+				id: USER_ID,
+				name: "Slack Join Spec",
+				email: `${USER_ID}@example.com`,
+			})
+			.onConflictDoUpdate({
+				target: user.id,
+				set: { id: sql`excluded.${sql.identifier("id")}` },
+			})
+			.returning(),
+	);
+	await requireRow(
+		db
+			.insert(account)
+			.values({
+				id: ACCOUNT_ID,
+				accountId: "T-JOIN-SPEC",
+				providerId: "slack",
+				userId: USER_ID,
+				accessToken: "xoxb-join-spec",
+			})
+			.onConflictDoUpdate({
+				target: account.id,
+				set: { ...{ accessToken: "xoxb-join-spec" }, updatedAt: new Date() },
+			})
+			.returning(),
+	);
 }
 
 function answers(error: string) {
@@ -57,33 +80,43 @@ let inventoryTaskIds: string[] = [];
 beforeEach(async () => {
 	requested.length = 0;
 	inventoryTaskIds = (
-		await db.agentTask.findMany({
-			where: { kind: INVENTORY_KIND },
-			select: { id: true },
-		})
+		await db
+			.select({ id: agentTask.id })
+			.from(agentTask)
+			.where(eq(agentTask.kind, INVENTORY_KIND))
 	).map((task) => task.id);
-	await db.slackChannel.deleteMany({ where: { id: CHANNEL_ID } });
+	await db.delete(slackChannel).where(eq(slackChannel.id, CHANNEL_ID));
 	await connect();
-	await db.slackChannel.create({
-		data: {
-			id: CHANNEL_ID,
-			name: "join-spec",
-			isPrivate: false,
-			isMember: false,
-			available: true,
-		},
-	});
+	await requireRow(
+		db
+			.insert(slackChannel)
+			.values({
+				id: CHANNEL_ID,
+				name: "join-spec",
+				isPrivate: false,
+				isMember: false,
+				available: true,
+			})
+			.returning(),
+	);
 });
 
 afterEach(async () => {
 	globalThis.fetch = realFetch;
-	await db.slackChannel.deleteMany({ where: { id: CHANNEL_ID } });
-	await db.slackWorkspaceGrant.deleteMany({ where: { id: GRANT_ID } });
-	await db.agentTask.deleteMany({
-		where: { kind: INVENTORY_KIND, id: { notIn: inventoryTaskIds } },
-	});
-	await db.account.deleteMany({ where: { id: ACCOUNT_ID } });
-	await db.user.deleteMany({ where: { id: USER_ID } });
+	await db.delete(slackChannel).where(eq(slackChannel.id, CHANNEL_ID));
+	await db
+		.delete(slackWorkspaceGrant)
+		.where(eq(slackWorkspaceGrant.id, GRANT_ID));
+	await db
+		.delete(agentTask)
+		.where(
+			and(
+				eq(agentTask.kind, INVENTORY_KIND),
+				notInArray(agentTask.id, inventoryTaskIds),
+			),
+		);
+	await db.delete(account).where(eq(account.id, ACCOUNT_ID));
+	await db.delete(user).where(eq(user.id, USER_ID));
 });
 
 describe("joining a Slack channel", () => {
@@ -95,10 +128,13 @@ describe("joining a Slack channel", () => {
 		expect(outcome.joined).toBe(false);
 		expect(outcome).toMatchObject({ needsHuman: true });
 
-		const row = await db.slackChannel.findUnique({
-			where: { id: CHANNEL_ID },
-			select: { isMember: true },
-		});
+		const row = await firstRow(
+			db
+				.select({ isMember: slackChannel.isMember })
+				.from(slackChannel)
+				.where(eq(slackChannel.id, CHANNEL_ID))
+				.limit(1),
+		);
 		expect(row?.isMember).toBe(false);
 	});
 
@@ -116,27 +152,40 @@ describe("joining a Slack channel", () => {
 			false,
 		);
 		expect(
-			await db.slackChannel.findUnique({
-				where: { id: CHANNEL_ID },
-				select: { isPrivate: true, isMember: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						isPrivate: slackChannel.isPrivate,
+						isMember: slackChannel.isMember,
+					})
+					.from(slackChannel)
+					.where(eq(slackChannel.id, CHANNEL_ID))
+					.limit(1),
+			),
 		).toEqual({ isPrivate: true, isMember: true });
 		expect(
-			await db.agentTask.count({
-				where: { kind: INVENTORY_KIND, id: { notIn: inventoryTaskIds } },
-			}),
+			await db.$count(
+				agentTask,
+				and(
+					eq(agentTask.kind, INVENTORY_KIND),
+					notInArray(agentTask.id, inventoryTaskIds),
+				),
+			),
 		).toBe(1);
 	});
 
 	it("invites itself to a private channel a stale row calls public", async () => {
-		await db.slackWorkspaceGrant.create({
-			data: {
-				id: GRANT_ID,
-				teamId: "T-JOIN-SPEC",
-				userToken: "xoxp-join-spec",
-				userScopes: "groups:write",
-			},
-		});
+		await requireRow(
+			db
+				.insert(slackWorkspaceGrant)
+				.values({
+					id: GRANT_ID,
+					teamId: "T-JOIN-SPEC",
+					userToken: "xoxp-join-spec",
+					userScopes: "groups:write",
+				})
+				.returning(),
+		);
 		replies((url) => {
 			if (url.includes("conversations.info")) {
 				return { ok: false, error: "channel_not_found" };
@@ -155,10 +204,16 @@ describe("joining a Slack channel", () => {
 			false,
 		);
 		expect(
-			await db.slackChannel.findUnique({
-				where: { id: CHANNEL_ID },
-				select: { isPrivate: true, isMember: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						isPrivate: slackChannel.isPrivate,
+						isMember: slackChannel.isMember,
+					})
+					.from(slackChannel)
+					.where(eq(slackChannel.id, CHANNEL_ID))
+					.limit(1),
+			),
 		).toEqual({ isPrivate: true, isMember: true });
 	});
 
@@ -169,10 +224,13 @@ describe("joining a Slack channel", () => {
 
 		expect(outcome).toEqual({ joined: true, already: true });
 
-		const row = await db.slackChannel.findUnique({
-			where: { id: CHANNEL_ID },
-			select: { isMember: true },
-		});
+		const row = await firstRow(
+			db
+				.select({ isMember: slackChannel.isMember })
+				.from(slackChannel)
+				.where(eq(slackChannel.id, CHANNEL_ID))
+				.limit(1),
+		);
 		expect(row?.isMember).toBe(true);
 	});
 });

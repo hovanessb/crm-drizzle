@@ -5,7 +5,29 @@ import {
 	WORKSPACE_ID,
 	type WorkspaceRole,
 } from "@crm/auth/organization";
-import { type Db, DomainScope, Prisma } from "@crm/db";
+import {
+	and,
+	appSetting,
+	asc,
+	contact,
+	count,
+	type Db,
+	DomainScope,
+	desc,
+	eq,
+	formSubmission,
+	gte,
+	inArray,
+	isNotNull,
+	isUniqueViolation,
+	max,
+	member,
+	type NewAppSetting,
+	sql,
+	trackedDomain,
+	trackedEvent,
+	trackedVisitor,
+} from "@crm/db";
 import { describeTouch } from "@crm/db/attribution";
 import { safeFetch } from "@crm/db/safe-fetch";
 import { SETTINGS_ID } from "@crm/db/settings";
@@ -50,26 +72,33 @@ export class TrackingService {
 
 	async settings(userId: string): Promise<TrackingSettings> {
 		const [row, domains, latest, pageViews, submissions] = await Promise.all([
-			this.db.appSetting.findUnique({
-				where: { id: SETTINGS_ID },
-				select: {
-					trackingSiteId: true,
-					trackingCrossDomain: true,
-					trackingLimitToDomains: true,
-					trackingCookieSubdomains: true,
-					trackingSecureCookies: true,
-					trackingHonourDnt: true,
-					trackingCookieDays: true,
-					trackingPaused: true,
-				},
-			}),
-			this.db.trackedDomain.findMany({ orderBy: { createdAt: "asc" } }),
-			this.db.trackedEvent.findFirst({
-				orderBy: { occurredAt: "desc" },
-				select: { occurredAt: true },
-			}),
-			this.db.trackedEvent.count({ where: { type: "page_view" } }),
-			this.db.formSubmission.count(),
+			this.db
+				.select({
+					trackingSiteId: appSetting.trackingSiteId,
+					trackingCrossDomain: appSetting.trackingCrossDomain,
+					trackingLimitToDomains: appSetting.trackingLimitToDomains,
+					trackingCookieSubdomains: appSetting.trackingCookieSubdomains,
+					trackingSecureCookies: appSetting.trackingSecureCookies,
+					trackingHonourDnt: appSetting.trackingHonourDnt,
+					trackingCookieDays: appSetting.trackingCookieDays,
+					trackingPaused: appSetting.trackingPaused,
+				})
+				.from(appSetting)
+				.where(eq(appSetting.id, SETTINGS_ID))
+				.limit(1)
+				.then((rows) => rows[0]),
+			this.db
+				.select()
+				.from(trackedDomain)
+				.orderBy(asc(trackedDomain.createdAt)),
+			this.db
+				.select({ occurredAt: trackedEvent.occurredAt })
+				.from(trackedEvent)
+				.orderBy(desc(trackedEvent.occurredAt))
+				.limit(1)
+				.then((rows) => rows[0]),
+			this.db.$count(trackedEvent, eq(trackedEvent.type, "page_view")),
+			this.db.$count(formSubmission),
 		]);
 
 		const ready = trackingReady(
@@ -131,11 +160,11 @@ export class TrackingService {
 			paused: "trackingPaused",
 		}[flag];
 
-		await this.db.appSetting.upsert({
-			where: { id: SETTINGS_ID },
-			create: { id: SETTINGS_ID, [column]: enabled },
-			update: { [column]: enabled },
-		});
+		const fields: Partial<NewAppSetting> = { [column]: enabled };
+		await this.db
+			.insert(appSetting)
+			.values({ id: SETTINGS_ID, ...fields })
+			.onConflictDoUpdate({ target: appSetting.id, set: fields });
 
 		await this.config.invalidate();
 	}
@@ -147,11 +176,13 @@ export class TrackingService {
 			throw new BadRequestException("That is not a cookie lifetime we offer.");
 		}
 
-		await this.db.appSetting.upsert({
-			where: { id: SETTINGS_ID },
-			create: { id: SETTINGS_ID, trackingCookieDays: days },
-			update: { trackingCookieDays: days },
-		});
+		await this.db
+			.insert(appSetting)
+			.values({ id: SETTINGS_ID, trackingCookieDays: days })
+			.onConflictDoUpdate({
+				target: appSetting.id,
+				set: { trackingCookieDays: days },
+			});
 
 		await this.config.invalidate();
 	}
@@ -170,9 +201,11 @@ export class TrackingService {
 		}
 
 		try {
-			const domain = await this.db.trackedDomain.create({
-				data: { host, scope: input.scope },
-			});
+			const [domain] = await this.db
+				.insert(trackedDomain)
+				.values({ host, scope: input.scope })
+				.returning();
+			if (!domain) throw new Error("The domain insert returned no row.");
 
 			await this.config.invalidate();
 
@@ -184,10 +217,7 @@ export class TrackingService {
 				lastSeenAt: null,
 			};
 		} catch (error) {
-			if (
-				error instanceof Prisma.PrismaClientKnownRequestError &&
-				error.code === "P2002"
-			) {
+			if (isUniqueViolation(error)) {
 				throw new BadRequestException(`${host} is already on the list.`);
 			}
 
@@ -198,17 +228,12 @@ export class TrackingService {
 	async removeDomain(userId: string, id: string): Promise<void> {
 		await this.assertCanManage(userId);
 
-		try {
-			await this.db.trackedDomain.delete({ where: { id } });
-		} catch (error) {
-			if (
-				error instanceof Prisma.PrismaClientKnownRequestError &&
-				error.code === "P2025"
-			) {
-				throw new NotFoundException("That domain is already gone.");
-			}
-
-			throw error;
+		const removed = await this.db
+			.delete(trackedDomain)
+			.where(eq(trackedDomain.id, id))
+			.returning({ id: trackedDomain.id });
+		if (removed.length === 0) {
+			throw new NotFoundException("That domain is already gone.");
 		}
 
 		await this.config.invalidate();
@@ -223,11 +248,12 @@ export class TrackingService {
 	async verify(userId: string, url: string): Promise<VerifyResult> {
 		await this.assertCanManage(userId);
 
-		const domains = await this.db.trackedDomain.count();
-		const row = await this.db.appSetting.findUnique({
-			where: { id: SETTINGS_ID },
-			select: { trackingLimitToDomains: true },
-		});
+		const domains = await this.db.$count(trackedDomain);
+		const [row] = await this.db
+			.select({ trackingLimitToDomains: appSetting.trackingLimitToDomains })
+			.from(appSetting)
+			.where(eq(appSetting.id, SETTINGS_ID))
+			.limit(1);
 
 		if (!trackingReady(row?.trackingLimitToDomains ?? true, domains)) {
 			throw new BadRequestException(
@@ -276,17 +302,20 @@ export class TrackingService {
 		}
 
 		const since = new Date(Date.now() - VERIFY_WINDOW_MS);
-		const seen = await this.db.trackedEvent.findFirst({
-			where: { host, occurredAt: { gte: since } },
-			select: { id: true },
-		});
+		const [seen] = await this.db
+			.select({ id: trackedEvent.id })
+			.from(trackedEvent)
+			.where(
+				and(eq(trackedEvent.host, host), gte(trackedEvent.occurredAt, since)),
+			)
+			.limit(1);
 
 		return {
 			status: "found",
 			host,
 			responseMs,
 			allowed: compiled ? hostAllowed(host, compiled.config) : false,
-			pageView: seen !== null,
+			pageView: seen !== undefined,
 			container,
 		};
 	}
@@ -316,19 +345,20 @@ export class TrackingService {
 	}
 
 	async activityForCompany(companyId: string): Promise<WebsiteActivity> {
-		const visitors = await this.db.trackedVisitor.findMany({
-			where: { contact: { companyId } },
-			select: { id: true },
-		});
+		const visitors = await this.db
+			.select({ id: trackedVisitor.id })
+			.from(trackedVisitor)
+			.innerJoin(contact, eq(contact.id, trackedVisitor.contactId))
+			.where(eq(contact.companyId, companyId));
 
 		return this.activityFor(visitors.map((visitor) => visitor.id));
 	}
 
 	async activityForContact(contactId: string): Promise<WebsiteActivity> {
-		const visitors = await this.db.trackedVisitor.findMany({
-			where: { contactId },
-			select: { id: true },
-		});
+		const visitors = await this.db
+			.select({ id: trackedVisitor.id })
+			.from(trackedVisitor)
+			.where(eq(trackedVisitor.contactId, contactId));
 
 		return this.activityFor(visitors.map((visitor) => visitor.id));
 	}
@@ -346,34 +376,57 @@ export class TrackingService {
 			};
 		}
 
-		const [first, last] = await Promise.all([
-			this.db.trackedVisitor.findFirst({
-				where: { id: { in: visitorIds }, firstSource: { not: null } },
-				orderBy: { firstTouchAt: "asc" },
-			}),
-			this.db.trackedVisitor.findFirst({
-				where: { id: { in: visitorIds }, lastSource: { not: null } },
-				orderBy: { lastTouchAt: "desc" },
-			}),
+		const [[first], [last]] = await Promise.all([
+			this.db
+				.select()
+				.from(trackedVisitor)
+				.where(
+					and(
+						inArray(trackedVisitor.id, visitorIds),
+						isNotNull(trackedVisitor.firstSource),
+					),
+				)
+				.orderBy(asc(trackedVisitor.firstTouchAt))
+				.limit(1),
+			this.db
+				.select()
+				.from(trackedVisitor)
+				.where(
+					and(
+						inArray(trackedVisitor.id, visitorIds),
+						isNotNull(trackedVisitor.lastSource),
+					),
+				)
+				.orderBy(sql`${trackedVisitor.lastTouchAt} desc nulls first`)
+				.limit(1),
 		]);
 
+		const pageViews = and(
+			inArray(trackedEvent.visitorId, visitorIds),
+			eq(trackedEvent.type, "page_view"),
+		);
+
 		const [grouped, latest, views] = await Promise.all([
-			this.db.trackedEvent.groupBy({
-				by: ["host", "path"],
-				where: { visitorId: { in: visitorIds }, type: "page_view" },
-				_count: { _all: true },
-				_max: { occurredAt: true },
-				orderBy: { _count: { path: "desc" } },
-				take: 10,
-			}),
-			this.db.trackedEvent.findFirst({
-				where: { visitorId: { in: visitorIds } },
-				orderBy: { occurredAt: "desc" },
-				select: { occurredAt: true },
-			}),
-			this.db.trackedEvent.count({
-				where: { visitorId: { in: visitorIds }, type: "page_view" },
-			}),
+			this.db
+				.select({
+					host: trackedEvent.host,
+					path: trackedEvent.path,
+					views: count(),
+					lastSeenAt: max(trackedEvent.occurredAt),
+				})
+				.from(trackedEvent)
+				.where(pageViews)
+				.groupBy(trackedEvent.host, trackedEvent.path)
+				.orderBy(desc(count(trackedEvent.path)))
+				.limit(10),
+			this.db
+				.select({ occurredAt: trackedEvent.occurredAt })
+				.from(trackedEvent)
+				.where(inArray(trackedEvent.visitorId, visitorIds))
+				.orderBy(desc(trackedEvent.occurredAt))
+				.limit(1)
+				.then((rows) => rows[0]),
+			this.db.$count(trackedEvent, pageViews),
 		]);
 
 		return {
@@ -382,13 +435,13 @@ export class TrackingService {
 			views,
 			lastSeenAt: latest?.occurredAt.toISOString() ?? null,
 			pages: grouped.flatMap((row) =>
-				row._max.occurredAt
+				row.lastSeenAt
 					? [
 							{
 								host: row.host,
 								path: row.path,
-								views: row._count._all,
-								lastSeenAt: row._max.occurredAt.toISOString(),
+								views: row.views,
+								lastSeenAt: row.lastSeenAt.toISOString(),
 							},
 						]
 					: [],
@@ -420,19 +473,32 @@ export class TrackingService {
 		await this.assertCanManage(userId);
 
 		const [views, contacts] = await Promise.all([
-			this.db.trackedEvent.groupBy({
-				by: ["source", "medium"],
-				where: { type: "page_view", source: { not: null } },
-				_count: { _all: true },
-			}),
-			this.db.$queryRaw<
-				{ firstSource: string; firstMedium: string | null; contacts: bigint }[]
-			>`
+			this.db
+				.select({
+					source: trackedEvent.source,
+					medium: trackedEvent.medium,
+					count: count(),
+				})
+				.from(trackedEvent)
+				.where(
+					and(
+						eq(trackedEvent.type, "page_view"),
+						isNotNull(trackedEvent.source),
+					),
+				)
+				.groupBy(trackedEvent.source, trackedEvent.medium),
+			this.db
+				.execute<{
+					firstSource: string;
+					firstMedium: string | null;
+					contacts: string;
+				}>(sql`
 				SELECT "firstSource", "firstMedium", count(DISTINCT "contactId") AS contacts
 				FROM "trackedVisitor"
 				WHERE "contactId" IS NOT NULL AND "firstSource" IS NOT NULL
 				GROUP BY 1, 2;
-			`,
+			`)
+				.then((result) => result.rows),
 		]);
 
 		const rows = new Map<string, SourceRow>();
@@ -443,7 +509,7 @@ export class TrackingService {
 			rows.set(key, {
 				source: row.source,
 				medium: row.medium,
-				views: row._count._all,
+				views: row.count,
 				contacts: 0,
 			});
 		}
@@ -481,12 +547,17 @@ export class TrackingService {
 	}
 
 	private async roleOf(userId: string): Promise<WorkspaceRole | null> {
-		const member = await this.db.member.findFirst({
-			where: { organizationId: WORKSPACE_ID, userId },
-			select: { role: true },
-		});
+		const [membership] = await this.db
+			.select({ role: member.role })
+			.from(member)
+			.where(
+				and(eq(member.organizationId, WORKSPACE_ID), eq(member.userId, userId)),
+			)
+			.limit(1);
 
-		return member && isWorkspaceRole(member.role) ? member.role : null;
+		return membership && isWorkspaceRole(membership.role)
+			? membership.role
+			: null;
 	}
 }
 

@@ -1,5 +1,32 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	activity,
+	agentAction,
+	agentAuditEvent,
+	agentConversation,
+	agentConversationAttachment,
+	agentConversationSubmission,
+	agentDefinition,
+	agentEvent,
+	agentRun,
+	agentRunEvent,
+	agentTrigger,
+	agentVersion,
+	and,
+	asc,
+	company,
+	db,
+	eq,
+	inArray,
+	type NewAgentConversation,
+	type NewAgentConversationAttachment,
+	type NewAgentConversationSubmission,
+	requireRow,
+	sql,
+	startsWith,
+	user,
+	whereEq,
+} from "@crm/db";
 import type { SendFn } from "eve/channels";
 import { z } from "zod";
 import audit from "../agent/hooks/audit";
@@ -33,153 +60,210 @@ let triggerId = "";
 const builderConversationIds: string[] = [];
 
 beforeAll(async () => {
-	await db.user.create({
-		data: {
-			id: userId,
-			name: "Durable Runtime Test",
-			email: `${userId}@example.test`,
-		},
-	});
-	const [company, otherCompany] = await Promise.all([
-		db.company.create({
-			data: { name: "Durable Runtime Company", domain },
-			select: { id: true },
-		}),
-		db.company.create({
-			data: { name: "Out of Scope Company", domain: `other-${domain}` },
-			select: { id: true },
-		}),
+	await requireRow(
+		db
+			.insert(user)
+			.values({
+				id: userId,
+				name: "Durable Runtime Test",
+				email: `${userId}@example.test`,
+			})
+			.returning(),
+	);
+	const [created, otherCreated] = await Promise.all([
+		requireRow(
+			db
+				.insert(company)
+				.values({ name: "Durable Runtime Company", domain })
+				.returning({ id: company.id }),
+		),
+		requireRow(
+			db
+				.insert(company)
+				.values({ name: "Out of Scope Company", domain: `other-${domain}` })
+				.returning({ id: company.id }),
+		),
 	]);
-	companyId = company.id;
-	otherCompanyId = otherCompany.id;
+	companyId = created.id;
+	otherCompanyId = otherCreated.id;
 
-	const agent = await db.agentDefinition.create({
-		data: {
-			name: "Durable runtime",
-			status: "LIVE",
-			createdById: userId,
-		},
-		select: { id: true },
-	});
+	const agent = await requireRow(
+		db
+			.insert(agentDefinition)
+			.values({
+				name: "Durable runtime",
+				status: "LIVE",
+				createdById: userId,
+			})
+			.returning({ id: agentDefinition.id }),
+	);
 	agentId = agent.id;
-	const version = await db.agentVersion.create({
-		data: {
-			agentId,
-			number: 1,
-			status: "DEPLOYED",
-			instructions: "Create one approved CRM activity.",
-			manifest: {
-				triggers: [
-					{
-						type: "SCHEDULE",
-						name: "Every hour",
-						summary: "Run every hour",
-						config: {
-							nextRunAt: new Date().toISOString(),
-							intervalMinutes: 60,
-						},
-					},
-				],
-				dataScope: {
-					mode: "SELECTED",
-					summary: "Only the selected durable runtime company",
-					resources: [
+	const version = await requireRow(
+		db
+			.insert(agentVersion)
+			.values({
+				agentId,
+				number: 1,
+				status: "DEPLOYED",
+				instructions: "Create one approved CRM activity.",
+				manifest: {
+					triggers: [
 						{
-							kind: "company",
-							id: companyId,
-							label: "Durable Runtime Company",
+							type: "SCHEDULE",
+							name: "Every hour",
+							summary: "Run every hour",
+							config: {
+								nextRunAt: new Date().toISOString(),
+								intervalMinutes: 60,
+							},
+						},
+					],
+					dataScope: {
+						mode: "SELECTED",
+						summary: "Only the selected durable runtime company",
+						resources: [
+							{
+								kind: "company",
+								id: companyId,
+								label: "Durable Runtime Company",
+							},
+						],
+					},
+					actions: [
+						{
+							type: "crm.activity.create",
+							provider: "crm",
+							summary: "Create a CRM note",
+							activityTypes: ["NOTE"],
+						},
+						{
+							type: "run.summary",
+							provider: "crm",
+							summary: "Summarize the run",
 						},
 					],
 				},
-				actions: [
-					{
-						type: "crm.activity.create",
-						provider: "crm",
-						summary: "Create a CRM note",
-						activityTypes: ["NOTE"],
-					},
-					{
-						type: "run.summary",
-						provider: "crm",
-						summary: "Summarize the run",
-					},
-				],
-			},
-			modelId: "test/model",
-			sandboxPolicy: {},
-			createdById: userId,
-			approvedAt: new Date(),
-			deployedAt: new Date(),
-		},
-		select: { id: true },
-	});
+				modelId: "test/model",
+				sandboxPolicy: {},
+				createdById: userId,
+				approvedAt: new Date(),
+				deployedAt: new Date(),
+			})
+			.returning({ id: agentVersion.id }),
+	);
 	versionId = version.id;
-	await db.agentDefinition.update({
-		where: { id: agentId },
-		data: { currentVersionId: versionId },
-	});
-	const trigger = await db.agentTrigger.create({
-		data: {
-			agentId,
-			versionId,
-			type: "SCHEDULE",
-			name: "Every hour",
-			config: { intervalMinutes: 60 },
-			createdById: userId,
-			enabled: true,
-			nextRunAt: new Date(Date.now() - 60_000),
-		},
-		select: { id: true },
-	});
+	await requireRow(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: versionId })
+			.where(whereEq(agentDefinition.id, agentId))
+			.returning(),
+	);
+	const trigger = await requireRow(
+		db
+			.insert(agentTrigger)
+			.values({
+				agentId,
+				versionId,
+				type: "SCHEDULE",
+				name: "Every hour",
+				config: { intervalMinutes: 60 },
+				createdById: userId,
+				enabled: true,
+				nextRunAt: new Date(Date.now() - 60_000),
+			})
+			.returning({ id: agentTrigger.id }),
+	);
 	triggerId = trigger.id;
 });
 
 afterEach(async () => {
 	if (!agentId) return;
-	await db.agentRun.updateMany({
-		where: {
-			agentId,
-			status: { in: ["QUEUED", "RUNNING", "WAITING_FOR_APPROVAL"] },
-		},
-		data: {
+	await db
+		.update(agentRun)
+		.set({
 			status: "CANCELLED",
 			errorCode: "TEST_CLEANUP",
 			errorMessage: "Settled between tests.",
 			finishedAt: new Date(),
-		},
-	});
+		})
+		.where(
+			and(
+				whereEq(agentRun.agentId, agentId),
+				inArray(agentRun.status, ["QUEUED", "RUNNING", "WAITING_FOR_APPROVAL"]),
+			),
+		);
 });
 
 afterAll(async () => {
 	if (builderConversationIds.length > 0) {
-		await db.agentConversation.deleteMany({
-			where: { id: { in: builderConversationIds } },
-		});
+		await db
+			.delete(agentConversation)
+			.where(inArray(agentConversation.id, builderConversationIds));
 	}
 	if (agentId) {
-		await db.agentEvent.deleteMany({
-			where: { sessionId: { startsWith: `durable-session-${suffix}` } },
-		});
-		await db.agentRunEvent.deleteMany({ where: { run: { agentId } } });
-		await db.agentAction.deleteMany({ where: { agentId } });
-		await db.activity.deleteMany({
-			where: { meta: { path: ["agentId"], equals: agentId } },
-		});
-		await db.agentAuditEvent.deleteMany({ where: { agentId } });
-		await db.agentRun.deleteMany({ where: { agentId } });
-		await db.agentTrigger.deleteMany({ where: { agentId } });
-		await db.agentDefinition.updateMany({
-			where: { id: agentId },
-			data: { currentVersionId: null },
-		});
-		await db.agentVersion.deleteMany({ where: { agentId } });
-		await db.agentDefinition.deleteMany({ where: { id: agentId } });
+		await db
+			.delete(agentEvent)
+			.where(startsWith(agentEvent.sessionId, `durable-session-${suffix}`));
+		await db
+			.delete(agentRunEvent)
+			.where(
+				inArray(
+					agentRunEvent.runId,
+					db
+						.select({ id: agentRun.id })
+						.from(agentRun)
+						.where(whereEq(agentRun.agentId, agentId)),
+				),
+			);
+		await db.delete(agentAction).where(whereEq(agentAction.agentId, agentId));
+		await db
+			.delete(activity)
+			.where(sql`${activity.meta} #>> '{agentId}' = ${agentId}`);
+		await db
+			.delete(agentAuditEvent)
+			.where(whereEq(agentAuditEvent.agentId, agentId));
+		await db.delete(agentRun).where(whereEq(agentRun.agentId, agentId));
+		await db.delete(agentTrigger).where(whereEq(agentTrigger.agentId, agentId));
+		await db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(whereEq(agentDefinition.id, agentId));
+		await db.delete(agentVersion).where(whereEq(agentVersion.agentId, agentId));
+		await db
+			.delete(agentDefinition)
+			.where(whereEq(agentDefinition.id, agentId));
 	}
-	await db.company.deleteMany({
-		where: { id: { in: [companyId, otherCompanyId] } },
-	});
-	await db.user.deleteMany({ where: { id: userId } });
+	await db
+		.delete(company)
+		.where(inArray(company.id, [companyId, otherCompanyId]));
+	await db.delete(user).where(whereEq(user.id, userId));
 });
+
+async function builderConversation(
+	conversation: NewAgentConversation,
+	submission: Omit<NewAgentConversationSubmission, "conversationId">,
+	attachment?: Omit<NewAgentConversationAttachment, "submissionId">,
+) {
+	const created = await requireRow(
+		db
+			.insert(agentConversation)
+			.values(conversation)
+			.returning({ id: agentConversation.id }),
+	);
+	const submitted = await requireRow(
+		db
+			.insert(agentConversationSubmission)
+			.values({ ...submission, conversationId: created.id })
+			.returning({ id: agentConversationSubmission.id }),
+	);
+	if (attachment) {
+		await db
+			.insert(agentConversationAttachment)
+			.values({ ...attachment, submissionId: submitted.id });
+	}
+	return { id: created.id, submissions: [submitted] };
+}
 
 async function createRun(
 	status: "QUEUED" | "RUNNING" = "RUNNING",
@@ -187,20 +271,25 @@ async function createRun(
 	sessionId: string | null = null,
 	triggerType: "MANUAL" | "EVENT" = "MANUAL",
 ) {
-	return db.agentRun.create({
-		data: {
-			agentId,
-			versionId,
-			triggerType,
-			status,
-			startedAt,
-			sessionId,
-			idempotencyKey: `durable-run-${crypto.randomUUID()}`,
-			correlationId: crypto.randomUUID(),
-			events: { create: { sequence: 0, type: "run.queued", data: {} } },
-		},
-		select: { id: true },
-	});
+	const run = await requireRow(
+		db
+			.insert(agentRun)
+			.values({
+				agentId,
+				versionId,
+				triggerType,
+				status,
+				startedAt,
+				sessionId,
+				idempotencyKey: `durable-run-${crypto.randomUUID()}`,
+				correlationId: crypto.randomUUID(),
+			})
+			.returning({ id: agentRun.id }),
+	);
+	await db
+		.insert(agentRunEvent)
+		.values({ runId: run.id, sequence: 0, type: "run.queued", data: {} });
+	return run;
 }
 
 async function satisfyRequiredActivity(runId: string, callId: string) {
@@ -215,18 +304,20 @@ async function satisfyRequiredActivity(runId: string, callId: string) {
 
 describe("durable custom-agent runtime", () => {
 	it("queues one run per matching event trigger and event occurrence", async () => {
-		const trigger = await db.agentTrigger.create({
-			data: {
-				agentId,
-				versionId,
-				type: "EVENT",
-				name: "When a deal closes",
-				config: { event: "deal.closed" },
-				createdById: userId,
-				enabled: true,
-			},
-			select: { id: true },
-		});
+		const trigger = await requireRow(
+			db
+				.insert(agentTrigger)
+				.values({
+					agentId,
+					versionId,
+					type: "EVENT",
+					name: "When a deal closes",
+					config: { event: "deal.closed" },
+					createdById: userId,
+					enabled: true,
+				})
+				.returning({ id: agentTrigger.id }),
+		);
 		const occurredAt = new Date().toISOString();
 		const task = {
 			id: `event-task-${suffix}`,
@@ -247,10 +338,14 @@ describe("durable custom-agent runtime", () => {
 			queueEventAgentRuns(task),
 		]);
 
-		const runs = await db.agentRun.findMany({
-			where: { triggerId: trigger.id },
-			select: { triggerType: true, status: true, input: true },
-		});
+		const runs = await db
+			.select({
+				triggerType: agentRun.triggerType,
+				status: agentRun.status,
+				input: agentRun.input,
+			})
+			.from(agentRun)
+			.where(whereEq(agentRun.triggerId, trigger.id));
 		expect(runs).toEqual([
 			{
 				triggerType: "EVENT",
@@ -275,11 +370,21 @@ describe("durable custom-agent runtime", () => {
 
 		expect(results.reduce((total, count) => total + count, 0)).toBe(1);
 		const [trigger, scheduledRuns] = await Promise.all([
-			db.agentTrigger.findUniqueOrThrow({ where: { id: triggerId } }),
-			db.agentRun.findMany({
-				where: { triggerId },
-				select: { id: true, status: true, input: true },
-			}),
+			requireRow(
+				db
+					.select()
+					.from(agentTrigger)
+					.where(whereEq(agentTrigger.id, triggerId))
+					.limit(1),
+			),
+			db
+				.select({
+					id: agentRun.id,
+					status: agentRun.status,
+					input: agentRun.input,
+				})
+				.from(agentRun)
+				.where(whereEq(agentRun.triggerId, triggerId)),
 		]);
 		expect(trigger.lastRunAt).not.toBeNull();
 		expect(trigger.nextRunAt?.getTime()).toBeGreaterThan(now.getTime());
@@ -296,15 +401,31 @@ describe("durable custom-agent runtime", () => {
 
 		const pending = await pendingAgentRunIds();
 		const [recovered, untouched] = await Promise.all([
-			db.agentRun.findUniqueOrThrow({ where: { id: recoverable.id } }),
-			db.agentRun.findUniqueOrThrow({ where: { id: active.id } }),
+			requireRow(
+				db
+					.select()
+					.from(agentRun)
+					.where(whereEq(agentRun.id, recoverable.id))
+					.limit(1),
+			),
+			requireRow(
+				db
+					.select()
+					.from(agentRun)
+					.where(whereEq(agentRun.id, active.id))
+					.limit(1),
+			),
 		]);
 		expect(pending).not.toContain(recoverable.id);
 		expect(recovered).toMatchObject({ status: "QUEUED", startedAt: null });
 		expect(
-			await db.agentRunEvent.count({
-				where: { runId: recoverable.id, type: "run.delivery_recovered" },
-			}),
+			await db.$count(
+				agentRunEvent,
+				and(
+					whereEq(agentRunEvent.runId, recoverable.id),
+					eq(agentRunEvent.type, "run.delivery_recovered"),
+				),
+			),
 		).toBe(1);
 		expect(untouched.status).toBe("RUNNING");
 	});
@@ -322,9 +443,9 @@ describe("durable custom-agent runtime", () => {
 			dispatchAgentRun(run.id, send),
 			dispatchAgentRun(run.id, send),
 		]);
-		const persisted = await db.agentRun.findUniqueOrThrow({
-			where: { id: run.id },
-		});
+		const persisted = await requireRow(
+			db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+		);
 		expect(
 			attempts.filter((attempt) => attempt.status === "fulfilled"),
 		).toHaveLength(1);
@@ -361,10 +482,10 @@ describe("durable custom-agent runtime", () => {
 		expect(deliveries).toHaveLength(1);
 		expect(
 			(
-				await db.agentRun.findMany({
-					where: { id: { in: [first.id, second.id] } },
-					select: { status: true },
-				})
+				await db
+					.select({ status: agentRun.status })
+					.from(agentRun)
+					.where(inArray(agentRun.id, [first.id, second.id]))
 			)
 				.map((run) => run.status)
 				.sort(),
@@ -372,68 +493,84 @@ describe("durable custom-agent runtime", () => {
 	});
 
 	it("restores a builder continuation when a delivery lease expires", async () => {
-		const conversation = await db.agentConversation.create({
-			data: {
+		const conversation = await builderConversation(
+			{
 				kind: "BUILDER",
 				userId,
 				sessionId: `durable-session-${suffix}-builder`,
 				continuationToken: null,
-				submissions: {
-					create: {
-						submittedById: userId,
-						clientRequestId: crypto.randomUUID(),
-						message: { text: "Continue building" },
-						status: "SENDING",
-						attemptCount: 1,
-						sentAt: new Date(Date.now() - 10 * 60_000),
-					},
-				},
 			},
-			select: { id: true, submissions: { select: { id: true } } },
-		});
+			{
+				submittedById: userId,
+				clientRequestId: crypto.randomUUID(),
+				message: { text: "Continue building" },
+				status: "SENDING",
+				attemptCount: 1,
+				sentAt: new Date(Date.now() - 10 * 60_000),
+			},
+		);
 		builderConversationIds.push(conversation.id);
 
 		await pendingBuilderSubmissionIds();
 		const [submission, restored] = await Promise.all([
-			db.agentConversationSubmission.findUniqueOrThrow({
-				where: { id: conversation.submissions[0]?.id },
-			}),
-			db.agentConversation.findUniqueOrThrow({
-				where: { id: conversation.id },
-			}),
+			requireRow(
+				db
+					.select()
+					.from(agentConversationSubmission)
+					.where(
+						whereEq(
+							agentConversationSubmission.id,
+							conversation.submissions[0]?.id,
+						),
+					)
+					.limit(1),
+			),
+			requireRow(
+				db
+					.select()
+					.from(agentConversation)
+					.where(whereEq(agentConversation.id, conversation.id))
+					.limit(1),
+			),
 		]);
 		expect(submission.status).toBe("PENDING");
 		expect(restored.continuationToken).toBe(builderToken(conversation.id));
 	});
 
 	it("keeps concurrent builder dispatches in conversation order", async () => {
-		const conversation = await db.agentConversation.create({
-			data: { kind: "BUILDER", userId },
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({ kind: "BUILDER", userId })
+				.returning({ id: agentConversation.id }),
+		);
 		builderConversationIds.push(conversation.id);
 		const firstCreatedAt = new Date();
 		const [first, second] = await Promise.all([
-			db.agentConversationSubmission.create({
-				data: {
-					conversationId: conversation.id,
-					submittedById: userId,
-					clientRequestId: crypto.randomUUID(),
-					message: { text: "First" },
-					createdAt: firstCreatedAt,
-				},
-				select: { id: true },
-			}),
-			db.agentConversationSubmission.create({
-				data: {
-					conversationId: conversation.id,
-					submittedById: userId,
-					clientRequestId: crypto.randomUUID(),
-					message: { text: "Second" },
-					createdAt: new Date(firstCreatedAt.getTime() + 1),
-				},
-				select: { id: true },
-			}),
+			requireRow(
+				db
+					.insert(agentConversationSubmission)
+					.values({
+						conversationId: conversation.id,
+						submittedById: userId,
+						clientRequestId: crypto.randomUUID(),
+						message: { text: "First" },
+						createdAt: firstCreatedAt,
+					})
+					.returning({ id: agentConversationSubmission.id }),
+			),
+			requireRow(
+				db
+					.insert(agentConversationSubmission)
+					.values({
+						conversationId: conversation.id,
+						submittedById: userId,
+						clientRequestId: crypto.randomUUID(),
+						message: { text: "Second" },
+						createdAt: new Date(firstCreatedAt.getTime() + 1),
+					})
+					.returning({ id: agentConversationSubmission.id }),
+			),
 		]);
 		const started = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -456,11 +593,17 @@ describe("durable custom-agent runtime", () => {
 		release.resolve();
 		await firstDispatch;
 
-		const submissions = await db.agentConversationSubmission.findMany({
-			where: { id: { in: [first.id, second.id] } },
-			orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-			select: { id: true, status: true },
-		});
+		const submissions = await db
+			.select({
+				id: agentConversationSubmission.id,
+				status: agentConversationSubmission.status,
+			})
+			.from(agentConversationSubmission)
+			.where(inArray(agentConversationSubmission.id, [first.id, second.id]))
+			.orderBy(
+				asc(agentConversationSubmission.createdAt),
+				asc(agentConversationSubmission.id),
+			);
 		expect(deliveries).toBe(1);
 		expect(secondError?.message).toContain(
 			"already claimed or is out of order",
@@ -473,40 +616,31 @@ describe("durable custom-agent runtime", () => {
 
 	it("loads persisted attachment bytes into the Eve builder turn", async () => {
 		const content = Buffer.from("durable attachment");
-		const conversation = await db.agentConversation.create({
-			data: {
-				kind: "BUILDER",
-				userId,
-				permissionMode: "AUTO",
-				submissions: {
-					create: {
-						submittedById: userId,
-						clientRequestId: crypto.randomUUID(),
-						message: {
-							text: "Read the attachment",
-							resources: [],
-							attachments: [
-								{
-									name: "brief.txt",
-									type: "text/plain",
-									size: content.byteLength,
-								},
-							],
+		const conversation = await builderConversation(
+			{ kind: "BUILDER", userId, permissionMode: "AUTO" },
+			{
+				submittedById: userId,
+				clientRequestId: crypto.randomUUID(),
+				message: {
+					text: "Read the attachment",
+					resources: [],
+					attachments: [
+						{
+							name: "brief.txt",
+							type: "text/plain",
+							size: content.byteLength,
 						},
-						attachments: {
-							create: {
-								position: 0,
-								name: "brief.txt",
-								mediaType: "text/plain",
-								size: content.byteLength,
-								content,
-							},
-						},
-					},
+					],
 				},
 			},
-			select: { id: true, submissions: { select: { id: true } } },
-		});
+			{
+				position: 0,
+				name: "brief.txt",
+				mediaType: "text/plain",
+				size: content.byteLength,
+				content,
+			},
+		);
 		builderConversationIds.push(conversation.id);
 		let delivered: Parameters<SendFn>[0] | null = null;
 		let deliveredOptions: Parameters<SendFn>[1] | null = null;
@@ -579,17 +713,21 @@ describe("durable custom-agent runtime", () => {
 		await handler(event, context);
 		await handler(event, context);
 
-		const persisted = await db.agentRun.findUniqueOrThrow({
-			where: { id: run.id },
-		});
+		const persisted = await requireRow(
+			db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+		);
 		expect(persisted).toMatchObject({
 			inputTokens: 5,
 			outputTokens: 3,
 			nextEventSequence: 1,
 		});
 		expect(Number(persisted.costUsd)).toBe(0.01);
-		expect(await db.agentRunEvent.count({ where: { id: eventId } })).toBe(1);
-		expect(await db.agentEvent.count({ where: { id: eventId } })).toBe(1);
+		expect(
+			await db.$count(agentRunEvent, whereEq(agentRunEvent.id, eventId)),
+		).toBe(1);
+		expect(await db.$count(agentEvent, whereEq(agentEvent.id, eventId))).toBe(
+			1,
+		);
 	});
 
 	it("keeps a nested subagent session from replacing the root run session", async () => {
@@ -638,7 +776,9 @@ describe("durable custom-agent runtime", () => {
 		);
 
 		expect(
-			await db.agentRun.findUniqueOrThrow({ where: { id: run.id } }),
+			await requireRow(
+				db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+			),
 		).toMatchObject({ sessionId: rootSessionId });
 	});
 
@@ -659,8 +799,20 @@ describe("durable custom-agent runtime", () => {
 		await failRun(failed.id, "SECOND_FAILURE", "This arrived late");
 
 		const [completedRow, failedRow] = await Promise.all([
-			db.agentRun.findUniqueOrThrow({ where: { id: completed.id } }),
-			db.agentRun.findUniqueOrThrow({ where: { id: failed.id } }),
+			requireRow(
+				db
+					.select()
+					.from(agentRun)
+					.where(whereEq(agentRun.id, completed.id))
+					.limit(1),
+			),
+			requireRow(
+				db
+					.select()
+					.from(agentRun)
+					.where(whereEq(agentRun.id, failed.id))
+					.limit(1),
+			),
 		]);
 		expect(completedRow).toMatchObject({
 			status: "SUCCEEDED",
@@ -673,12 +825,13 @@ describe("durable custom-agent runtime", () => {
 		});
 		expect(lateCompletionError?.message).toContain("already ended with FAILED");
 		expect(
-			await db.agentRunEvent.count({
-				where: {
-					runId: { in: [completed.id, failed.id] },
-					type: { in: ["run.completed", "run.failed"] },
-				},
-			}),
+			await db.$count(
+				agentRunEvent,
+				and(
+					inArray(agentRunEvent.runId, [completed.id, failed.id]),
+					inArray(agentRunEvent.type, ["run.completed", "run.failed"]),
+				),
+			),
 		).toBe(2);
 	});
 
@@ -688,18 +841,22 @@ describe("durable custom-agent runtime", () => {
 			summary: "Staged safely",
 			result: { noted: 2 },
 		});
-		const staged = await db.agentRun.findUniqueOrThrow({
-			where: { id: run.id },
-		});
+		const staged = await requireRow(
+			db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+		);
 		expect(staged).toMatchObject({
 			status: "RUNNING",
 			summary: "Staged safely",
 			result: { noted: 2 },
 		});
 		expect(
-			await db.agentRunEvent.count({
-				where: { runId: run.id, type: "run.completed" },
-			}),
+			await db.$count(
+				agentRunEvent,
+				and(
+					whereEq(agentRunEvent.runId, run.id),
+					eq(agentRunEvent.type, "run.completed"),
+				),
+			),
 		).toBe(0);
 
 		await satisfyRequiredActivity(run.id, "staged-success");
@@ -708,7 +865,9 @@ describe("durable custom-agent runtime", () => {
 			result: runResultOf(staged.result),
 		});
 		expect(
-			await db.agentRun.findUniqueOrThrow({ where: { id: run.id } }),
+			await requireRow(
+				db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+			),
 		).toMatchObject({ status: "SUCCEEDED", summary: "Staged safely" });
 	});
 
@@ -720,17 +879,26 @@ describe("durable custom-agent runtime", () => {
 
 		expect(finished).toEqual({ id: run.id, status: "FAILED" });
 		expect(
-			await db.agentRun.findUniqueOrThrow({ where: { id: run.id } }),
+			await requireRow(
+				db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+			),
 		).toMatchObject({
 			status: "FAILED",
 			errorCode: "ACTION_NOT_PERFORMED",
 		});
 		expect(
-			await db.agentAction.findUniqueOrThrow({
-				where: {
-					idempotencyKey: `run:${run.id}:required:crm.activity.create`,
-				},
-			}),
+			await requireRow(
+				db
+					.select()
+					.from(agentAction)
+					.where(
+						whereEq(
+							agentAction.idempotencyKey,
+							`run:${run.id}:required:crm.activity.create`,
+						),
+					)
+					.limit(1),
+			),
 		).toMatchObject({
 			status: "FAILED",
 			errorCode: "ACTION_NOT_PERFORMED",
@@ -758,12 +926,18 @@ describe("durable custom-agent runtime", () => {
 		});
 		expect(finished).toEqual({ id: run.id, status: "FAILED" });
 		expect(
-			await db.agentRun.findUniqueOrThrow({ where: { id: run.id } }),
+			await requireRow(
+				db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+			),
 		).toMatchObject({ status: "FAILED", errorCode: "ACTION_NOT_PERFORMED" });
 		expect(
-			await db.agentRunEvent.count({
-				where: { runId: run.id, type: "run.completed" },
-			}),
+			await db.$count(
+				agentRunEvent,
+				and(
+					whereEq(agentRunEvent.runId, run.id),
+					eq(agentRunEvent.type, "run.completed"),
+				),
+			),
 		).toBe(0);
 	});
 
@@ -773,9 +947,9 @@ describe("durable custom-agent runtime", () => {
 			summary: "The deal was already closed",
 			noActionNeeded: { reason: "The condition was not met." },
 		});
-		const staged = await db.agentRun.findUniqueOrThrow({
-			where: { id: run.id },
-		});
+		const staged = await requireRow(
+			db.select().from(agentRun).where(whereEq(agentRun.id, run.id)).limit(1),
+		);
 		expect(staged.result).toMatchObject({
 			noActionNeeded: "The condition was not met.",
 		});
@@ -785,7 +959,9 @@ describe("durable custom-agent runtime", () => {
 			result: runResultOf(staged.result),
 		});
 		expect(finished).toEqual({ id: run.id, status: "SUCCEEDED" });
-		expect(await db.agentAction.count({ where: { runId: run.id } })).toBe(0);
+		expect(
+			await db.$count(agentAction, whereEq(agentAction.runId, run.id)),
+		).toBe(0);
 	});
 
 	it("claims an approved CRM action once and rejects scope before target access", async () => {
@@ -818,14 +994,19 @@ describe("durable custom-agent runtime", () => {
 		}
 		expect(reusedCallError?.message).toContain("already used for other input");
 		expect(
-			await db.agentAction.count({
-				where: { runId: run.id, idempotencyKey: `${run.id}:shared-call` },
-			}),
+			await db.$count(
+				agentAction,
+				and(
+					whereEq(agentAction.runId, run.id),
+					whereEq(agentAction.idempotencyKey, `${run.id}:shared-call`),
+				),
+			),
 		).toBe(1);
 		expect(
-			await db.activity.count({
-				where: { meta: { path: ["runId"], equals: run.id } },
-			}),
+			await db.$count(
+				activity,
+				sql`${activity.meta} #>> '{runId}' = ${run.id}`,
+			),
 		).toBe(1);
 
 		let scopeError: Error | null = null;
@@ -839,9 +1020,10 @@ describe("durable custom-agent runtime", () => {
 		}
 		expect(scopeError?.message).toContain("outside this agent version");
 		expect(
-			await db.agentAction.count({
-				where: { idempotencyKey: `${run.id}:out-of-scope` },
-			}),
+			await db.$count(
+				agentAction,
+				whereEq(agentAction.idempotencyKey, `${run.id}:out-of-scope`),
+			),
 		).toBe(0);
 
 		let activityTypeError: Error | null = null;
@@ -858,9 +1040,10 @@ describe("durable custom-agent runtime", () => {
 			"does not allow CRM task activities",
 		);
 		expect(
-			await db.agentAction.count({
-				where: { idempotencyKey: `${run.id}:unapproved-task` },
-			}),
+			await db.$count(
+				agentAction,
+				whereEq(agentAction.idempotencyKey, `${run.id}:unapproved-task`),
+			),
 		).toBe(0);
 	});
 });

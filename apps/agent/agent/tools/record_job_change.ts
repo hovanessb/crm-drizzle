@@ -1,4 +1,10 @@
-import { db } from "@crm/db";
+import {
+	contact as contactTable,
+	db,
+	firstRow,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { defineTool } from "eve/tools";
 import { z } from "zod";
 import { sensitiveWrite } from "../lib/approval";
@@ -34,15 +40,18 @@ export default defineTool({
 			};
 		}
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: {
-				firstName: true,
-				lastName: true,
-				ownerId: true,
-				companyId: true,
-			},
-		});
+		const contact = await firstRow(
+			db
+				.select({
+					firstName: contactTable.firstName,
+					lastName: contactTable.lastName,
+					ownerId: contactTable.ownerId,
+					companyId: contactTable.companyId,
+				})
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		if (!contact) return { raised: false as const, reason: "No such contact." };
 
 		const name = [contact.firstName, contact.lastName]
@@ -66,10 +75,13 @@ export default defineTool({
 		);
 
 		if (moveToCompanyId) {
-			await db.contact.update({
-				where: { id: contactId },
-				data: { companyId: moveToCompanyId },
-			});
+			await requireRow(
+				db
+					.update(contactTable)
+					.set({ companyId: moveToCompanyId })
+					.where(whereEq(contactTable.id, contactId))
+					.returning(),
+			);
 		}
 
 		return {

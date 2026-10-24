@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import { db, eq, telemetryMilestone } from "@crm/db";
 import {
 	type JsonObject,
 	type JsonValue,
@@ -10,6 +10,7 @@ import { captureNow, resetTelemetryClient } from "../src/client";
 import { milestone } from "../src/events";
 import { forgetInstall, readInstall, stableUuid } from "../src/install";
 import { POSTHOG_HOST } from "../src/project";
+import { first, one } from "./rows";
 
 const real = {
 	fetch: globalThis.fetch,
@@ -175,18 +176,31 @@ describe("milestone", () => {
 	let existing: { step: string; reachedAt: Date } | null = null;
 
 	beforeEach(async () => {
-		existing = await db.telemetryMilestone.findUnique({ where: { step } });
-		await db.telemetryMilestone.deleteMany({ where: { step } });
+		existing = await first(
+			db
+				.select()
+				.from(telemetryMilestone)
+				.where(eq(telemetryMilestone.step, step))
+				.limit(1),
+		);
+		await db
+			.delete(telemetryMilestone)
+			.where(eq(telemetryMilestone.step, step));
 	});
 
 	afterEach(async () => {
-		await db.telemetryMilestone.deleteMany({ where: { step } });
-		if (existing) await db.telemetryMilestone.create({ data: existing });
+		await db
+			.delete(telemetryMilestone)
+			.where(eq(telemetryMilestone.step, step));
+		if (existing)
+			await one(db.insert(telemetryMilestone).values(existing).returning());
 	});
 
 	it("records the step once the event has left", async () => {
 		expect(await milestone(step)).toBe(true);
-		expect(await db.telemetryMilestone.count({ where: { step } })).toBe(1);
+		expect(
+			await db.$count(telemetryMilestone, eq(telemetryMilestone.step, step)),
+		).toBe(1);
 	});
 
 	it("leaves the step unreached when the send fails", async () => {
@@ -195,7 +209,9 @@ describe("milestone", () => {
 		}) as typeof fetch;
 
 		expect(await milestone(step)).toBe(false);
-		expect(await db.telemetryMilestone.count({ where: { step } })).toBe(0);
+		expect(
+			await db.$count(telemetryMilestone, eq(telemetryMilestone.step, step)),
+		).toBe(0);
 	});
 
 	it("sends the step again on the attempt after a failed send", async () => {
@@ -210,7 +226,9 @@ describe("milestone", () => {
 
 		expect(await milestone(step)).toBe(true);
 		expect(eventOf(calls[0]?.body).event).toBe(step);
-		expect(await db.telemetryMilestone.count({ where: { step } })).toBe(1);
+		expect(
+			await db.$count(telemetryMilestone, eq(telemetryMilestone.step, step)),
+		).toBe(1);
 	});
 
 	it("sends once when two processes sweep at the same instant", async () => {
@@ -221,7 +239,9 @@ describe("milestone", () => {
 
 		expect([first, second].filter(Boolean).length).toBe(1);
 		expect(sentSteps()).toEqual([step]);
-		expect(await db.telemetryMilestone.count({ where: { step } })).toBe(1);
+		expect(
+			await db.$count(telemetryMilestone, eq(telemetryMilestone.step, step)),
+		).toBe(1);
 	});
 
 	it("carries an id that stays the same across a resent step", async () => {
@@ -245,7 +265,9 @@ describe("milestone", () => {
 		resetTelemetryClient();
 
 		expect(await milestone(step)).toBe(false);
-		expect(await db.telemetryMilestone.count({ where: { step } })).toBe(0);
+		expect(
+			await db.$count(telemetryMilestone, eq(telemetryMilestone.step, step)),
+		).toBe(0);
 		expect(calls.length).toBe(0);
 	});
 });

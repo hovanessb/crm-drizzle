@@ -1,6 +1,30 @@
 import { isSlackConfigured } from "@crm/auth/env";
 import { canManageConnections, WORKSPACE_ID } from "@crm/auth/organization";
-import type { Db, Prisma } from "@crm/db";
+import {
+	account as accountTable,
+	agentDefinition,
+	agentTask,
+	agentVersion,
+	and,
+	asc,
+	contains,
+	type Db,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	lt,
+	member,
+	or,
+	type SQL,
+	slackChannel,
+	slackMemberMatch,
+	slackWorkspaceGrant,
+	sql,
+	user,
+} from "@crm/db";
 import { SLACK_INVENTORY } from "@crm/db/slack-inventory";
 import { schemas } from "@crm/validation";
 import {
@@ -42,37 +66,53 @@ export class SlackConnectionService {
 	async status(userId: string): Promise<SlackStatus> {
 		const role = await this.access.assertMember(userId);
 		const [account, agents, matches, memberCount, grant] = await Promise.all([
-			this.db.account.findFirst({
-				where: { providerId: "slack", accessToken: { not: null } },
-				orderBy: { updatedAt: "desc" },
-				select: { accountId: true, updatedAt: true, scope: true },
-			}),
-			this.db.agentDefinition.findMany({
-				where: {
-					status: { in: ["LIVE", "PAUSED"] },
-					deletedAt: null,
-					currentVersionId: { not: null },
-					currentVersion: {
-						manifest: {
-							path: ["dataScope", "resources"],
-							array_contains: [{ id: SLACK_WORKSPACE_RESOURCE_ID }],
-						},
-					},
-				},
-				orderBy: { updatedAt: "desc" },
-				take: 30,
-				select: { id: true, name: true, description: true, status: true },
-			}),
-			this.db.slackMemberMatch.findMany({
-				where: {
-					crmUser: { members: { some: { organizationId: WORKSPACE_ID } } },
-				},
-				select: { slackUserId: true, updatedAt: true },
-			}),
-			this.db.member.count({ where: { organizationId: WORKSPACE_ID } }),
-			this.db.slackWorkspaceGrant.findFirst({
-				select: { id: true, teamName: true },
-			}),
+			this.slackAccount(),
+			this.db
+				.select({
+					id: agentDefinition.id,
+					name: agentDefinition.name,
+					description: agentDefinition.description,
+					status: agentDefinition.status,
+				})
+				.from(agentDefinition)
+				.innerJoin(
+					agentVersion,
+					eq(agentVersion.id, agentDefinition.currentVersionId),
+				)
+				.where(
+					and(
+						inArray(agentDefinition.status, ["LIVE", "PAUSED"]),
+						isNull(agentDefinition.deletedAt),
+						isNotNull(agentDefinition.currentVersionId),
+						sql`${agentVersion.manifest} #> '{dataScope,resources}' @> ${JSON.stringify([{ id: SLACK_WORKSPACE_RESOURCE_ID }])}::jsonb`,
+					),
+				)
+				.orderBy(desc(agentDefinition.updatedAt))
+				.limit(30),
+			this.db
+				.select({
+					slackUserId: slackMemberMatch.slackUserId,
+					updatedAt: slackMemberMatch.updatedAt,
+				})
+				.from(slackMemberMatch)
+				.where(
+					inArray(
+						slackMemberMatch.crmUserId,
+						this.db
+							.select({ userId: member.userId })
+							.from(member)
+							.where(eq(member.organizationId, WORKSPACE_ID)),
+					),
+				),
+			this.db.$count(member, eq(member.organizationId, WORKSPACE_ID)),
+			this.db
+				.select({
+					id: slackWorkspaceGrant.id,
+					teamName: slackWorkspaceGrant.teamName,
+				})
+				.from(slackWorkspaceGrant)
+				.limit(1)
+				.then((rows) => rows[0]),
 		]);
 
 		const matched = matches.filter((match) => match.slackUserId).length;
@@ -106,46 +146,57 @@ export class SlackConnectionService {
 	async matches(userId: string): Promise<SlackMatches> {
 		await this.access.assertMember(userId);
 		const [members, syncing] = await Promise.all([
-			this.db.member.findMany({
-				where: { organizationId: WORKSPACE_ID },
-				orderBy: { user: { name: "asc" } },
-				select: {
-					user: {
-						select: {
-							id: true,
-							name: true,
-							email: true,
-							slackMemberMatch: {
-								select: {
-									slackUserId: true,
-									slackHandle: true,
-									slackEmail: true,
-								},
-							},
-						},
+			this.db
+				.select({
+					user: { id: user.id, name: user.name, email: user.email },
+					match: {
+						slackUserId: slackMemberMatch.slackUserId,
+						slackHandle: slackMemberMatch.slackHandle,
+						slackEmail: slackMemberMatch.slackEmail,
+						id: slackMemberMatch.id,
 					},
-				},
-			}),
+				})
+				.from(member)
+				.innerJoin(user, eq(user.id, member.userId))
+				.leftJoin(slackMemberMatch, eq(slackMemberMatch.crmUserId, user.id))
+				.where(eq(member.organizationId, WORKSPACE_ID))
+				.orderBy(asc(user.name)),
 			this.peopleSyncState(),
 		]);
 
 		return {
-			rows: members.map(({ user }) => ({
-				crmUserId: user.id,
-				name: user.name,
-				email: user.email,
-				match: user.slackMemberMatch,
+			rows: members.map(({ user: person, match }) => ({
+				crmUserId: person.id,
+				name: person.name,
+				email: person.email,
+				match: match
+					? {
+							slackUserId: match.slackUserId,
+							slackHandle: match.slackHandle,
+							slackEmail: match.slackEmail,
+						}
+					: null,
 			})),
 			sync: syncing,
 		};
 	}
 
 	private async peopleSyncState(): Promise<SlackSyncState> {
-		const pending = await this.db.agentTask.findFirst({
-			where: { kind: "slack-people-match", finishedAt: null },
-			orderBy: { createdAt: "desc" },
-			select: { createdAt: true, startedAt: true, leasedUntil: true },
-		});
+		const [pending] = await this.db
+			.select({
+				createdAt: agentTask.createdAt,
+				startedAt: agentTask.startedAt,
+				leasedUntil: agentTask.leasedUntil,
+			})
+			.from(agentTask)
+			.where(
+				and(
+					eq(agentTask.kind, "slack-people-match"),
+					isNull(agentTask.finishedAt),
+				),
+			)
+			.orderBy(desc(agentTask.createdAt))
+			.limit(1);
 		if (!pending) return "idle";
 
 		const now = Date.now();
@@ -161,11 +212,7 @@ export class SlackConnectionService {
 
 	async refreshPeople(userId: string): Promise<SlackRefreshPeopleResult> {
 		await this.access.assertMember(userId);
-		const account = await this.db.account.findFirst({
-			where: { providerId: "slack", accessToken: { not: null } },
-			orderBy: { updatedAt: "desc" },
-			select: { id: true },
-		});
+		const account = await this.slackAccount();
 		if (!account) throw new NotFoundException("Slack is not connected.");
 
 		await this.agent.slackPeopleRequested(
@@ -185,27 +232,34 @@ export class SlackConnectionService {
 		const take = input.limit ?? SLACK.channels.pageSize;
 		const needle = input.query?.trim() ?? "";
 
-		const where: Prisma.SlackChannelWhereInput = { available: true };
-		if (needle) where.name = { contains: needle, mode: "insensitive" };
+		const where = and(
+			eq(slackChannel.available, true),
+			needle
+				? contains(slackChannel.name, needle, { insensitive: true })
+				: undefined,
+			input.cursor ? await this.channelsAfter(input.cursor) : undefined,
+		);
 
 		const [rows, grant, sync] = await Promise.all([
-			this.db.slackChannel.findMany({
-				where,
-				orderBy: [{ isMember: "desc" }, { name: "asc" }, { id: "asc" }],
-				take: take + 1,
-				cursor: input.cursor ? { id: input.cursor } : undefined,
-				skip: input.cursor ? 1 : undefined,
-				select: {
-					id: true,
-					name: true,
-					memberCount: true,
-					isPrivate: true,
-					isMember: true,
-					classifiedAt: true,
-					inviteRequestedAt: true,
-				},
-			}),
-			this.db.slackWorkspaceGrant.findFirst({ select: { id: true } }),
+			this.db
+				.select({
+					id: slackChannel.id,
+					name: slackChannel.name,
+					memberCount: slackChannel.memberCount,
+					isPrivate: slackChannel.isPrivate,
+					isMember: slackChannel.isMember,
+					classifiedAt: slackChannel.classifiedAt,
+					inviteRequestedAt: slackChannel.inviteRequestedAt,
+				})
+				.from(slackChannel)
+				.where(where)
+				.orderBy(
+					desc(slackChannel.isMember),
+					asc(slackChannel.name),
+					asc(slackChannel.id),
+				)
+				.limit(take + 1),
+			this.grant(),
 			this.peopleSyncState(),
 		]);
 
@@ -213,19 +267,19 @@ export class SlackConnectionService {
 		const emptyInventory = sync === "idle" && !needle && page.length === 0;
 		const [account, lastFill] = emptyInventory
 			? await Promise.all([
-					this.db.account.findFirst({
-						where: { providerId: "slack", accessToken: { not: null } },
-						orderBy: { updatedAt: "desc" },
-						select: { updatedAt: true },
-					}),
-					this.db.agentTask.findFirst({
-						where: {
-							kind: SLACK_INVENTORY.kind,
-							finishedAt: { not: null },
-						},
-						orderBy: { finishedAt: "desc" },
-						select: { finishedAt: true },
-					}),
+					this.slackAccount(),
+					this.db
+						.select({ finishedAt: agentTask.finishedAt })
+						.from(agentTask)
+						.where(
+							and(
+								eq(agentTask.kind, SLACK_INVENTORY.kind),
+								isNotNull(agentTask.finishedAt),
+							),
+						)
+						.orderBy(desc(agentTask.finishedAt))
+						.limit(1)
+						.then((rows) => rows[0] ?? null),
 				])
 			: [null, null];
 		const refillDue =
@@ -258,21 +312,25 @@ export class SlackConnectionService {
 		userId: string,
 	): Promise<SlackJoinChannelResult> {
 		await this.access.assertMember(userId);
-		const channel = await this.db.slackChannel.findUnique({
-			where: { id: input.channelId },
-			select: { id: true, name: true, isMember: true, isPrivate: true },
-		});
+		const [channel] = await this.db
+			.select({
+				id: slackChannel.id,
+				name: slackChannel.name,
+				isMember: slackChannel.isMember,
+				isPrivate: slackChannel.isPrivate,
+			})
+			.from(slackChannel)
+			.where(eq(slackChannel.id, input.channelId))
+			.limit(1);
 		if (!channel) throw new NotFoundException("No such Slack channel.");
 		if (channel.isMember) return { queued: false, alreadyJoined: true };
 
-		const grant = await this.db.slackWorkspaceGrant.findFirst({
-			select: { id: true },
-		});
+		const grant = await this.grant();
 		if (channel.isPrivate && !grant) {
-			await this.db.slackChannel.update({
-				where: { id: channel.id },
-				data: { inviteRequestedAt: new Date() },
-			});
+			await this.db
+				.update(slackChannel)
+				.set({ inviteRequestedAt: new Date() })
+				.where(eq(slackChannel.id, channel.id));
 			return { queued: false, alreadyJoined: false };
 		}
 
@@ -285,10 +343,11 @@ export class SlackConnectionService {
 		userId: string,
 	): Promise<SlackCreateChannelResult> {
 		await this.access.assertMember(userId);
-		const existing = await this.db.slackChannel.findFirst({
-			where: { name: input.name },
-			select: { id: true },
-		});
+		const [existing] = await this.db
+			.select({ id: slackChannel.id })
+			.from(slackChannel)
+			.where(eq(slackChannel.name, input.name))
+			.limit(1);
 		if (existing) {
 			throw new BadRequestException("A channel with that name already exists.");
 		}
@@ -305,17 +364,72 @@ export class SlackConnectionService {
 			);
 		}
 
-		const removed = await this.db.$transaction(async (tx) => {
-			const accounts = await tx.account.deleteMany({
-				where: { providerId: "slack" },
-			});
-			await tx.slackChannel.deleteMany({});
-			await tx.slackWorkspaceGrant.deleteMany({});
-			return accounts.count;
+		const removed = await this.db.transaction(async (tx) => {
+			const accounts = await tx
+				.delete(accountTable)
+				.where(eq(accountTable.providerId, "slack"))
+				.returning({ id: accountTable.id });
+			await tx.delete(slackChannel);
+			await tx.delete(slackWorkspaceGrant);
+			return accounts.length;
 		});
 
 		if (removed === 0) throw new NotFoundException("Slack is not connected.");
 
 		return { disconnected: true };
+	}
+
+	private async slackAccount() {
+		const [row] = await this.db
+			.select({
+				id: accountTable.id,
+				accountId: accountTable.accountId,
+				updatedAt: accountTable.updatedAt,
+				scope: accountTable.scope,
+			})
+			.from(accountTable)
+			.where(
+				and(
+					eq(accountTable.providerId, "slack"),
+					isNotNull(accountTable.accessToken),
+				),
+			)
+			.orderBy(desc(accountTable.updatedAt))
+			.limit(1);
+		return row ?? null;
+	}
+
+	private async grant() {
+		const [row] = await this.db
+			.select({ id: slackWorkspaceGrant.id })
+			.from(slackWorkspaceGrant)
+			.limit(1);
+		return row ?? null;
+	}
+
+	private async channelsAfter(cursorId: string): Promise<SQL | undefined> {
+		const [cursor] = await this.db
+			.select({
+				id: slackChannel.id,
+				name: slackChannel.name,
+				isMember: slackChannel.isMember,
+			})
+			.from(slackChannel)
+			.where(eq(slackChannel.id, cursorId))
+			.limit(1);
+		if (!cursor) return sql`false`;
+
+		return or(
+			lt(slackChannel.isMember, cursor.isMember),
+			and(
+				eq(slackChannel.isMember, cursor.isMember),
+				gt(slackChannel.name, cursor.name),
+			),
+			and(
+				eq(slackChannel.isMember, cursor.isMember),
+				eq(slackChannel.name, cursor.name),
+				gt(slackChannel.id, cursor.id),
+			),
+		);
 	}
 }

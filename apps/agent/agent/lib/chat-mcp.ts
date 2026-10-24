@@ -1,4 +1,13 @@
-import { db } from "@crm/db";
+import {
+	and,
+	db,
+	eq,
+	firstRow,
+	mcpConnection,
+	mcpToolSnapshot,
+	orNull,
+	whereEq,
+} from "@crm/db";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import { vendorAccess } from "@crm/mcp-integrations/catalog";
 import type { Vendor } from "@crm/mcp-integrations/vendor";
@@ -80,17 +89,19 @@ export function chatCallApprovalStatus(
 }
 
 export async function loadChatMcpConnections(): Promise<ChatMcpConnection[]> {
-	const connections = await db.mcpConnection.findMany({
-		where: { organizationId: WORKSPACE_ID },
-		select: {
+	const connections = await db.query.mcpConnection.findMany({
+		where: eq(mcpConnection.organizationId, WORKSPACE_ID),
+		columns: {
 			id: true,
 			platformSlug: true,
 			status: true,
 			accessMode: true,
 			lastErrorCode: true,
+		},
+		with: {
 			toolSnapshots: {
-				where: { reviewState: "REVIEWED" },
-				select: { name: true, callKind: true },
+				where: eq(mcpToolSnapshot.reviewState, "REVIEWED"),
+				columns: { name: true, callKind: true },
 			},
 		},
 	});
@@ -164,10 +175,13 @@ async function chatMcpToken(
 	try {
 		return await mcpConnectionToken(connection.id);
 	} catch {
-		const current = await db.mcpConnection.findUnique({
-			where: { id: connection.id },
-			select: { status: true },
-		});
+		const current = await firstRow(
+			db
+				.select({ status: mcpConnection.status })
+				.from(mcpConnection)
+				.where(whereEq(mcpConnection.id, connection.id))
+				.limit(1),
+		);
 		if (current?.status !== "CONNECTED") {
 			throw new ConnectionAuthorizationRequiredError(vendor.slug, {
 				message: `${vendor.name} needs authorization. Use the connection card.`,
@@ -230,18 +244,22 @@ async function authorizeChatMcpTool(
 	if (!toolName) {
 		return { type: "denied", reason: "The MCP tool name is invalid." };
 	}
-	const current = await db.mcpConnection.findUnique({
-		where: { id: connection.id },
-		select: {
-			status: true,
-			accessMode: true,
-			toolSnapshots: {
-				where: { name: toolName, reviewState: "REVIEWED" },
-				select: { callKind: true },
-				take: 1,
+	const current = await db.query.mcpConnection
+		.findFirst({
+			where: whereEq(mcpConnection.id, connection.id),
+			columns: { status: true, accessMode: true },
+			with: {
+				toolSnapshots: {
+					where: and(
+						whereEq(mcpToolSnapshot.name, toolName),
+						eq(mcpToolSnapshot.reviewState, "REVIEWED"),
+					),
+					limit: 1,
+					columns: { callKind: true },
+				},
 			},
-		},
-	});
+		})
+		.then(orNull);
 	if (current?.status !== "CONNECTED") {
 		return { type: "denied", reason: "The MCP platform is disconnected." };
 	}

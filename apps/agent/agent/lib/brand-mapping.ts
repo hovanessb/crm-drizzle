@@ -1,7 +1,7 @@
-import type { Prisma } from "@crm/db";
+import type { NewCompany } from "@crm/db";
 import type { Brand } from "./context-dev";
 
-export type BrandUpdate = Prisma.CompanyUpdateInput;
+export type BrandUpdate = Partial<NewCompany>;
 
 export type CompanySnapshot = {
 	name: string;

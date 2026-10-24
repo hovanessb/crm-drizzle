@@ -1,4 +1,21 @@
-import { db, EnrichmentStatus, type Prisma } from "@crm/db";
+import {
+	agentTask,
+	and,
+	company,
+	contact,
+	db,
+	EnrichmentStatus,
+	eq,
+	firstRow,
+	inArray,
+	isNull,
+	lt,
+	ne,
+	or,
+	type PgColumn,
+	type SQL,
+	whereEq,
+} from "@crm/db";
 import { ownsCompanyStatus, ownsContactStatus } from "@crm/db/agent-tasks";
 import type { TaskSubject } from "./tasks";
 
@@ -7,7 +24,7 @@ type StatusGuard =
 	| { not: EnrichmentStatus }
 	| { in: EnrichmentStatus[] };
 
-type SettleGuard = {
+export type SettleGuard = {
 	enrichmentStatus?: StatusGuard;
 	OR?: Array<{
 		enrichmentStatus: EnrichmentStatus;
@@ -23,6 +40,43 @@ type OwnedColumns = {
 export const UNLESS_COMPLETE = {
 	enrichmentStatus: { not: EnrichmentStatus.COMPLETE },
 } as const;
+
+type GuardColumns = { enrichmentStatus: PgColumn; updatedAt: PgColumn };
+
+const STATUSES = new Set<StatusGuard>(Object.values(EnrichmentStatus));
+
+function isStatus(guard: StatusGuard): guard is EnrichmentStatus {
+	return STATUSES.has(guard);
+}
+
+function statusSql(column: PgColumn, guard: StatusGuard): SQL {
+	if (isStatus(guard)) return eq(column, guard);
+	if ("not" in guard) return ne(column, guard.not);
+	return inArray(column, guard.in);
+}
+
+export function guardSql(
+	columns: GuardColumns,
+	guard: SettleGuard,
+): SQL | undefined {
+	return and(
+		guard.enrichmentStatus === undefined
+			? undefined
+			: statusSql(columns.enrichmentStatus, guard.enrichmentStatus),
+		guard.OR === undefined
+			? undefined
+			: or(
+					...guard.OR.map((branch) =>
+						and(
+							eq(columns.enrichmentStatus, branch.enrichmentStatus),
+							branch.updatedAt === undefined
+								? undefined
+								: lt(columns.updatedAt, branch.updatedAt.lt),
+						),
+					),
+				),
+	);
+}
 
 function ownedColumns(subject: TaskSubject): OwnedColumns {
 	return {
@@ -69,17 +123,17 @@ async function write(
 	};
 
 	if (owned.contactId) {
-		await db.contact.updateMany({
-			where: { id: owned.contactId, ...guard },
-			data,
-		});
+		await db
+			.update(contact)
+			.set(data)
+			.where(and(eq(contact.id, owned.contactId), guardSql(contact, guard)));
 	}
 
 	if (owned.companyId) {
-		await db.company.updateMany({
-			where: { id: owned.companyId, ...guard },
-			data,
-		});
+		await db
+			.update(company)
+			.set(data)
+			.where(and(eq(company.id, owned.companyId), guardSql(company, guard)));
 	}
 }
 
@@ -130,24 +184,38 @@ async function settleable(
 }
 
 async function taskEndedAt(taskId: string): Promise<Date | null> {
-	const task = await db.agentTask.findUnique({
-		where: { id: taskId },
-		select: { finishedAt: true },
-	});
+	const task = await firstRow(
+		db
+			.select({ finishedAt: agentTask.finishedAt })
+			.from(agentTask)
+			.where(whereEq(agentTask.id, taskId))
+			.limit(1),
+	);
 
 	return task?.finishedAt ?? null;
 }
 
 async function hasOpenRequest(subject: TaskSubject): Promise<boolean> {
-	const owners: Prisma.AgentTaskWhereInput[] = [];
-	if (subject.contactId) owners.push({ contactId: subject.contactId });
-	if (subject.companyId) owners.push({ companyId: subject.companyId });
+	const owners: SQL[] = [];
+	if (subject.contactId)
+		owners.push(eq(agentTask.contactId, subject.contactId));
+	if (subject.companyId)
+		owners.push(eq(agentTask.companyId, subject.companyId));
 	if (owners.length === 0) return false;
 
-	const open = await db.agentTask.findFirst({
-		where: { id: { not: subject.id }, finishedAt: null, OR: owners },
-		select: { id: true },
-	});
+	const open = await firstRow(
+		db
+			.select({ id: agentTask.id })
+			.from(agentTask)
+			.where(
+				and(
+					ne(agentTask.id, subject.id),
+					isNull(agentTask.finishedAt),
+					or(...owners),
+				),
+			)
+			.limit(1),
+	);
 
 	return open !== null;
 }

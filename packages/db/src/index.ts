@@ -1,15 +1,21 @@
 export { Decimal } from "decimal.js";
 export {
+	type AnyColumn,
+	aliasedTable,
 	and,
+	arrayContains,
+	arrayOverlaps,
 	asc,
 	avg,
 	between,
+	type Column,
 	count,
 	countDistinct,
 	desc,
 	eq,
 	exists,
 	getTableColumns,
+	getTableName,
 	gt,
 	gte,
 	ilike,
@@ -27,10 +33,18 @@ export {
 	notIlike,
 	notInArray,
 	or,
+	QueryPromise,
 	type SQL,
+	type SQLWrapper,
 	sql,
 	sum,
 } from "drizzle-orm";
+export {
+	alias,
+	type PgColumn,
+	PgDialect,
+	type PgTable,
+} from "drizzle-orm/pg-core";
 export {
 	type Db,
 	type DbLogLevel,
@@ -46,13 +60,6 @@ export {
 	isUniqueViolation,
 	pgErrorCode,
 } from "./errors";
-export {
-	contains,
-	endsWith,
-	equalsInsensitive,
-	escapeLike,
-	startsWith,
-} from "./text-filters";
 export type {
 	ContactBriefSections,
 	FactEvidence,
@@ -62,6 +69,26 @@ export type {
 	JsonValue,
 	WorkspaceProfileSections,
 } from "./json";
+export {
+	hasValues,
+	type RelatedMatch,
+	relatedCount,
+	whereEq,
+} from "./related";
+export {
+	firstRow,
+	orNull,
+	orThrow,
+	queryRows,
+	requireRow,
+} from "./rows";
 export * from "./schema/enums";
 export type * from "./schema/models";
 export * from "./schema/schema";
+export {
+	contains,
+	endsWith,
+	equalsInsensitive,
+	escapeLike,
+	startsWith,
+} from "./text-filters";

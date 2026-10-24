@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import { agentTask, and, company, db, eq, isNull } from "@crm/db";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
 
 const suffix = process.env.TEST_RUN_ID ?? "company-requested-spec";
@@ -12,20 +12,22 @@ let companyId: string;
 let bridgeSecret: string | undefined;
 
 async function clean() {
-	if (companyId) await db.agentTask.deleteMany({ where: { companyId } });
-	await db.company.deleteMany({ where: { name } });
+	if (companyId)
+		await db.delete(agentTask).where(eq(agentTask.companyId, companyId));
+	await db.delete(company).where(eq(company.name, name));
 }
 
 beforeAll(async () => {
 	bridgeSecret = process.env.AGENT_BRIDGE_SECRET;
 	process.env.AGENT_BRIDGE_SECRET = "";
 
-	await db.company.deleteMany({ where: { name } });
-	const company = await db.company.create({
-		data: { name, domain: `requested-${suffix}.test`.toLowerCase() },
-		select: { id: true },
-	});
-	companyId = company.id;
+	await db.delete(company).where(eq(company.name, name));
+	const [created] = await db
+		.insert(company)
+		.values({ name, domain: `requested-${suffix}.test`.toLowerCase() })
+		.returning({ id: company.id });
+	if (!created) throw new Error("Could not seed the company.");
+	companyId = created.id;
 });
 
 afterAll(async () => {
@@ -44,10 +46,16 @@ describe("asking for a fresh look", () => {
 
 		expect(await agent.companyRequested(companyId, reason)).toBe(false);
 
-		await db.agentTask.updateMany({
-			where: { companyId, reason, finishedAt: null },
-			data: { finishedAt: new Date(), outcome: "done" },
-		});
+		await db
+			.update(agentTask)
+			.set({ finishedAt: new Date(), outcome: "done" })
+			.where(
+				and(
+					eq(agentTask.companyId, companyId),
+					eq(agentTask.reason, reason),
+					isNull(agentTask.finishedAt),
+				),
+			);
 
 		expect(await agent.companyRequested(companyId, reason)).toBe(true);
 	});

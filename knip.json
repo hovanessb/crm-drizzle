@@ -40,8 +40,7 @@
 		},
 		"packages/db": {
 			"entry": ["src/*.ts"],
-			"project": ["src/**/*.ts"],
-			"ignoreDependencies": ["@prisma/client"]
+			"project": ["src/**/*.ts"]
 		},
 		"packages/ui": {
 			"entry": ["src/components/**/*.tsx", "src/lib/*.ts", "src/hooks/*.ts"],

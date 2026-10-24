@@ -1,6 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	agentTask,
+	company as companyTable,
+	contact as contactTable,
+	db,
+	eq,
+} from "@crm/db";
 import { AgentQueueService } from "../src/agent/agent-queue.service";
+import { one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "agent-queue-spec";
 const email = `badge-${suffix}@example.test`;
@@ -15,45 +22,52 @@ let contactId: string;
 let companyId: string;
 
 async function clean() {
-	await db.agentTask.deleteMany({ where: { kind } });
-	await db.contact.deleteMany({ where: { email } });
-	await db.company.deleteMany({ where: { name } });
+	await db.delete(agentTask).where(eq(agentTask.kind, kind));
+	await db.delete(contactTable).where(eq(contactTable.email, email));
+	await db.delete(companyTable).where(eq(companyTable.name, name));
 }
 
 beforeAll(async () => {
 	await clean();
 
-	const contact = await db.contact.create({
-		data: { firstName: "Badge", lastName: "Later", email },
-		select: { id: true },
-	});
-	const company = await db.company.create({
-		data: { name },
-		select: { id: true },
-	});
+	const contact = await one(
+		db
+			.insert(contactTable)
+			.values({ firstName: "Badge", lastName: "Later", email })
+			.returning({ id: contactTable.id }),
+	);
+	const company = await one(
+		db.insert(companyTable).values({ name }).returning({ id: companyTable.id }),
+	);
 
 	contactId = contact.id;
 	companyId = company.id;
 
-	await db.agentTask.create({
-		data: {
-			kind,
-			reason: "recheck in three months",
-			dueAt: new Date(Date.now() + 90 * DAY_MS),
-			budget: 4,
-			contactId,
-		},
-	});
+	await one(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: "recheck in three months",
+				dueAt: new Date(Date.now() + 90 * DAY_MS),
+				budget: 4,
+				contactId,
+			})
+			.returning(),
+	);
 
-	await db.agentTask.create({
-		data: {
-			kind,
-			reason: "due now",
-			dueAt: new Date(Date.now() - 60_000),
-			budget: 4,
-			companyId,
-		},
-	});
+	await one(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: "due now",
+				dueAt: new Date(Date.now() - 60_000),
+				budget: 4,
+				companyId,
+			})
+			.returning(),
+	);
 });
 
 afterAll(clean);

@@ -1,5 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	account,
+	asc,
+	db,
+	eq,
+	firstRow,
+	requireRow,
+	slackChannel,
+	sql,
+	startsWith,
+	user,
+	whereEq,
+} from "@crm/db";
 import {
 	persistSlackChannels,
 	refreshSlackChannels,
@@ -14,51 +26,61 @@ const realFetch = globalThis.fetch;
 let restore: Array<{ id: string; available: boolean }> = [];
 
 async function connect() {
-	await db.user.upsert({
-		where: { id: USER_ID },
-		create: {
-			id: USER_ID,
-			name: "Slack Spec",
-			email: `${USER_ID}@example.com`,
-		},
-		update: {},
-	});
-	await db.account.upsert({
-		where: { id: ACCOUNT_ID },
-		create: {
-			id: ACCOUNT_ID,
-			accountId: "T-SPEC",
-			providerId: "slack",
-			userId: USER_ID,
-			accessToken: "xoxb-spec",
-		},
-		update: { accessToken: "xoxb-spec" },
-	});
+	await requireRow(
+		db
+			.insert(user)
+			.values({
+				id: USER_ID,
+				name: "Slack Spec",
+				email: `${USER_ID}@example.com`,
+			})
+			.onConflictDoUpdate({
+				target: user.id,
+				set: { id: sql`excluded.${sql.identifier("id")}` },
+			})
+			.returning(),
+	);
+	await requireRow(
+		db
+			.insert(account)
+			.values({
+				id: ACCOUNT_ID,
+				accountId: "T-SPEC",
+				providerId: "slack",
+				userId: USER_ID,
+				accessToken: "xoxb-spec",
+			})
+			.onConflictDoUpdate({
+				target: account.id,
+				set: { ...{ accessToken: "xoxb-spec" }, updatedAt: new Date() },
+			})
+			.returning(),
+	);
 }
 
 async function disconnect() {
-	await db.account.deleteMany({ where: { providerId: "slack" } });
-	await db.slackChannel.deleteMany({ where: { id: { startsWith: PREFIX } } });
+	await db.delete(account).where(eq(account.providerId, "slack"));
+	await db.delete(slackChannel).where(startsWith(slackChannel.id, PREFIX));
 }
 
 beforeEach(async () => {
-	restore = await db.slackChannel.findMany({
-		select: { id: true, available: true },
-	});
-	await db.slackChannel.deleteMany({ where: { id: { startsWith: PREFIX } } });
+	restore = await db
+		.select({ id: slackChannel.id, available: slackChannel.available })
+		.from(slackChannel);
+	await db.delete(slackChannel).where(startsWith(slackChannel.id, PREFIX));
 	await connect();
 });
 
 afterEach(async () => {
 	globalThis.fetch = realFetch;
-	await db.slackChannel.deleteMany({ where: { id: { startsWith: PREFIX } } });
-	await db.account.deleteMany({ where: { id: ACCOUNT_ID } });
-	await db.user.deleteMany({ where: { id: USER_ID } });
+	await db.delete(slackChannel).where(startsWith(slackChannel.id, PREFIX));
+	await db.delete(account).where(eq(account.id, ACCOUNT_ID));
+	await db.delete(user).where(eq(user.id, USER_ID));
 	for (const row of restore) {
-		await db.slackChannel.updateMany({
-			where: { id: row.id },
-			data: { available: row.available },
-		});
+		await db
+			.update(slackChannel)
+			.set({ available: row.available })
+			.where(whereEq(slackChannel.id, row.id));
 	}
 });
 
@@ -85,17 +107,23 @@ function slackReply(body: SlackListReply): Response {
 
 describe("persistSlackChannels", () => {
 	it("creates, updates and retires the inventory in one pass", async () => {
-		await db.slackChannel.create({
-			data: {
-				id: `${PREFIX}-keep`,
-				name: "old-name",
-				memberCount: 1,
-				available: false,
-			},
-		});
-		await db.slackChannel.create({
-			data: { id: `${PREFIX}-gone`, name: "gone", available: true },
-		});
+		await requireRow(
+			db
+				.insert(slackChannel)
+				.values({
+					id: `${PREFIX}-keep`,
+					name: "old-name",
+					memberCount: 1,
+					available: false,
+				})
+				.returning(),
+		);
+		await requireRow(
+			db
+				.insert(slackChannel)
+				.values({ id: `${PREFIX}-gone`, name: "gone", available: true })
+				.returning(),
+		);
 
 		const written = await persistSlackChannels(
 			[
@@ -120,18 +148,18 @@ describe("persistSlackChannels", () => {
 
 		expect(written).toBe(3);
 
-		const rows = await db.slackChannel.findMany({
-			where: { id: { startsWith: PREFIX } },
-			orderBy: { id: "asc" },
-			select: {
-				id: true,
-				name: true,
-				memberCount: true,
-				isPrivate: true,
-				isMember: true,
-				available: true,
-			},
-		});
+		const rows = await db
+			.select({
+				id: slackChannel.id,
+				name: slackChannel.name,
+				memberCount: slackChannel.memberCount,
+				isPrivate: slackChannel.isPrivate,
+				isMember: slackChannel.isMember,
+				available: slackChannel.available,
+			})
+			.from(slackChannel)
+			.where(startsWith(slackChannel.id, PREFIX))
+			.orderBy(asc(slackChannel.id));
 
 		expect(rows).toEqual([
 			{
@@ -170,16 +198,22 @@ describe("persistSlackChannels", () => {
 	});
 
 	it("retires every channel when nothing is available", async () => {
-		await db.slackChannel.create({
-			data: { id: `${PREFIX}-only`, name: "only", available: true },
-		});
+		await requireRow(
+			db
+				.insert(slackChannel)
+				.values({ id: `${PREFIX}-only`, name: "only", available: true })
+				.returning(),
+		);
 
 		expect(await persistSlackChannels([], false)).toBe(0);
 
-		const row = await db.slackChannel.findUnique({
-			where: { id: `${PREFIX}-only` },
-			select: { available: true },
-		});
+		const row = await firstRow(
+			db
+				.select({ available: slackChannel.available })
+				.from(slackChannel)
+				.where(whereEq(slackChannel.id, `${PREFIX}-only`))
+				.limit(1),
+		);
 		expect(row?.available).toBe(false);
 	});
 
@@ -193,7 +227,10 @@ describe("persistSlackChannels", () => {
 
 		expect(written).toBe(0);
 		expect(
-			await db.slackChannel.count({ where: { id: `${PREFIX}-ghost` } }),
+			await db.$count(
+				slackChannel,
+				whereEq(slackChannel.id, `${PREFIX}-ghost`),
+			),
 		).toBe(0);
 	});
 });
@@ -250,7 +287,7 @@ describe("refreshSlackChannels", () => {
 
 		expect(await refreshSlackChannels()).toBe(0);
 		expect(
-			await db.slackChannel.count({ where: { id: { startsWith: PREFIX } } }),
+			await db.$count(slackChannel, startsWith(slackChannel.id, PREFIX)),
 		).toBe(0);
 	});
 

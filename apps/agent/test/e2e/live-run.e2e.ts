@@ -1,4 +1,19 @@
-import { db } from "@crm/db";
+import {
+	agentAction,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentVersion,
+	and,
+	appSetting,
+	db,
+	eq,
+	firstRow,
+	requireRow,
+	slackChannel,
+	user,
+	whereEq,
+} from "@crm/db";
 import { reasonOf, removeAgent } from "./e2e-agents";
 import { E2E } from "./e2e-config";
 
@@ -17,57 +32,66 @@ async function seedAgent(
 	channelName: string,
 	modelId: string,
 ) {
-	const owner = await db.user.findFirstOrThrow({ select: { id: true } });
-	const agent = await db.agentDefinition.create({
-		data: {
-			name: `${E2E.liveRun.agentPrefix} ${Date.now()}`,
-			description: "Seeded by the live run E2E. Safe to delete.",
-			status: "LIVE",
-			createdById: owner.id,
-		},
-		select: { id: true },
-	});
-	const version = await db.agentVersion.create({
-		data: {
-			agentId: agent.id,
-			number: 1,
-			status: "DEPLOYED",
-			instructions: `Post exactly one short Slack message to #${channelName} that says "E2E live run — ignore this message." Do nothing else.`,
-			modelId,
-			sandboxPolicy: {},
-			createdById: owner.id,
-			manifest: {
-				description: "live run",
-				triggers: [
-					{
-						type: "MANUAL",
-						name: "Run now",
-						summary: "Started by a person",
-						config: {},
-					},
-				],
-				dataScope: { mode: "WORKSPACE", summary: "Workspace", resources: [] },
-				actions: [
-					{
-						type: "slack.message.post",
-						provider: "slack",
-						summary: `Post one message to #${channelName}`,
-						destination: {
-							kind: "channel",
-							resolution: "chosen",
-							id: channelId,
-							label: `#${channelName}`,
+	const owner = await requireRow(
+		db.select({ id: user.id }).from(user).limit(1),
+	);
+	const agent = await requireRow(
+		db
+			.insert(agentDefinition)
+			.values({
+				name: `${E2E.liveRun.agentPrefix} ${Date.now()}`,
+				description: "Seeded by the live run E2E. Safe to delete.",
+				status: "LIVE",
+				createdById: owner.id,
+			})
+			.returning({ id: agentDefinition.id }),
+	);
+	const version = await requireRow(
+		db
+			.insert(agentVersion)
+			.values({
+				agentId: agent.id,
+				number: 1,
+				status: "DEPLOYED",
+				instructions: `Post exactly one short Slack message to #${channelName} that says "E2E live run — ignore this message." Do nothing else.`,
+				modelId,
+				sandboxPolicy: {},
+				createdById: owner.id,
+				manifest: {
+					description: "live run",
+					triggers: [
+						{
+							type: "MANUAL",
+							name: "Run now",
+							summary: "Started by a person",
+							config: {},
 						},
-					},
-				],
-			},
-		},
-		select: { id: true },
-	});
-	await db.agentDefinition.update({
-		where: { id: agent.id },
-		data: { currentVersionId: version.id },
-	});
+					],
+					dataScope: { mode: "WORKSPACE", summary: "Workspace", resources: [] },
+					actions: [
+						{
+							type: "slack.message.post",
+							provider: "slack",
+							summary: `Post one message to #${channelName}`,
+							destination: {
+								kind: "channel",
+								resolution: "chosen",
+								id: channelId,
+								label: `#${channelName}`,
+							},
+						},
+					],
+				},
+			})
+			.returning({ id: agentVersion.id }),
+	);
+	await requireRow(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: version.id })
+			.where(whereEq(agentDefinition.id, agent.id))
+			.returning(),
+	);
 	return { agentId: agent.id, versionId: version.id, ownerId: owner.id };
 }
 
@@ -77,19 +101,27 @@ async function main() {
 		process.exit(1);
 	}
 
-	const channel = await db.slackChannel.findFirst({
-		where: { available: true, name: "test" },
-		select: { id: true, name: true },
-	});
+	const channel = await firstRow(
+		db
+			.select({ id: slackChannel.id, name: slackChannel.name })
+			.from(slackChannel)
+			.where(
+				and(eq(slackChannel.available, true), eq(slackChannel.name, "test")),
+			)
+			.limit(1),
+	);
 	if (!channel) {
 		console.error("FAIL  No available #test channel. Connect Slack first.");
 		process.exit(1);
 	}
 
-	const settings = await db.appSetting.findUnique({
-		where: { id: "app" },
-		select: { agentModelId: true },
-	});
+	const settings = await firstRow(
+		db
+			.select({ agentModelId: appSetting.agentModelId })
+			.from(appSetting)
+			.where(eq(appSetting.id, "app"))
+			.limit(1),
+	);
 	if (!settings?.agentModelId) {
 		console.error(
 			"FAIL  No model is configured. Pick one on the settings page first.",
@@ -105,18 +137,22 @@ async function main() {
 	let ok = false;
 
 	try {
-		const run = await db.agentRun.create({
-			data: {
-				agentId,
-				versionId,
-				initiatedById: ownerId,
-				triggerType: "MANUAL",
-				idempotencyKey: crypto.randomUUID(),
-				correlationId: crypto.randomUUID(),
-				events: { create: { sequence: 0, type: "run.queued", data: {} } },
-			},
-			select: { id: true },
-		});
+		const run = await requireRow(
+			db
+				.insert(agentRun)
+				.values({
+					agentId,
+					versionId,
+					initiatedById: ownerId,
+					triggerType: "MANUAL",
+					idempotencyKey: crypto.randomUUID(),
+					correlationId: crypto.randomUUID(),
+				})
+				.returning({ id: agentRun.id }),
+		);
+		await db
+			.insert(agentRunEvent)
+			.values({ runId: run.id, sequence: 0, type: "run.queued", data: {} });
 		console.log(`Queued run ${run.id}. Dispatching…`);
 
 		const dispatch = await fetch(`${AGENT_URL}/internal/crm/agent-dispatch`, {
@@ -131,10 +167,17 @@ async function main() {
 
 			while (Date.now() < deadline) {
 				await new Promise((resolve) => setTimeout(resolve, E2E.liveRun.pollMs));
-				const current = await db.agentRun.findUniqueOrThrow({
-					where: { id: run.id },
-					select: { status: true, errorCode: true, errorMessage: true },
-				});
+				const current = await requireRow(
+					db
+						.select({
+							status: agentRun.status,
+							errorCode: agentRun.errorCode,
+							errorMessage: agentRun.errorMessage,
+						})
+						.from(agentRun)
+						.where(whereEq(agentRun.id, run.id))
+						.limit(1),
+				);
 				if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(current.status)) {
 					final = current;
 					break;
@@ -146,16 +189,19 @@ async function main() {
 				console.log(`  still ${current.status}…`);
 			}
 
-			const actions = await db.agentAction.findMany({
-				where: { runId: run.id },
-				select: {
-					type: true,
-					status: true,
-					externalId: true,
-					errorMessage: true,
-				},
-			});
-			const events = await db.agentRunEvent.count({ where: { runId: run.id } });
+			const actions = await db
+				.select({
+					type: agentAction.type,
+					status: agentAction.status,
+					externalId: agentAction.externalId,
+					errorMessage: agentAction.errorMessage,
+				})
+				.from(agentAction)
+				.where(whereEq(agentAction.runId, run.id));
+			const events = await db.$count(
+				agentRunEvent,
+				whereEq(agentRunEvent.runId, run.id),
+			);
 
 			console.log(`\n  status       ${final?.status ?? "never settled"}`);
 			console.log(`  events       ${events}`);

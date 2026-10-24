@@ -1,5 +1,13 @@
 import type { Db } from "@crm/db";
-import { Prisma, RateSource } from "@crm/db";
+import {
+	and,
+	Decimal,
+	eq,
+	exchangeRate,
+	notInArray,
+	or,
+	RateSource,
+} from "@crm/db";
 import {
 	CURRENCY_CODES,
 	isCurrencyCode,
@@ -108,51 +116,54 @@ export class RatesService {
 
 	private async store(
 		base: string,
-		rates: Map<string, Prisma.Decimal>,
+		rates: Map<string, Decimal>,
 		asOf: Date,
 	): Promise<number> {
 		let written = 0;
 
 		for (const [quoteCurrency, rate] of rates) {
-			await this.db.exchangeRate.upsert({
-				where: {
-					baseCurrency_quoteCurrency_source: {
-						baseCurrency: base,
-						quoteCurrency,
-						source: RateSource.FETCHED,
-					},
-				},
-				create: {
+			await this.db
+				.insert(exchangeRate)
+				.values({
 					baseCurrency: base,
 					quoteCurrency,
 					rate,
 					asOf,
 					source: RateSource.FETCHED,
 					provider: RATES_PROVIDER,
-				},
-				update: { rate, asOf, provider: RATES_PROVIDER },
-			});
+				})
+				.onConflictDoUpdate({
+					target: [
+						exchangeRate.baseCurrency,
+						exchangeRate.quoteCurrency,
+						exchangeRate.source,
+					],
+					set: { rate, asOf, provider: RATES_PROVIDER },
+				});
 
 			written += 1;
 		}
 
 		const supported = [...CURRENCY_CODES];
 
-		const stale = await this.db.exchangeRate.deleteMany({
-			where: {
-				source: RateSource.FETCHED,
-				OR: [
-					{ baseCurrency: { notIn: supported } },
-					{ quoteCurrency: { notIn: supported } },
-				],
-			},
-		});
+		const stale = await this.db
+			.delete(exchangeRate)
+			.where(
+				and(
+					eq(exchangeRate.source, RateSource.FETCHED),
+					or(
+						notInArray(exchangeRate.baseCurrency, supported),
+						notInArray(exchangeRate.quoteCurrency, supported),
+					),
+				),
+			)
+			.returning({ id: exchangeRate.id });
 
-		if (stale.count > 0) {
+		if (stale.length > 0) {
 			this.logger.log({
 				message: "Dropped fetched rates for currencies that are not supported",
 				base,
-				dropped: stale.count,
+				dropped: stale.length,
 			});
 		}
 
@@ -161,7 +172,7 @@ export class RatesService {
 
 	private async fetch(
 		base: string,
-	): Promise<{ rates: Map<string, Prisma.Decimal>; asOf: Date } | null> {
+	): Promise<{ rates: Map<string, Decimal>; asOf: Date } | null> {
 		for (let attempt = 1; attempt <= RATES_ATTEMPTS; attempt += 1) {
 			const quotes = await this.attempt(base, attempt);
 			if (quotes) return quotes;
@@ -175,7 +186,7 @@ export class RatesService {
 	private async attempt(
 		base: string,
 		attempt: number,
-	): Promise<{ rates: Map<string, Prisma.Decimal>; asOf: Date } | null> {
+	): Promise<{ rates: Map<string, Decimal>; asOf: Date } | null> {
 		try {
 			const response = await fetch(`${RATES_URL}/${encodeURIComponent(base)}`, {
 				headers: { accept: "application/json" },
@@ -205,7 +216,7 @@ export class RatesService {
 			}
 
 			const asOf = parseAsOf(body.time_last_update_unix) ?? new Date();
-			const rates = new Map<string, Prisma.Decimal>();
+			const rates = new Map<string, Decimal>();
 
 			for (const [code, value] of Object.entries(body.rates)) {
 				const quoteCurrency = normalizeCurrency(code);
@@ -217,7 +228,7 @@ export class RatesService {
 
 				rates.set(
 					quoteCurrency,
-					new Prisma.Decimal(1).dividedBy(perBase).toDecimalPlaces(10),
+					new Decimal(1).dividedBy(perBase).toDecimalPlaces(10),
 				);
 			}
 

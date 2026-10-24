@@ -1,10 +1,26 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { DEFAULT_WORKSPACE_NAME, WORKSPACE_ID } from "@crm/auth/organization";
-import { db } from "@crm/db";
+import {
+	agentAction,
+	agentAuditEvent,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentTrigger,
+	agentVersion,
+	and,
+	db,
+	eq,
+	inArray,
+	member,
+	organization,
+	user,
+} from "@crm/db";
 import { workspaceSlug } from "@crm/db/workspace";
 import { AgentAccessService } from "../src/agent/agent-access.service";
 import { AgentDefinitionsService } from "../src/agent/agent-definitions.service";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
+import { first, one } from "./rows";
 
 const suffix = crypto.randomUUID();
 const userId = `agent-delete-user-${suffix}`;
@@ -28,146 +44,180 @@ let deliveryRunId: string;
 
 async function clean() {
 	if (agentId) {
-		await db.agentRunEvent.deleteMany({ where: { run: { agentId } } });
-		await db.agentAction.deleteMany({ where: { agentId } });
-		await db.agentAuditEvent.deleteMany({ where: { agentId } });
-		await db.agentRun.deleteMany({ where: { agentId } });
-		await db.agentTrigger.deleteMany({ where: { agentId } });
-		await db.agentDefinition.updateMany({
-			where: { id: agentId },
-			data: { currentVersionId: null },
-		});
-		await db.agentVersion.deleteMany({ where: { agentId } });
-		await db.agentDefinition.deleteMany({ where: { id: agentId } });
+		await db
+			.delete(agentRunEvent)
+			.where(
+				inArray(
+					agentRunEvent.runId,
+					db
+						.select({ id: agentRun.id })
+						.from(agentRun)
+						.where(eq(agentRun.agentId, agentId)),
+				),
+			);
+		await db.delete(agentAction).where(eq(agentAction.agentId, agentId));
+		await db
+			.delete(agentAuditEvent)
+			.where(eq(agentAuditEvent.agentId, agentId));
+		await db.delete(agentRun).where(eq(agentRun.agentId, agentId));
+		await db.delete(agentTrigger).where(eq(agentTrigger.agentId, agentId));
+		await db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(eq(agentDefinition.id, agentId));
+		await db.delete(agentVersion).where(eq(agentVersion.agentId, agentId));
+		await db.delete(agentDefinition).where(eq(agentDefinition.id, agentId));
 	}
 
-	await db.member.deleteMany({ where: { id: memberId } });
-	await db.user.deleteMany({ where: { id: userId } });
+	await db.delete(member).where(eq(member.id, memberId));
+	await db.delete(user).where(eq(user.id, userId));
 }
 
 beforeAll(async () => {
-	await db.organization.upsert({
-		where: { id: WORKSPACE_ID },
-		update: {},
-		create: {
+	await db
+		.insert(organization)
+		.values({
 			id: WORKSPACE_ID,
 			name: DEFAULT_WORKSPACE_NAME,
 			slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
 			createdAt: new Date(),
-		},
-	});
-	await db.user.create({
-		data: {
-			id: userId,
-			name: "Agent Delete Test",
-			email: `${userId}@example.test`,
-		},
-	});
-	await db.member.create({
-		data: {
-			id: memberId,
-			organizationId: WORKSPACE_ID,
-			userId,
-			role: "member",
-			createdAt: new Date(),
-		},
-	});
+		})
+		.onConflictDoNothing();
+	await one(
+		db
+			.insert(user)
+			.values({
+				id: userId,
+				name: "Agent Delete Test",
+				email: `${userId}@example.test`,
+			})
+			.returning(),
+	);
+	await one(
+		db
+			.insert(member)
+			.values({
+				id: memberId,
+				organizationId: WORKSPACE_ID,
+				userId,
+				role: "member",
+				createdAt: new Date(),
+			})
+			.returning(),
+	);
 
-	const agent = await db.agentDefinition.create({
-		data: {
-			name: "Delete me",
-			status: "PAUSED",
-			createdById: userId,
-		},
-		select: { id: true },
-	});
+	const agent = await one(
+		db
+			.insert(agentDefinition)
+			.values({
+				name: "Delete me",
+				status: "PAUSED",
+				createdById: userId,
+			})
+			.returning({ id: agentDefinition.id }),
+	);
 	agentId = agent.id;
 
-	const version = await db.agentVersion.create({
-		data: {
-			agentId,
-			number: 1,
-			status: "DEPLOYED",
-			instructions: "Test deletion behavior.",
-			manifest: {},
-			modelId: "test/model",
-			sandboxPolicy: {},
-			createdById: userId,
-			approvedAt: new Date(),
-			deployedAt: new Date(),
-		},
-		select: { id: true },
-	});
+	const version = await one(
+		db
+			.insert(agentVersion)
+			.values({
+				agentId,
+				number: 1,
+				status: "DEPLOYED",
+				instructions: "Test deletion behavior.",
+				manifest: {},
+				modelId: "test/model",
+				sandboxPolicy: {},
+				createdById: userId,
+				approvedAt: new Date(),
+				deployedAt: new Date(),
+			})
+			.returning({ id: agentVersion.id }),
+	);
 	versionId = version.id;
-	await db.agentDefinition.update({
-		where: { id: agentId },
-		data: { currentVersionId: versionId },
-	});
+	await one(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: versionId })
+			.where(eq(agentDefinition.id, agentId))
+			.returning(),
+	);
 
-	const trigger = await db.agentTrigger.create({
-		data: {
-			agentId,
-			versionId,
-			type: "SCHEDULE",
-			name: "Every hour",
-			config: { intervalMinutes: 60 },
-			createdById: userId,
-			enabled: true,
-			nextRunAt: new Date(Date.now() + 60 * 60 * 1000),
-		},
-		select: { id: true },
-	});
+	const trigger = await one(
+		db
+			.insert(agentTrigger)
+			.values({
+				agentId,
+				versionId,
+				type: "SCHEDULE",
+				name: "Every hour",
+				config: { intervalMinutes: 60 },
+				createdById: userId,
+				enabled: true,
+				nextRunAt: new Date(Date.now() + 60 * 60 * 1000),
+			})
+			.returning({ id: agentTrigger.id }),
+	);
 	triggerId = trigger.id;
 
 	const [queued, waiting, running, delivery] = await Promise.all([
-		db.agentRun.create({
-			data: {
-				agentId,
-				versionId,
-				triggerId,
-				triggerType: "SCHEDULE",
-				status: "QUEUED",
-				idempotencyKey: `${idempotencyPrefix}-queued`,
-				correlationId: `${idempotencyPrefix}-queued`,
-			},
-			select: { id: true },
-		}),
-		db.agentRun.create({
-			data: {
-				agentId,
-				versionId,
-				triggerType: "MANUAL",
-				status: "WAITING_FOR_APPROVAL",
-				idempotencyKey: `${idempotencyPrefix}-waiting`,
-				correlationId: `${idempotencyPrefix}-waiting`,
-			},
-			select: { id: true },
-		}),
-		db.agentRun.create({
-			data: {
-				agentId,
-				versionId,
-				triggerType: "MANUAL",
-				status: "RUNNING",
-				idempotencyKey: `${idempotencyPrefix}-running`,
-				correlationId: `${idempotencyPrefix}-running`,
-				startedAt: new Date(),
-				sessionId: `${idempotencyPrefix}-active-session`,
-			},
-			select: { id: true },
-		}),
-		db.agentRun.create({
-			data: {
-				agentId,
-				versionId,
-				triggerType: "MANUAL",
-				status: "RUNNING",
-				idempotencyKey: `${idempotencyPrefix}-delivery`,
-				correlationId: `${idempotencyPrefix}-delivery`,
-				startedAt: new Date(),
-			},
-			select: { id: true },
-		}),
+		one(
+			db
+				.insert(agentRun)
+				.values({
+					agentId,
+					versionId,
+					triggerId,
+					triggerType: "SCHEDULE",
+					status: "QUEUED",
+					idempotencyKey: `${idempotencyPrefix}-queued`,
+					correlationId: `${idempotencyPrefix}-queued`,
+				})
+				.returning({ id: agentRun.id }),
+		),
+		one(
+			db
+				.insert(agentRun)
+				.values({
+					agentId,
+					versionId,
+					triggerType: "MANUAL",
+					status: "WAITING_FOR_APPROVAL",
+					idempotencyKey: `${idempotencyPrefix}-waiting`,
+					correlationId: `${idempotencyPrefix}-waiting`,
+				})
+				.returning({ id: agentRun.id }),
+		),
+		one(
+			db
+				.insert(agentRun)
+				.values({
+					agentId,
+					versionId,
+					triggerType: "MANUAL",
+					status: "RUNNING",
+					idempotencyKey: `${idempotencyPrefix}-running`,
+					correlationId: `${idempotencyPrefix}-running`,
+					startedAt: new Date(),
+					sessionId: `${idempotencyPrefix}-active-session`,
+				})
+				.returning({ id: agentRun.id }),
+		),
+		one(
+			db
+				.insert(agentRun)
+				.values({
+					agentId,
+					versionId,
+					triggerType: "MANUAL",
+					status: "RUNNING",
+					idempotencyKey: `${idempotencyPrefix}-delivery`,
+					correlationId: `${idempotencyPrefix}-delivery`,
+					startedAt: new Date(),
+				})
+				.returning({ id: agentRun.id }),
+		),
 	]);
 	queuedRunId = queued.id;
 	waitingRunId = waiting.id;
@@ -189,30 +239,62 @@ describe("deleting an agent", () => {
 
 		const [definition, trigger, runs, runEvents, auditEvent, listed] =
 			await Promise.all([
-				db.agentDefinition.findUnique({ where: { id: agentId } }),
-				db.agentTrigger.findUnique({ where: { id: triggerId } }),
-				db.agentRun.findMany({
-					where: {
-						id: {
-							in: [queuedRunId, waitingRunId, runningRunId, deliveryRunId],
-						},
-					},
-					select: {
-						id: true,
-						status: true,
-						errorCode: true,
-						finishedAt: true,
-					},
-				}),
-				db.agentRunEvent.findMany({
-					where: {
-						runId: { in: [queuedRunId, waitingRunId, deliveryRunId] },
-					},
-					select: { runId: true, type: true, data: true },
-				}),
-				db.agentAuditEvent.findFirst({
-					where: { agentId, type: "agent.deleted" },
-				}),
+				first(
+					db
+						.select()
+						.from(agentDefinition)
+						.where(eq(agentDefinition.id, agentId))
+						.limit(1),
+				),
+				first(
+					db
+						.select()
+						.from(agentTrigger)
+						.where(eq(agentTrigger.id, triggerId))
+						.limit(1),
+				),
+				db
+					.select({
+						id: agentRun.id,
+						status: agentRun.status,
+						errorCode: agentRun.errorCode,
+						finishedAt: agentRun.finishedAt,
+					})
+					.from(agentRun)
+					.where(
+						inArray(agentRun.id, [
+							queuedRunId,
+							waitingRunId,
+							runningRunId,
+							deliveryRunId,
+						]),
+					),
+				db
+					.select({
+						runId: agentRunEvent.runId,
+						type: agentRunEvent.type,
+						data: agentRunEvent.data,
+					})
+					.from(agentRunEvent)
+					.where(
+						inArray(agentRunEvent.runId, [
+							queuedRunId,
+							waitingRunId,
+							deliveryRunId,
+						]),
+					),
+				first(
+					db
+						.select()
+						.from(agentAuditEvent)
+						.where(
+							and(
+								eq(agentAuditEvent.agentId, agentId),
+								eq(agentAuditEvent.type, "agent.deleted"),
+							),
+						)
+						.limit(1),
+				),
 				agents.list(userId),
 			]);
 

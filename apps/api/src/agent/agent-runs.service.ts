@@ -1,5 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { type Db, Prisma } from "@crm/db";
+import {
+	agentAction,
+	agentAuditEvent,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	and,
+	asc,
+	type Db,
+	desc,
+	type Executor,
+	eq,
+	inArray,
+	relatedCount,
+} from "@crm/db";
 import type { AgentRunStatus } from "@crm/db/enums";
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import {
@@ -38,11 +52,18 @@ export class AgentRunsService {
 	async list(agentId: string, limit: number, userId: string) {
 		const agent = await this.readableAgent(agentId, userId);
 
-		const rows = await this.db.agentRun.findMany({
-			where: { agentId },
-			orderBy: { createdAt: "desc" },
-			take: limit,
-			select: {
+		const rows = await this.db.query.agentRun.findMany({
+			where: eq(agentRun.agentId, agentId),
+			orderBy: [desc(agentRun.createdAt)],
+			limit,
+			extras: (run: { id: typeof agentRun.id }) => ({
+				totalEvents: relatedCount(
+					agentRunEvent,
+					agentRunEvent.runId,
+					run.id,
+				).as("totalEvents"),
+			}),
+			columns: {
 				id: true,
 				status: true,
 				triggerType: true,
@@ -56,13 +77,14 @@ export class AgentRunsService {
 				createdAt: true,
 				startedAt: true,
 				finishedAt: true,
-				initiatedBy: { select: { id: true, name: true, image: true } },
-				version: { select: { id: true, number: true } },
-				_count: { select: { events: true } },
+			},
+			with: {
+				initiatedBy: { columns: { id: true, name: true, image: true } },
+				version: { columns: { id: true, number: true } },
 				events: {
-					orderBy: { sequence: "asc" },
-					take: RUN_EVENT_LIMIT,
-					select: {
+					orderBy: [asc(agentRunEvent.sequence)],
+					limit: RUN_EVENT_LIMIT,
+					columns: {
 						id: true,
 						sequence: true,
 						type: true,
@@ -71,8 +93,8 @@ export class AgentRunsService {
 					},
 				},
 				actions: {
-					orderBy: { plannedAt: "asc" },
-					select: {
+					orderBy: [asc(agentAction.plannedAt)],
+					columns: {
 						id: true,
 						type: true,
 						provider: true,
@@ -93,10 +115,10 @@ export class AgentRunsService {
 			},
 		});
 
-		return rows.map(({ _count, ...run }) => ({
+		return rows.map((run) => ({
 			...run,
-			totalEvents: _count.events,
-			eventsTruncated: _count.events > run.events.length,
+			totalEvents: run.totalEvents,
+			eventsTruncated: run.totalEvents > run.events.length,
 			canCancel:
 				CANCELLABLE_STATUSES.includes(run.status) &&
 				(agent.canManage || run.initiatedBy?.id === userId),
@@ -120,11 +142,11 @@ export class AgentRunsService {
 	async activity(agentId: string, limit: number, userId: string) {
 		await this.readableAgent(agentId, userId);
 
-		const rows = await this.db.agentAuditEvent.findMany({
-			where: { agentId },
-			orderBy: { emittedAt: "desc" },
-			take: limit,
-			select: {
+		const rows = await this.db.query.agentAuditEvent.findMany({
+			where: eq(agentAuditEvent.agentId, agentId),
+			orderBy: [desc(agentAuditEvent.emittedAt)],
+			limit,
+			columns: {
 				id: true,
 				type: true,
 				summary: true,
@@ -134,8 +156,10 @@ export class AgentRunsService {
 				emittedAt: true,
 				actorType: true,
 				actorId: true,
-				actorUser: { select: { id: true, name: true, image: true } },
-				version: { select: { id: true, number: true } },
+			},
+			with: {
+				actorUser: { columns: { id: true, name: true, image: true } },
+				version: { columns: { id: true, number: true } },
 			},
 		});
 
@@ -147,10 +171,7 @@ export class AgentRunsService {
 
 	async runNow(input: AgentRunNowInput, userId: string) {
 		await this.access.assertMember(userId);
-		const existing = await this.db.agentRun.findUnique({
-			where: { idempotencyKey: input.clientRequestId },
-			select: { id: true, agentId: true },
-		});
+		const existing = await runByKey(this.db, input.clientRequestId);
 
 		if (existing) {
 			this.assertReplayMatches(existing.agentId, input.id);
@@ -158,29 +179,15 @@ export class AgentRunsService {
 			return { id: existing.id };
 		}
 
-		const run = await this.db.$transaction(async (tx) => {
+		const run = await this.db.transaction(async (tx) => {
 			await lockIdempotencyKey(tx, input.clientRequestId);
-			const replay = await tx.agentRun.findUnique({
-				where: { idempotencyKey: input.clientRequestId },
-				select: { id: true, agentId: true },
-			});
+			const replay = await runByKey(tx, input.clientRequestId);
 			if (replay) {
 				this.assertReplayMatches(replay.agentId, input.id);
 				return { id: replay.id };
 			}
 
-			const [agent] = await tx.$queryRaw<
-				Array<{
-					id: string;
-					status: string;
-					currentVersionId: string | null;
-				}>
-			>`
-					SELECT id, status, "currentVersionId"
-					FROM "agentDefinition"
-					WHERE id = ${input.id}
-					FOR UPDATE
-				`;
+			const agent = await lockAgent(tx, input.id);
 
 			if (!agent || agent.status === "DELETED") {
 				throw new NotFoundException(`No agent with id ${input.id}.`);
@@ -190,45 +197,26 @@ export class AgentRunsService {
 				throw new BadRequestException("This agent is not live yet.");
 			}
 
-			const active = await tx.agentRun.findFirst({
-				where: {
-					agentId: input.id,
-					status: { in: [...CANCELLABLE_STATUSES] },
-				},
-				select: { id: true },
-			});
-			if (active) {
-				throw new ConflictException(
-					"This agent already has an active run. Stop it or wait for it to finish.",
-				);
-			}
+			await assertNoActiveRun(tx, input.id);
 
-			const created = await tx.agentRun.create({
-				data: {
-					agentId: input.id,
-					versionId: agent.currentVersionId,
-					initiatedById: userId,
-					triggerType: "MANUAL",
-					idempotencyKey: input.clientRequestId,
-					correlationId: randomUUID(),
-					events: {
-						create: { sequence: 0, type: "run.queued", data: {} },
-					},
-				},
-				select: { id: true },
+			const created = await createRun(tx, {
+				agentId: input.id,
+				versionId: agent.currentVersionId,
+				initiatedById: userId,
+				triggerType: "MANUAL",
+				idempotencyKey: input.clientRequestId,
+				correlationId: randomUUID(),
 			});
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: input.id,
-					versionId: agent.currentVersionId,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "run.requested",
-					summary: "Requested a manual run",
-					requestId: input.clientRequestId,
-				},
+			await tx.insert(agentAuditEvent).values({
+				agentId: input.id,
+				versionId: agent.currentVersionId,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "run.requested",
+				summary: "Requested a manual run",
+				requestId: input.clientRequestId,
 			});
 
 			return created;
@@ -241,28 +229,26 @@ export class AgentRunsService {
 	async retryRun(input: AgentRetryRunInput, userId: string) {
 		await this.access.assertMember(userId);
 
-		const run = await this.db.$transaction(async (tx) => {
+		const run = await this.db.transaction(async (tx) => {
 			await lockIdempotencyKey(tx, input.clientRequestId);
-			const replay = await tx.agentRun.findUnique({
-				where: { idempotencyKey: input.clientRequestId },
-				select: { id: true, agentId: true },
-			});
+			const replay = await runByKey(tx, input.clientRequestId);
 			if (replay) {
 				this.assertReplayMatches(replay.agentId, input.id);
 				return { id: replay.id };
 			}
 
-			const previous = await tx.agentRun.findUnique({
-				where: { id: input.runId },
-				select: {
-					agentId: true,
-					status: true,
-					versionId: true,
-					triggerId: true,
-					triggerType: true,
-					input: true,
-				},
-			});
+			const [previous] = await tx
+				.select({
+					agentId: agentRun.agentId,
+					status: agentRun.status,
+					versionId: agentRun.versionId,
+					triggerId: agentRun.triggerId,
+					triggerType: agentRun.triggerType,
+					input: agentRun.input,
+				})
+				.from(agentRun)
+				.where(eq(agentRun.id, input.runId))
+				.limit(1);
 			if (!previous || previous.agentId !== input.id) {
 				throw new NotFoundException(`No run with id ${input.runId}.`);
 			}
@@ -270,14 +256,7 @@ export class AgentRunsService {
 				throw new ConflictException("This run has not finished yet.");
 			}
 
-			const [agent] = await tx.$queryRaw<
-				Array<{ id: string; status: string; currentVersionId: string | null }>
-			>`
-					SELECT id, status, "currentVersionId"
-					FROM "agentDefinition"
-					WHERE id = ${input.id}
-					FOR UPDATE
-				`;
+			const agent = await lockAgent(tx, input.id);
 			if (!agent || agent.status === "DELETED") {
 				throw new NotFoundException(`No agent with id ${input.id}.`);
 			}
@@ -285,42 +264,28 @@ export class AgentRunsService {
 				throw new BadRequestException("This agent is not live yet.");
 			}
 
-			const active = await tx.agentRun.findFirst({
-				where: { agentId: input.id, status: { in: [...CANCELLABLE_STATUSES] } },
-				select: { id: true },
-			});
-			if (active) {
-				throw new ConflictException(
-					"This agent already has an active run. Stop it or wait for it to finish.",
-				);
-			}
+			await assertNoActiveRun(tx, input.id);
 
-			const created = await tx.agentRun.create({
-				data: {
-					agentId: input.id,
-					versionId: previous.versionId,
-					initiatedById: userId,
-					triggerId: previous.triggerId,
-					triggerType: previous.triggerType,
-					input: previous.input ?? Prisma.DbNull,
-					idempotencyKey: input.clientRequestId,
-					correlationId: randomUUID(),
-					events: { create: { sequence: 0, type: "run.queued", data: {} } },
-				},
-				select: { id: true },
+			const created = await createRun(tx, {
+				agentId: input.id,
+				versionId: previous.versionId,
+				initiatedById: userId,
+				triggerId: previous.triggerId,
+				triggerType: previous.triggerType,
+				input: previous.input,
+				idempotencyKey: input.clientRequestId,
+				correlationId: randomUUID(),
 			});
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: input.id,
-					versionId: previous.versionId,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "run.requested",
-					summary: `Retried run ${input.runId}`,
-					requestId: input.clientRequestId,
-				},
+			await tx.insert(agentAuditEvent).values({
+				agentId: input.id,
+				versionId: previous.versionId,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "run.requested",
+				summary: `Retried run ${input.runId}`,
+				requestId: input.clientRequestId,
 			});
 
 			return created;
@@ -333,22 +298,19 @@ export class AgentRunsService {
 	async cancelRun(input: AgentCancelRunInput, userId: string) {
 		const agent = await this.readableAgent(input.id, userId);
 
-		const outcome = await this.db.$transaction(async (tx) => {
-			const [run] = await tx.$queryRaw<
-				Array<{
-					id: string;
-					agentId: string;
-					versionId: string;
-					status: AgentRunStatus;
-					initiatedById: string | null;
-					nextEventSequence: number;
-				}>
-			>`
-				SELECT id, "agentId", "versionId", status, "initiatedById", "nextEventSequence"
-				FROM "agentRun"
-				WHERE id = ${input.runId}
-				FOR UPDATE
-			`;
+		const outcome = await this.db.transaction(async (tx) => {
+			const [run] = await tx
+				.select({
+					id: agentRun.id,
+					agentId: agentRun.agentId,
+					versionId: agentRun.versionId,
+					status: agentRun.status,
+					initiatedById: agentRun.initiatedById,
+					nextEventSequence: agentRun.nextEventSequence,
+				})
+				.from(agentRun)
+				.where(eq(agentRun.id, input.runId))
+				.for("update");
 
 			if (!run || run.agentId !== input.id) {
 				throw new NotFoundException(`No run with id ${input.runId}.`);
@@ -367,47 +329,44 @@ export class AgentRunsService {
 			const sequence = run.nextEventSequence + 1;
 			const finishedAt = new Date();
 
-			await tx.agentRun.update({
-				where: { id: run.id },
-				data: {
+			await tx
+				.update(agentRun)
+				.set({
 					status: "CANCELLED",
 					errorCode: AGENT_DISPATCH.cancel.errorCode,
 					errorMessage: AGENT_DISPATCH.cancel.message,
 					finishedAt,
 					nextEventSequence: sequence,
-				},
-			});
+				})
+				.where(eq(agentRun.id, run.id));
 
-			await tx.agentAction.updateMany({
-				where: { runId: run.id, status: { in: ["PLANNED", "RUNNING"] } },
-				data: {
+			await tx
+				.update(agentAction)
+				.set({
 					status: "CANCELLED",
 					errorCode: AGENT_DISPATCH.cancel.errorCode,
 					errorMessage: AGENT_DISPATCH.cancel.message,
 					completedAt: finishedAt,
-				},
+				})
+				.where(
+					and(
+						eq(agentAction.runId, run.id),
+						inArray(agentAction.status, ["PLANNED", "RUNNING"]),
+					),
+				);
+
+			await tx.insert(agentRunEvent).values({
+				id: `run-terminal:${run.id}:cancelled`,
+				runId: run.id,
+				sequence,
+				type: "run.cancelled",
+				data: { reason: "user.cancelled" },
+				emittedAt: finishedAt,
 			});
 
-			await tx.agentRunEvent.create({
-				data: {
-					id: `run-terminal:${run.id}:cancelled`,
-					runId: run.id,
-					sequence,
-					type: "run.cancelled",
-					data: { reason: "user.cancelled" },
-					emittedAt: finishedAt,
-				},
-			});
-
-			await tx.agentAuditEvent.upsert({
-				where: {
-					agentId_type_requestId: {
-						agentId: run.agentId,
-						type: "run.cancelled",
-						requestId: run.id,
-					},
-				},
-				create: {
+			await tx
+				.insert(agentAuditEvent)
+				.values({
 					agentId: run.agentId,
 					versionId: run.versionId,
 					actorUserId: userId,
@@ -416,9 +375,14 @@ export class AgentRunsService {
 					type: "run.cancelled",
 					summary: "Stopped a run",
 					requestId: run.id,
-				},
-				update: {},
-			});
+				})
+				.onConflictDoNothing({
+					target: [
+						agentAuditEvent.agentId,
+						agentAuditEvent.type,
+						agentAuditEvent.requestId,
+					],
+				});
 
 			return { id: run.id, status: "CANCELLED" as const, cancelled: true };
 		});
@@ -442,4 +406,59 @@ export class AgentRunsService {
 			throw new BadRequestException("That run request has already been used.");
 		}
 	}
+}
+
+async function runByKey(client: Executor, idempotencyKey: string) {
+	const [row] = await client
+		.select({ id: agentRun.id, agentId: agentRun.agentId })
+		.from(agentRun)
+		.where(eq(agentRun.idempotencyKey, idempotencyKey))
+		.limit(1);
+	return row ?? null;
+}
+
+async function lockAgent(tx: Executor, id: string) {
+	const [agent] = await tx
+		.select({
+			id: agentDefinition.id,
+			status: agentDefinition.status,
+			currentVersionId: agentDefinition.currentVersionId,
+		})
+		.from(agentDefinition)
+		.where(eq(agentDefinition.id, id))
+		.for("update");
+	return agent;
+}
+
+async function assertNoActiveRun(tx: Executor, agentId: string): Promise<void> {
+	const [active] = await tx
+		.select({ id: agentRun.id })
+		.from(agentRun)
+		.where(
+			and(
+				eq(agentRun.agentId, agentId),
+				inArray(agentRun.status, [...CANCELLABLE_STATUSES]),
+			),
+		)
+		.limit(1);
+	if (active) {
+		throw new ConflictException(
+			"This agent already has an active run. Stop it or wait for it to finish.",
+		);
+	}
+}
+
+async function createRun(
+	tx: Executor,
+	values: typeof agentRun.$inferInsert,
+): Promise<{ id: string }> {
+	const [created] = await tx
+		.insert(agentRun)
+		.values(values)
+		.returning({ id: agentRun.id });
+	if (!created) throw new Error("The run insert returned no row.");
+	await tx
+		.insert(agentRunEvent)
+		.values({ runId: created.id, sequence: 0, type: "run.queued", data: {} });
+	return created;
 }

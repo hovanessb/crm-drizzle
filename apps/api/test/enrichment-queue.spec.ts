@@ -1,5 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	agentTask,
+	company as companyTable,
+	contact as contactTable,
+	db,
+	endsWith,
+	eq,
+} from "@crm/db";
 import {
 	ENRICHMENT_PAGE,
 	ENRICHMENT_PAGE_MAX,
@@ -7,6 +14,7 @@ import {
 	pageSize,
 } from "@crm/validation/enrichment-queue";
 import { EnrichmentService } from "../src/enrichment/enrichment.service";
+import { one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "enrichment-queue-spec";
 const email = `queue-${suffix}@example.test`;
@@ -25,72 +33,82 @@ let dueId: string;
 let scheduledId: string;
 
 async function clean() {
-	await db.agentTask.deleteMany({ where: { kind } });
-	await db.contact.deleteMany({ where: { email } });
-	await db.contact.deleteMany({
-		where: { email: { endsWith: `-${suffix}@example.test` } },
-	});
-	await db.company.deleteMany({ where: { name } });
+	await db.delete(agentTask).where(eq(agentTask.kind, kind));
+	await db.delete(contactTable).where(eq(contactTable.email, email));
+	await db
+		.delete(contactTable)
+		.where(endsWith(contactTable.email, `-${suffix}@example.test`));
+	await db.delete(companyTable).where(eq(companyTable.name, name));
 }
 
 beforeAll(async () => {
 	await clean();
 
-	const contact = await db.contact.create({
-		data: { firstName: "Queue", lastName: "Split", email },
-		select: { id: true },
-	});
-	const company = await db.company.create({
-		data: { name },
-		select: { id: true },
-	});
+	const contact = await one(
+		db
+			.insert(contactTable)
+			.values({ firstName: "Queue", lastName: "Split", email })
+			.returning({ id: contactTable.id }),
+	);
+	const company = await one(
+		db.insert(companyTable).values({ name }).returning({ id: companyTable.id }),
+	);
 
 	contactId = contact.id;
 	companyId = company.id;
 
-	const due = await db.agentTask.create({
-		data: {
-			kind,
-			reason: "due now",
-			dueAt: new Date(Date.now() - 60_000),
-			budget: 4,
-			companyId,
-		},
-		select: { id: true },
-	});
-	const scheduled = await db.agentTask.create({
-		data: {
-			kind,
-			reason: "booked for later",
-			dueAt: new Date(Date.now() + 90 * DAY_MS),
-			budget: 4,
-			contactId,
-		},
-		select: { id: true },
-	});
+	const due = await one(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: "due now",
+				dueAt: new Date(Date.now() - 60_000),
+				budget: 4,
+				companyId,
+			})
+			.returning({ id: agentTask.id }),
+	);
+	const scheduled = await one(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: "booked for later",
+				dueAt: new Date(Date.now() + 90 * DAY_MS),
+				budget: 4,
+				contactId,
+			})
+			.returning({ id: agentTask.id }),
+	);
 
 	dueId = due.id;
 	scheduledId = scheduled.id;
 
 	for (let index = 0; index < EXTRA_ROWS; index++) {
-		const extra = await db.contact.create({
-			data: {
-				firstName: "Queue",
-				lastName: `Page ${index}`,
-				email: `page-${index}-${suffix}@example.test`,
-			},
-			select: { id: true },
-		});
+		const extra = await one(
+			db
+				.insert(contactTable)
+				.values({
+					firstName: "Queue",
+					lastName: `Page ${index}`,
+					email: `page-${index}-${suffix}@example.test`,
+				})
+				.returning({ id: contactTable.id }),
+		);
 
-		await db.agentTask.create({
-			data: {
-				kind,
-				reason: "due now",
-				dueAt: new Date(Date.now() - 60_000),
-				budget: 4,
-				contactId: extra.id,
-			},
-		});
+		await one(
+			db
+				.insert(agentTask)
+				.values({
+					kind,
+					reason: "due now",
+					dueAt: new Date(Date.now() - 60_000),
+					budget: 4,
+					contactId: extra.id,
+				})
+				.returning(),
+		);
 	}
 });
 

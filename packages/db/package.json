@@ -24,9 +24,11 @@
 		"./safe-fetch": "./src/safe-fetch.ts",
 		"./schema": "./src/schema/schema.ts",
 		"./settings": "./src/settings.ts",
+		"./settings-shape": "./src/settings-shape.ts",
 		"./slack-inventory": "./src/slack-inventory.ts",
 		"./tracking": "./src/tracking.ts",
-		"./workspace": "./src/workspace.ts"
+		"./workspace": "./src/workspace.ts",
+		"./workspace-shape": "./src/workspace-shape.ts"
 	},
 	"scripts": {
 		"check-types": "tsc --noEmit",

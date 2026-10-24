@@ -1,11 +1,44 @@
 import {
 	ActivityType,
+	activity,
+	agentConversation,
+	agentTask,
+	and,
+	appSetting,
+	avg,
+	company,
+	contact,
+	contactFact,
+	count,
 	type Db,
 	DealStage,
+	deal,
 	EnrichmentStatus,
+	emailMessage,
+	emailThread,
+	eq,
 	FactBand,
 	FactStatus,
+	formSubmission,
+	gte,
+	isNotNull,
+	isNull,
+	mailboxSync,
+	max as maxOf,
+	member,
+	not,
+	or,
+	type PgColumn,
+	type PgTable,
 	RecordSource,
+	sql,
+	ssoProvider,
+	startsWith,
+	suppressedContact,
+	suppressedDomain,
+	trackedDomain,
+	trackedEvent,
+	workspaceProfile as workspaceProfileTable,
 } from "@crm/db";
 import { RETIRED_OUTCOME } from "@crm/db/agent-tasks";
 import { readAgentModel } from "@crm/db/settings";
@@ -28,6 +61,7 @@ import {
 } from "@crm/telemetry";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
+import { groupCounts } from "../trpc/list-input";
 import { FunnelService } from "./funnel.service";
 import { SEED_OWNER_PREFIX } from "./seed";
 
@@ -137,10 +171,14 @@ export class RollupService {
 		const [model, members, ssoProviders, postgres, contextKey] =
 			await Promise.all([
 				readAgentModel(this.db).catch(() => null),
-				this.db.member.count({ where: { organizationId: WORKSPACE_ID } }),
-				this.db.ssoProvider.count(),
+				this.db.$count(member, eq(member.organizationId, WORKSPACE_ID)),
+				this.db.$count(ssoProvider),
 				this.postgresMajor(),
-				this.db.appSetting.findFirst({ select: { contextDevApiKey: true } }),
+				this.db
+					.select({ contextDevApiKey: appSetting.contextDevApiKey })
+					.from(appSetting)
+					.limit(1)
+					.then((rows) => rows[0]),
 			]);
 
 		return {
@@ -168,11 +206,11 @@ export class RollupService {
 
 	private async postgresMajor(): Promise<string | null> {
 		try {
-			const rows = await this.db.$queryRaw<{ version: string }[]>`
+			const result = await this.db.execute<{ version: string }>(sql`
 				SELECT current_setting('server_version_num') AS version;
-			`;
+			`);
 
-			const raw = Number(rows[0]?.version);
+			const raw = Number(result.rows[0]?.version);
 			if (!Number.isFinite(raw)) return null;
 
 			return String(Math.floor(raw / 10_000));
@@ -192,7 +230,7 @@ export class RollupService {
 				this.tasks(since),
 				this.attempts(since),
 				this.rechecks(since),
-				this.db.agentConversation.count(),
+				this.db.$count(agentConversation),
 			]);
 
 		const total = Object.values(tools.calls).reduce((sum, n) => sum + n, 0);
@@ -230,9 +268,11 @@ export class RollupService {
 		errors: Record<string, number>;
 		sandbox: boolean;
 	}> {
-		const rows = await this.db.$queryRaw<
-			{ tool: string | null; failed: boolean; count: bigint }[]
-		>`
+		const { rows } = await this.db.execute<{
+			tool: string | null;
+			failed: boolean;
+			count: string;
+		}>(sql`
 			SELECT
 				"data"->'result'->>'toolName' AS tool,
 				COALESCE("data"->>'status', 'completed') <> 'completed' AS failed,
@@ -240,7 +280,7 @@ export class RollupService {
 			FROM "agentEvent"
 			WHERE "type" = 'action.result' AND "emittedAt" >= ${since}
 			GROUP BY 1, 2;
-		`;
+		`);
 
 		const calls: Record<string, number> = {};
 		const errors: Record<string, number> = {};
@@ -264,13 +304,16 @@ export class RollupService {
 		failed: number;
 		withTools: number;
 	}> {
-		const rows = await this.db.$queryRaw<{ type: string; sessions: bigint }[]>`
+		const { rows } = await this.db.execute<{
+			type: string;
+			sessions: string;
+		}>(sql`
 			SELECT "type", COUNT(DISTINCT "sessionId") AS sessions
 			FROM "agentEvent"
 			WHERE "emittedAt" >= ${since}
 				AND "type" IN ('session.started', 'session.waiting', 'session.failed', 'action.result')
 			GROUP BY 1;
-		`;
+		`);
 
 		const of = (type: string) =>
 			Number(rows.find((row) => row.type === type)?.sessions ?? 0);
@@ -289,16 +332,20 @@ export class RollupService {
 		retired: Record<string, number>;
 	}> {
 		const [claimed, finished] = await Promise.all([
-			this.db.agentTask.groupBy({
-				by: ["kind"],
-				where: { startedAt: { gte: since } },
-				_count: { _all: true },
-			}),
-			this.db.agentTask.groupBy({
-				by: ["kind", "outcome"],
-				where: { finishedAt: { gte: since } },
-				_count: { _all: true },
-			}),
+			this.db
+				.select({ kind: agentTask.kind, count: count() })
+				.from(agentTask)
+				.where(gte(agentTask.startedAt, since))
+				.groupBy(agentTask.kind),
+			this.db
+				.select({
+					kind: agentTask.kind,
+					outcome: agentTask.outcome,
+					count: count(),
+				})
+				.from(agentTask)
+				.where(gte(agentTask.finishedAt, since))
+				.groupBy(agentTask.kind, agentTask.outcome),
 		]);
 
 		const completed: Record<string, number> = {};
@@ -307,12 +354,12 @@ export class RollupService {
 		for (const row of finished) {
 			const kind = permittedTaskKind(row.kind);
 			const into = row.outcome === RETIRED_OUTCOME ? retired : completed;
-			into[kind] = (into[kind] ?? 0) + row._count._all;
+			into[kind] = (into[kind] ?? 0) + row.count;
 		}
 
 		return {
 			claimed: byKind(
-				claimed.map((row) => ({ key: row.kind, count: row._count._all })),
+				claimed.map((row) => ({ key: row.kind, count: row.count })),
 			),
 			completed,
 			retired,
@@ -322,20 +369,23 @@ export class RollupService {
 	private async attempts(
 		since: Date,
 	): Promise<{ mean: Record<string, number>; max: Record<string, number> }> {
-		const rows = await this.db.agentTask.groupBy({
-			by: ["kind"],
-			where: { finishedAt: { gte: since } },
-			_avg: { attempts: true },
-			_max: { attempts: true },
-		});
+		const rows = await this.db
+			.select({
+				kind: agentTask.kind,
+				mean: avg(agentTask.attempts).mapWith(Number),
+				max: maxOf(agentTask.attempts),
+			})
+			.from(agentTask)
+			.where(gte(agentTask.finishedAt, since))
+			.groupBy(agentTask.kind);
 
 		const mean: Record<string, number> = {};
 		const max: Record<string, number> = {};
 
 		for (const row of rows) {
 			const kind = permittedTaskKind(row.kind);
-			mean[kind] = round(row._avg.attempts ?? 0);
-			max[kind] = row._max.attempts ?? 0;
+			mean[kind] = round(row.mean ?? 0);
+			max[kind] = row.max ?? 0;
 		}
 
 		return { mean, max };
@@ -344,10 +394,12 @@ export class RollupService {
 	private async rechecks(
 		since: Date,
 	): Promise<{ total: number; buckets: Record<string, number> }> {
-		const rows = await this.db.agentTask.findMany({
-			where: { kind: "recheck", createdAt: { gte: since } },
-			select: { createdAt: true, dueAt: true },
-		});
+		const rows = await this.db
+			.select({ createdAt: agentTask.createdAt, dueAt: agentTask.dueAt })
+			.from(agentTask)
+			.where(
+				and(eq(agentTask.kind, "recheck"), gte(agentTask.createdAt, since)),
+			);
 
 		const buckets: Record<string, number> = {};
 
@@ -366,24 +418,15 @@ export class RollupService {
 	private async ledger(): Promise<Properties> {
 		const [byStatus, byBand, methods, kinds, decided, superseded] =
 			await Promise.all([
-				this.db.contactFact.groupBy({
-					by: ["status"],
-					_count: { _all: true },
-				}),
-				this.db.contactFact.groupBy({ by: ["band"], _count: { _all: true } }),
-				this.db.contactFact.groupBy({
-					by: ["method"],
-					_count: { _all: true },
-				}),
+				this.counted(contactFact, contactFact.status),
+				this.counted(contactFact, contactFact.band),
+				this.counted(contactFact, contactFact.method),
 				this.evidenceKinds(),
 				this.decisionHours(),
 				this.supersededWithin(SUPERSEDE_WINDOW_DAYS),
 			]);
 
-		const statuses = countsOf(
-			byStatus.map((row) => ({ key: row.status, count: row._count._all })),
-			Object.values(FactStatus),
-		);
+		const statuses = countsOf(byStatus, Object.values(FactStatus));
 
 		const dismissed = statuses[FactStatus.DISMISSED] ?? 0;
 		const proposed = statuses[FactStatus.PROPOSED] ?? 0;
@@ -391,14 +434,11 @@ export class RollupService {
 
 		return {
 			facts_by_status: statuses,
-			facts_by_band: countsOf(
-				byBand.map((row) => ({ key: row.band, count: row._count._all })),
-				Object.values(FactBand),
-			),
+			facts_by_band: countsOf(byBand, Object.values(FactBand)),
 			facts_by_method: merge(
 				methods.map((row) => ({
-					key: permittedMethod(row.method),
-					count: row._count._all,
+					key: permittedMethod(row.key),
+					count: row.count,
 				})),
 			),
 			facts_by_evidence_kind: kinds,
@@ -409,12 +449,12 @@ export class RollupService {
 	}
 
 	private async evidenceKinds(): Promise<Record<string, number>> {
-		const rows = await this.db.$queryRaw<{ kind: string; count: bigint }[]>`
+		const { rows } = await this.db.execute<{ kind: string; count: string }>(sql`
 			SELECT item->>'kind' AS kind, COUNT(*) AS count
 			FROM "contactFact", jsonb_array_elements("evidence") AS item
 			WHERE jsonb_typeof("evidence") = 'array'
 			GROUP BY 1;
-		`;
+		`);
 
 		return merge(
 			rows.map((row) => ({
@@ -425,27 +465,36 @@ export class RollupService {
 	}
 
 	private async decisionHours(): Promise<number | null> {
-		const rows = await this.db.$queryRaw<{ median: number | null }[]>`
+		const { rows } = await this.db.execute<{
+			median: number | string | null;
+		}>(sql`
 			SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (
 				ORDER BY EXTRACT(EPOCH FROM ("decidedAt" - "observedAt")) / 3600
 			) AS median
 			FROM "contactFact"
 			WHERE "decidedAt" IS NOT NULL;
-		`;
+		`);
 
 		const median = rows[0]?.median;
-		return median === null || median === undefined ? null : round(median);
+		return median === null || median === undefined
+			? null
+			: round(Number(median));
 	}
 
 	private async supersededWithin(days: number): Promise<number> {
-		const rows = await this.db.$queryRaw<{ count: bigint }[]>`
+		const { rows } = await this.db.execute<{ count: string }>(sql`
 			SELECT COUNT(*) AS count
 			FROM "contactFact"
 			WHERE "supersededAt" IS NOT NULL
 				AND "supersededAt" - "observedAt" < make_interval(days => ${days});
-		`;
+		`);
 
 		return Number(rows[0]?.count ?? 0);
+	}
+
+	private async counted(table: PgTable, column: PgColumn): Promise<Counted[]> {
+		const rows = await groupCounts(this.db, table, column, undefined);
+		return rows.map((row) => ({ key: row.value ?? "", count: row.count }));
 	}
 
 	private async crm(since: Date): Promise<Properties> {
@@ -467,32 +516,28 @@ export class RollupService {
 			workspaceProfile,
 			nonSeedContacts,
 		] = await Promise.all([
-			this.db.contact.count(),
-			this.db.company.count(),
-			this.db.deal.count(),
-			this.db.activity.count(),
-			this.db.contact.groupBy({ by: ["source"], _count: { _all: true } }),
-			this.db.company.groupBy({ by: ["source"], _count: { _all: true } }),
-			this.db.deal.groupBy({ by: ["stage"], _count: { _all: true } }),
-			this.db.activity.groupBy({ by: ["type"], _count: { _all: true } }),
-			this.db.mailboxSync.groupBy({ by: ["status"], _count: { _all: true } }),
-			this.db.emailThread.count({ where: { createdAt: { gte: since } } }),
-			this.db.emailMessage.count({ where: { createdAt: { gte: since } } }),
-			this.db.company.groupBy({
-				by: ["enrichmentStatus"],
-				_count: { _all: true },
-			}),
-			this.db.suppressedDomain.count(),
-			this.db.suppressedContact.count(),
-			this.db.workspaceProfile.count(),
-			this.db.contact.count({
-				where: {
-					OR: [
-						{ ownerId: null },
-						{ ownerId: { not: { startsWith: SEED_OWNER_PREFIX } } },
-					],
-				},
-			}),
+			this.db.$count(contact),
+			this.db.$count(company),
+			this.db.$count(deal),
+			this.db.$count(activity),
+			this.counted(contact, contact.source),
+			this.counted(company, company.source),
+			this.counted(deal, deal.stage),
+			this.counted(activity, activity.type),
+			this.counted(mailboxSync, mailboxSync.status),
+			this.db.$count(emailThread, gte(emailThread.createdAt, since)),
+			this.db.$count(emailMessage, gte(emailMessage.createdAt, since)),
+			this.counted(company, company.enrichmentStatus),
+			this.db.$count(suppressedDomain),
+			this.db.$count(suppressedContact),
+			this.db.$count(workspaceProfileTable),
+			this.db.$count(
+				contact,
+				or(
+					isNull(contact.ownerId),
+					not(startsWith(contact.ownerId, SEED_OWNER_PREFIX)),
+				),
+			),
 		]);
 
 		const [
@@ -504,22 +549,34 @@ export class RollupService {
 			trackingCapped,
 			trackingPaused,
 		] = await Promise.all([
-			this.db.appSetting.count({ where: { trackingSiteId: { not: null } } }),
-			this.db.trackedDomain.count(),
-			this.db.trackedEvent.count({
-				where: { type: "page_view", occurredAt: { gte: since } },
-			}),
-			this.db.formSubmission.count({ where: { createdAt: { gte: since } } }),
-			this.db.contact.count({
-				where: { createdAt: { gte: since }, source: RecordSource.TRACKING },
-			}),
-			this.db.formSubmission.count({
-				where: { createdAt: { gte: since }, skipReason: CONTACT_CAP_REASON },
-			}),
-			this.db.appSetting.count({ where: { trackingPaused: true } }),
+			this.db.$count(appSetting, isNotNull(appSetting.trackingSiteId)),
+			this.db.$count(trackedDomain),
+			this.db.$count(
+				trackedEvent,
+				and(
+					eq(trackedEvent.type, "page_view"),
+					gte(trackedEvent.occurredAt, since),
+				),
+			),
+			this.db.$count(formSubmission, gte(formSubmission.createdAt, since)),
+			this.db.$count(
+				contact,
+				and(
+					gte(contact.createdAt, since),
+					eq(contact.source, RecordSource.TRACKING),
+				),
+			),
+			this.db.$count(
+				formSubmission,
+				and(
+					gte(formSubmission.createdAt, since),
+					eq(formSubmission.skipReason, CONTACT_CAP_REASON),
+				),
+			),
+			this.db.$count(appSetting, eq(appSetting.trackingPaused, true)),
 		]);
 
-		const configured = syncs.reduce((sum, row) => sum + row._count._all, 0);
+		const configured = syncs.reduce((sum, row) => sum + row.count, 0);
 
 		return {
 			seed_only: contacts > 0 && nonSeedContacts === 0,
@@ -529,28 +586,13 @@ export class RollupService {
 			deals_bucket: bucket(deals),
 			activities_bucket: bucket(activities),
 
-			contacts_by_source: countsOf(
-				contactSources.map((row) => ({
-					key: row.source,
-					count: row._count._all,
-				})),
-				Object.values(RecordSource),
-			),
+			contacts_by_source: countsOf(contactSources, Object.values(RecordSource)),
 			companies_by_source: countsOf(
-				companySources.map((row) => ({
-					key: row.source,
-					count: row._count._all,
-				})),
+				companySources,
 				Object.values(RecordSource),
 			),
-			deals_by_stage: countsOf(
-				stages.map((row) => ({ key: row.stage, count: row._count._all })),
-				Object.values(DealStage),
-			),
-			activities_by_type: countsOf(
-				types.map((row) => ({ key: row.type, count: row._count._all })),
-				Object.values(ActivityType),
-			),
+			deals_by_stage: countsOf(stages, Object.values(DealStage)),
+			activities_by_type: countsOf(types, Object.values(ActivityType)),
 
 			cap_tracking: trackingSite > 0,
 			tracking_domains: bucket(trackingDomains),
@@ -561,17 +603,12 @@ export class RollupService {
 			tracking_paused: trackingPaused > 0,
 
 			mailbox_sync_configured: configured > 0,
-			mailbox_sync_status: merge(
-				syncs.map((row) => ({ key: row.status, count: row._count._all })),
-			),
+			mailbox_sync_status: merge(syncs),
 			threads_ingested: threads,
 			messages_ingested: messages,
 
 			enrichment_by_status: countsOf(
-				enrichment.map((row) => ({
-					key: row.enrichmentStatus,
-					count: row._count._all,
-				})),
+				enrichment,
 				Object.values(EnrichmentStatus),
 			),
 

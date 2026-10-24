@@ -6,7 +6,24 @@ import {
 	expect,
 	it,
 } from "bun:test";
-import { db } from "@crm/db";
+import {
+	activity,
+	and,
+	company,
+	contact as contactTable,
+	contains,
+	db,
+	endsWith,
+	eq,
+	formSubmission,
+	inArray,
+	startsWith,
+	suppressedContact,
+	suppressedDomain,
+	trackedVisitor,
+	trackingCounter,
+	user as userTable,
+} from "@crm/db";
 import {
 	CONTACT_CAP_REASON,
 	CONTACTS_PER_HOUR,
@@ -18,6 +35,7 @@ import { ActivityStampService } from "../src/crm/activity-stamp.service";
 import { TrackingCounterService } from "../src/tracking/tracking-counter.service";
 import { TrackingFilingService } from "../src/tracking/tracking-filing.service";
 import { withDiscardedCrmEvents } from "./agent-trigger.stub";
+import { first, one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "filing-spec";
 const domain = `visitors-${suffix}.test`;
@@ -43,16 +61,18 @@ const filing = new TrackingFilingService(db, counters, directory, agent, stamp);
 let userId: string;
 
 async function submit(email: string | null, name: string | null = "Dana Reed") {
-	const row = await db.formSubmission.create({
-		data: {
-			host,
-			path: "/pricing",
-			email,
-			fields: name ? { name, email: email ?? "" } : {},
-			dedupeKey: `${suffix}-${Math.random().toString(36).slice(2)}`,
-		},
-		select: { id: true },
-	});
+	const row = await one(
+		db
+			.insert(formSubmission)
+			.values({
+				host,
+				path: "/pricing",
+				email,
+				fields: name ? { name, email: email ?? "" } : {},
+				dedupeKey: `${suffix}-${Math.random().toString(36).slice(2)}`,
+			})
+			.returning({ id: formSubmission.id }),
+	);
 
 	const outcome = await filing.file({
 		id: row.id,
@@ -62,57 +82,72 @@ async function submit(email: string | null, name: string | null = "Dana Reed") {
 		name,
 	});
 
-	const stored = await db.formSubmission.findUnique({
-		where: { id: row.id },
-		select: { contactId: true, filedAt: true, skipReason: true },
-	});
+	const stored = await first(
+		db
+			.select({
+				contactId: formSubmission.contactId,
+				filedAt: formSubmission.filedAt,
+				skipReason: formSubmission.skipReason,
+			})
+			.from(formSubmission)
+			.where(eq(formSubmission.id, row.id))
+			.limit(1),
+	);
 
 	return { outcome, stored };
 }
 
 async function clean() {
-	await db.activity.deleteMany({ where: { body: { contains: host } } });
-	await db.formSubmission.deleteMany({ where: { host } });
-	await db.trackedVisitor.deleteMany({
-		where: { id: { startsWith: "visitor-" } },
-	});
-	await db.contact.deleteMany({ where: { email: { endsWith: `@${domain}` } } });
-	await db.contact.deleteMany({ where: { email: `free-${suffix}@gmail.com` } });
-	await db.company.deleteMany({ where: { domain } });
-	await db.suppressedContact.deleteMany({
-		where: { email: { endsWith: `@${domain}` } },
-	});
-	await db.suppressedDomain.deleteMany({ where: { domain } });
-	await db.trackingCounter.deleteMany({ where: {} });
+	await db.delete(activity).where(contains(activity.body, host));
+	await db.delete(formSubmission).where(eq(formSubmission.host, host));
+	await db
+		.delete(trackedVisitor)
+		.where(startsWith(trackedVisitor.id, "visitor-"));
+	await db
+		.delete(contactTable)
+		.where(endsWith(contactTable.email, `@${domain}`));
+	await db
+		.delete(contactTable)
+		.where(eq(contactTable.email, `free-${suffix}@gmail.com`));
+	await db.delete(company).where(eq(company.domain, domain));
+	await db
+		.delete(suppressedContact)
+		.where(endsWith(suppressedContact.email, `@${domain}`));
+	await db.delete(suppressedDomain).where(eq(suppressedDomain.domain, domain));
+	await db.delete(trackingCounter);
 }
 
 beforeAll(async () => {
 	await clean();
 
-	const user = await db.user.findFirst({ select: { id: true } });
+	const user = await first(
+		db.select({ id: userTable.id }).from(userTable).limit(1),
+	);
 	userId =
 		user?.id ??
 		(
-			await db.user.create({
-				data: {
-					id: `user-${suffix}`,
-					name: "Test Rep",
-					email: `rep-${suffix}@example.test`,
-				},
-				select: { id: true },
-			})
+			await one(
+				db
+					.insert(userTable)
+					.values({
+						id: `user-${suffix}`,
+						name: "Test Rep",
+						email: `rep-${suffix}@example.test`,
+					})
+					.returning({ id: userTable.id }),
+			)
 		).id;
 });
 
 beforeEach(async () => {
 	queued.length = 0;
-	await db.trackingCounter.deleteMany({ where: {} });
+	await db.delete(trackingCounter);
 });
 
 afterAll(async () => {
 	await clean();
 	if (userId.startsWith(`user-${suffix}`)) {
-		await db.user.deleteMany({ where: { id: userId } });
+		await db.delete(userTable).where(eq(userTable.id, userId));
 	}
 });
 
@@ -134,7 +169,7 @@ describe("filing a form submission", () => {
 
 	it("refuses an address a rep has deleted", async () => {
 		const email = `deleted@${domain}`;
-		await db.suppressedContact.create({ data: { email } });
+		await one(db.insert(suppressedContact).values({ email }).returning());
 
 		const { outcome, stored } = await submit(email);
 
@@ -143,14 +178,16 @@ describe("filing a form submission", () => {
 	});
 
 	it("refuses a suppressed domain", async () => {
-		await db.suppressedDomain.create({ data: { domain } });
+		await one(db.insert(suppressedDomain).values({ domain }).returning());
 
 		const { outcome, stored } = await submit(`someone@${domain}`);
 
 		expect(outcome.filed).toBe(false);
 		expect(stored?.skipReason).toContain("suppressed");
 
-		await db.suppressedDomain.deleteMany({ where: { domain } });
+		await db
+			.delete(suppressedDomain)
+			.where(eq(suppressedDomain.domain, domain));
 	});
 
 	it("files a free-mail address as a contact with no company", async () => {
@@ -159,10 +196,16 @@ describe("filing a form submission", () => {
 		expect(outcome.filed).toBe(true);
 		expect(stored?.filedAt).not.toBeNull();
 
-		const contact = await db.contact.findUnique({
-			where: { email: `free-${suffix}@gmail.com` },
-			select: { companyId: true, source: true },
-		});
+		const contact = await first(
+			db
+				.select({
+					companyId: contactTable.companyId,
+					source: contactTable.source,
+				})
+				.from(contactTable)
+				.where(eq(contactTable.email, `free-${suffix}@gmail.com`))
+				.limit(1),
+		);
 
 		expect(contact?.companyId).toBeNull();
 		expect(contact?.source).toBe("TRACKING");
@@ -176,10 +219,16 @@ describe("filing a form submission", () => {
 		expect(stored?.contactId).toBeTruthy();
 		expect(queued).toHaveLength(1);
 
-		const contact = await db.contact.findUnique({
-			where: { email },
-			select: { companyId: true, firstName: true },
-		});
+		const contact = await first(
+			db
+				.select({
+					companyId: contactTable.companyId,
+					firstName: contactTable.firstName,
+				})
+				.from(contactTable)
+				.where(eq(contactTable.email, email))
+				.limit(1),
+		);
 
 		expect(contact?.companyId).toBeTruthy();
 		expect(contact?.firstName).toBe("Dana");
@@ -187,16 +236,18 @@ describe("filing a form submission", () => {
 
 	it("writes one note when the same submission is filed twice at once", async () => {
 		const email = `raced@${domain}`;
-		const row = await db.formSubmission.create({
-			data: {
-				host,
-				path: "/pricing",
-				email,
-				fields: { email },
-				dedupeKey: `${suffix}-raced`,
-			},
-			select: { id: true },
-		});
+		const row = await one(
+			db
+				.insert(formSubmission)
+				.values({
+					host,
+					path: "/pricing",
+					email,
+					fields: { email },
+					dedupeKey: `${suffix}-raced`,
+				})
+				.returning({ id: formSubmission.id }),
+		);
 
 		const file = () =>
 			filing.file({
@@ -211,11 +262,23 @@ describe("filing a form submission", () => {
 
 		expect(first.filed).toBe(true);
 		expect(second.filed).toBe(true);
-		expect(await db.contact.count({ where: { email } })).toBe(1);
+		expect(await db.$count(contactTable, eq(contactTable.email, email))).toBe(
+			1,
+		);
 
-		const notes = await db.activity.count({
-			where: { body: { contains: host }, contact: { email } },
-		});
+		const notes = await db.$count(
+			activity,
+			and(
+				contains(activity.body, host),
+				inArray(
+					activity.contactId,
+					db
+						.select({ id: contactTable.id })
+						.from(contactTable)
+						.where(eq(contactTable.email, email)),
+				),
+			),
+		);
 
 		expect(notes).toBe(1);
 	});
@@ -224,16 +287,18 @@ describe("filing a form submission", () => {
 		const email = `refunded@${domain}`;
 		const rows = await Promise.all(
 			[1, 2].map((n) =>
-				db.formSubmission.create({
-					data: {
-						host,
-						path: "/pricing",
-						email,
-						fields: { email },
-						dedupeKey: `${suffix}-refunded-${n}`,
-					},
-					select: { id: true },
-				}),
+				one(
+					db
+						.insert(formSubmission)
+						.values({
+							host,
+							path: "/pricing",
+							email,
+							fields: { email },
+							dedupeKey: `${suffix}-refunded-${n}`,
+						})
+						.returning({ id: formSubmission.id }),
+				),
 			),
 		);
 
@@ -249,12 +314,17 @@ describe("filing a form submission", () => {
 			),
 		);
 
-		expect(await db.contact.count({ where: { email } })).toBe(1);
+		expect(await db.$count(contactTable, eq(contactTable.email, email))).toBe(
+			1,
+		);
 
-		const counter = await db.trackingCounter.findUnique({
-			where: { key: contactWindowKey() },
-			select: { value: true },
-		});
+		const counter = await first(
+			db
+				.select({ value: trackingCounter.value })
+				.from(trackingCounter)
+				.where(eq(trackingCounter.key, contactWindowKey()))
+				.limit(1),
+		);
 
 		expect(counter?.value).toBe(1);
 	});
@@ -271,20 +341,22 @@ describe("filing a form submission", () => {
 		expect(second.stored?.contactId).toBe(first.stored?.contactId ?? "");
 		expect(queued).toHaveLength(0);
 
-		const count = await db.contact.count({ where: { email } });
+		const count = await db.$count(contactTable, eq(contactTable.email, email));
 		expect(count).toBe(1);
 	});
 
 	it("stores but does not file once the hourly cap is reached", async () => {
-		await db.trackingCounter.upsert({
-			where: { key: contactWindowKey() },
-			create: {
+		await db
+			.insert(trackingCounter)
+			.values({
 				key: contactWindowKey(),
 				value: CONTACTS_PER_HOUR,
 				expiresAt: new Date(Date.now() + 3_600_000),
-			},
-			update: { value: CONTACTS_PER_HOUR },
-		});
+			})
+			.onConflictDoUpdate({
+				target: trackingCounter.key,
+				set: { value: CONTACTS_PER_HOUR },
+			});
 
 		const { outcome, stored } = await submit(`capped@${domain}`);
 
@@ -303,19 +375,31 @@ describe("the hourly counter", () => {
 		expect(await counters.take(key, 2)).toBe(false);
 		expect(await counters.take(key, 2)).toBe(false);
 
-		await db.trackingCounter.deleteMany({ where: { key } });
+		await db.delete(trackingCounter).where(eq(trackingCounter.key, key));
 	});
 
 	it("keeps a fixed window rather than sliding on every write", async () => {
 		const key = contactWindowKey();
 
 		await counters.take(key, 10);
-		const first = await db.trackingCounter.findUnique({ where: { key } });
+		const initial = await first(
+			db
+				.select()
+				.from(trackingCounter)
+				.where(eq(trackingCounter.key, key))
+				.limit(1),
+		);
 
 		await counters.take(key, 10);
-		const second = await db.trackingCounter.findUnique({ where: { key } });
+		const second = await first(
+			db
+				.select()
+				.from(trackingCounter)
+				.where(eq(trackingCounter.key, key))
+				.limit(1),
+		);
 
-		expect(second?.expiresAt.getTime()).toBe(first?.expiresAt.getTime() ?? 0);
+		expect(second?.expiresAt.getTime()).toBe(initial?.expiresAt.getTime() ?? 0);
 		expect(second?.value).toBe(2);
 	});
 });

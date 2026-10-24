@@ -14,8 +14,8 @@
   via its own `middleware` option — it mounts before `MiddlewareConsumer`, so
   `/api/auth/*` never reaches ours.
 - `requestId` from `RequestLoggerMiddleware` via `AsyncLocalStorage`;
-  `UserContextInterceptor` adds `userId`. Prisma statements are opt-in
-  (`PRISMA_LOG_QUERIES`).
+  `UserContextInterceptor` adds `userId`. SQL statements are opt-in
+  (`DB_LOG_QUERIES`).
 
 ## Intelligence never lives in the API
 
@@ -131,9 +131,9 @@ self-hoster's admin cannot redeploy.
 - **One router per module**, `*.router.ts` (the codegen glob), with
   `@Router({ alias })` and `@UseMiddlewares(AuthMiddleware)`. **No `AuthMiddleware`
   means public — there is no other guard.**
-- **Routers are thin**: zod in, service call out; Prisma lives in `*.service.ts`.
+- **Routers are thin**: zod in, service call out; Drizzle queries live in `*.service.ts`.
 - Services throw Nest's `HttpException` family; `DomainErrorMiddleware` maps them.
-- **Filter, sort and paginate in Prisma.** List procedures take `listInput` and return
+- **Filter, sort and paginate in SQL.** List procedures take `listInput` and return
   `{ rows, total, facetCounts }`. Never filter a whole table in the browser; never
   interpolate `sort` into a field name — use `resolveOrderBy`.
 - **`src/generated/server.ts` is generated *and committed*, and `build` must never

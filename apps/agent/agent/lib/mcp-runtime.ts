@@ -1,5 +1,19 @@
 import { createHash } from "node:crypto";
-import { db, type Prisma } from "@crm/db";
+import {
+	agentAction,
+	agentRun,
+	and,
+	db,
+	eq,
+	firstRow,
+	type JsonObject,
+	type JsonValue,
+	mcpConnection,
+	mcpToolSnapshot,
+	orNull,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import { vendorAccess, vendorBySlug } from "@crm/mcp-integrations/catalog";
 import { parseAgentManifest } from "@crm/validation/agent-manifest";
@@ -29,8 +43,8 @@ export const mcpActionResultEvent = z.object({
 
 export function capMcpArchivedResult(
 	type: string,
-	data: Prisma.InputJsonObject,
-): Prisma.InputJsonObject {
+	data: JsonObject,
+): JsonObject {
 	if (type !== "action.result") return data;
 	const parsed = mcpActionResultEvent.safeParse(data);
 	if (!parsed.success || !parsed.data.result.toolName.includes("__"))
@@ -58,7 +72,7 @@ export function capMcpArchivedResult(
 	};
 }
 
-export function mcpModelOutput(output: Prisma.JsonValue) {
+export function mcpModelOutput(output: JsonValue) {
 	const serialized = JSON.stringify(output);
 	const originalBytes = Buffer.byteLength(serialized);
 	if (originalBytes <= MCP.result.modelMaxBytes) {
@@ -85,13 +99,19 @@ export async function callMcpTool(input: {
 	platformSlug: string;
 	toolName: string;
 	arguments: z.infer<typeof mcpToolArguments>;
-}): Promise<Prisma.JsonValue> {
+}): Promise<JsonValue> {
 	const vendor = vendorBySlug(input.platformSlug);
 	if (!vendor) throw new Error("The MCP platform is unavailable.");
-	const connection = await db.mcpConnection.findUnique({
-		where: { id: input.connectionId },
-		select: { status: true, accessMode: true },
-	});
+	const connection = await firstRow(
+		db
+			.select({
+				status: mcpConnection.status,
+				accessMode: mcpConnection.accessMode,
+			})
+			.from(mcpConnection)
+			.where(whereEq(mcpConnection.id, input.connectionId))
+			.limit(1),
+	);
 	if (connection?.status !== "CONNECTED") {
 		throw new Error("The MCP platform is disconnected.");
 	}
@@ -137,13 +157,13 @@ export async function authorizeMcpTool(
 	if (!toolName)
 		return { type: "denied", reason: "The MCP tool name is invalid." };
 
-	const run = await db.agentRun.findUnique({
-		where: { id: runId },
-		select: {
-			agentId: true,
-			version: { select: { manifest: true } },
-		},
-	});
+	const run = await db.query.agentRun
+		.findFirst({
+			where: whereEq(agentRun.id, runId),
+			columns: { agentId: true },
+			with: { version: { columns: { manifest: true } } },
+		})
+		.then(orNull);
 	if (!run) return { type: "denied", reason: "The agent run is unavailable." };
 	const manifest = parseAgentManifest(run.version.manifest);
 	const grant = manifest.mcp.find(
@@ -153,28 +173,26 @@ export async function authorizeMcpTool(
 	if (!tool)
 		return { type: "denied", reason: "This agent lacks that MCP tool grant." };
 
-	const connection = await db.mcpConnection.findUnique({
-		where: {
-			organizationId_platformSlug: {
-				organizationId: WORKSPACE_ID,
-				platformSlug,
-			},
-		},
-		select: {
-			id: true,
-			status: true,
-			accessMode: true,
-			toolSnapshots: {
-				where: {
-					name: toolName,
-					fingerprint: tool.fingerprint,
-					reviewState: "REVIEWED",
+	const connection = await db.query.mcpConnection
+		.findFirst({
+			where: and(
+				eq(mcpConnection.organizationId, WORKSPACE_ID),
+				whereEq(mcpConnection.platformSlug, platformSlug),
+			),
+			columns: { id: true, status: true, accessMode: true },
+			with: {
+				toolSnapshots: {
+					where: and(
+						whereEq(mcpToolSnapshot.name, toolName),
+						whereEq(mcpToolSnapshot.fingerprint, tool.fingerprint),
+						eq(mcpToolSnapshot.reviewState, "REVIEWED"),
+					),
+					limit: 1,
+					columns: { id: true },
 				},
-				select: { id: true },
-				take: 1,
 			},
-		},
-	});
+		})
+		.then(orNull);
 	if (connection?.status !== "CONNECTED") {
 		return { type: "denied", reason: "The MCP platform is disconnected." };
 	}
@@ -194,37 +212,43 @@ export async function authorizeMcpTool(
 	if (tool.callKind === "read") return "approved";
 
 	const idempotencyKey = `${runId}:${context.callId}`;
-	const existing = await db.agentAction.findUnique({
-		where: { idempotencyKey },
-		select: { id: true },
-	});
+	const existing = await firstRow(
+		db
+			.select({ id: agentAction.id })
+			.from(agentAction)
+			.where(whereEq(agentAction.idempotencyKey, idempotencyKey))
+			.limit(1),
+	);
 	if (existing) {
 		return { type: "denied", reason: "This MCP change already ran." };
 	}
-	await db.agentAction.create({
-		data: {
-			agentId: run.agentId,
-			runId,
-			type: "mcp.tool.call",
-			provider: platformSlug,
-			targetType: "mcp-tool",
-			targetId: tool.name,
-			targetLabel: tool.name,
-			summary: tool.summary,
-			metadata: {
-				toolName: tool.name,
-				callKind: tool.callKind,
-				fingerprint: tool.fingerprint,
-			},
-			status: "RUNNING",
-			idempotencyKey,
-			requestHash: createHash("sha256")
-				.update(`${platformSlug}:${tool.name}:${context.callId}`)
-				.digest("hex"),
-			attemptCount: 1,
-			startedAt: new Date(),
-		},
-	});
+	await requireRow(
+		db
+			.insert(agentAction)
+			.values({
+				agentId: run.agentId,
+				runId,
+				type: "mcp.tool.call",
+				provider: platformSlug,
+				targetType: "mcp-tool",
+				targetId: tool.name,
+				targetLabel: tool.name,
+				summary: tool.summary,
+				metadata: {
+					toolName: tool.name,
+					callKind: tool.callKind,
+					fingerprint: tool.fingerprint,
+				},
+				status: "RUNNING",
+				idempotencyKey,
+				requestHash: createHash("sha256")
+					.update(`${platformSlug}:${tool.name}:${context.callId}`)
+					.digest("hex"),
+				attemptCount: 1,
+				startedAt: new Date(),
+			})
+			.returning(),
+	);
 
 	return "approved";
 }

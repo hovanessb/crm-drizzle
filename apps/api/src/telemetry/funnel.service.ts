@@ -1,6 +1,23 @@
 import { GOOGLE_PROVIDER_ID } from "@crm/auth/scopes";
-import type { Db } from "@crm/db";
-import { FactStatus } from "@crm/db";
+import {
+	account,
+	agentTask,
+	and,
+	asc,
+	contact,
+	contactFact,
+	type Db,
+	eq,
+	FactStatus,
+	inArray,
+	isNotNull,
+	isNull,
+	mailboxSync,
+	not,
+	or,
+	session,
+	startsWith,
+} from "@crm/db";
 import {
 	MILESTONES,
 	type Milestone,
@@ -49,11 +66,11 @@ export class FunnelService {
 
 			case "first_sign_in":
 				return this.earliest(
-					this.db.session.findFirst({
-						orderBy: { createdAt: "asc" },
-						select: { createdAt: true },
-					}),
-					(row) => row.createdAt,
+					this.db
+						.select({ at: session.createdAt })
+						.from(session)
+						.orderBy(asc(session.createdAt))
+						.limit(1),
 				);
 
 			case "google_oauth_configured": {
@@ -64,12 +81,12 @@ export class FunnelService {
 				if (!configured) return null;
 
 				const linked = await this.earliest(
-					this.db.account.findFirst({
-						where: { providerId: GOOGLE_PROVIDER_ID },
-						orderBy: { createdAt: "asc" },
-						select: { createdAt: true },
-					}),
-					(row) => row.createdAt,
+					this.db
+						.select({ at: account.createdAt })
+						.from(account)
+						.where(eq(account.providerId, GOOGLE_PROVIDER_ID))
+						.orderBy(asc(account.createdAt))
+						.limit(1),
 				);
 
 				return linked ?? new Date();
@@ -77,47 +94,47 @@ export class FunnelService {
 
 			case "first_mailbox_sync":
 				return this.earliest(
-					this.db.mailboxSync.findFirst({
-						where: { lastSyncedAt: { not: null } },
-						orderBy: { lastSyncedAt: "asc" },
-						select: { lastSyncedAt: true },
-					}),
-					(row) => row.lastSyncedAt,
+					this.db
+						.select({ at: mailboxSync.lastSyncedAt })
+						.from(mailboxSync)
+						.where(isNotNull(mailboxSync.lastSyncedAt))
+						.orderBy(asc(mailboxSync.lastSyncedAt))
+						.limit(1),
 				);
 
 			case "first_non_seed_contact":
 				return this.earliest(
-					this.db.contact.findFirst({
-						where: {
-							OR: [
-								{ ownerId: null },
-								{ ownerId: { not: { startsWith: SEED_OWNER_PREFIX } } },
-							],
-						},
-						orderBy: { createdAt: "asc" },
-						select: { createdAt: true },
-					}),
-					(row) => row.createdAt,
+					this.db
+						.select({ at: contact.createdAt })
+						.from(contact)
+						.where(
+							or(
+								isNull(contact.ownerId),
+								not(startsWith(contact.ownerId, SEED_OWNER_PREFIX)),
+							),
+						)
+						.orderBy(asc(contact.createdAt))
+						.limit(1),
 				);
 
 			case "first_agent_task_claimed":
 				return this.earliest(
-					this.db.agentTask.findFirst({
-						where: { startedAt: { not: null } },
-						orderBy: { startedAt: "asc" },
-						select: { startedAt: true },
-					}),
-					(row) => row.startedAt,
+					this.db
+						.select({ at: agentTask.startedAt })
+						.from(agentTask)
+						.where(isNotNull(agentTask.startedAt))
+						.orderBy(asc(agentTask.startedAt))
+						.limit(1),
 				);
 
 			case "first_agent_task_completed":
 				return this.earliest(
-					this.db.agentTask.findFirst({
-						where: { finishedAt: { not: null } },
-						orderBy: { finishedAt: "asc" },
-						select: { finishedAt: true },
-					}),
-					(row) => row.finishedAt,
+					this.db
+						.select({ at: agentTask.finishedAt })
+						.from(agentTask)
+						.where(isNotNull(agentTask.finishedAt))
+						.orderBy(asc(agentTask.finishedAt))
+						.limit(1),
 				);
 
 			case "first_fact_applied":
@@ -126,21 +143,24 @@ export class FunnelService {
 	}
 
 	private async firstApplied(): Promise<Date | null> {
-		const everApplied = {
-			status: { in: [FactStatus.APPLIED, FactStatus.SUPERSEDED] },
-		};
+		const everApplied = inArray(contactFact.status, [
+			FactStatus.APPLIED,
+			FactStatus.SUPERSEDED,
+		]);
 
-		const [decided, undecided] = await Promise.all([
-			this.db.contactFact.findFirst({
-				where: { ...everApplied, decidedAt: { not: null } },
-				orderBy: { decidedAt: "asc" },
-				select: { decidedAt: true },
-			}),
-			this.db.contactFact.findFirst({
-				where: { ...everApplied, decidedAt: null },
-				orderBy: { observedAt: "asc" },
-				select: { observedAt: true },
-			}),
+		const [[decided], [undecided]] = await Promise.all([
+			this.db
+				.select({ decidedAt: contactFact.decidedAt })
+				.from(contactFact)
+				.where(and(everApplied, isNotNull(contactFact.decidedAt)))
+				.orderBy(asc(contactFact.decidedAt))
+				.limit(1),
+			this.db
+				.select({ observedAt: contactFact.observedAt })
+				.from(contactFact)
+				.where(and(everApplied, isNull(contactFact.decidedAt)))
+				.orderBy(asc(contactFact.observedAt))
+				.limit(1),
 		]);
 
 		const applied = [decided?.decidedAt, undecided?.observedAt].filter(
@@ -152,11 +172,10 @@ export class FunnelService {
 		return new Date(Math.min(...applied.map((at) => at.getTime())));
 	}
 
-	private async earliest<T>(
-		query: PromiseLike<T | null>,
-		pick: (row: T) => Date | null,
+	private async earliest(
+		query: PromiseLike<{ at: Date | null }[]>,
 	): Promise<Date | null> {
-		const row = await query;
-		return row ? pick(row) : null;
+		const [row] = await query;
+		return row?.at ?? null;
 	}
 }

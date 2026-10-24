@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { company, db, requireRow, whereEq } from "@crm/db";
 import { blobEnabled, isMirrored, mirror } from "@crm/db/blob";
 import { COMPANY_IMAGE_FIELDS, type CompanyImageField } from "@crm/db/images";
 import { z } from "zod";
@@ -17,12 +17,11 @@ if (!blobEnabled()) {
 	);
 }
 
-const rows = await db.companyEnrichment.findMany({
-	select: {
-		companyId: true,
-		raw: true,
+const rows = await db.query.companyEnrichment.findMany({
+	columns: { companyId: true, raw: true },
+	with: {
 		company: {
-			select: {
+			columns: {
 				name: true,
 				description: true,
 				logoUrl: true,
@@ -81,7 +80,13 @@ for (const row of rows) {
 
 	if (Object.keys(patch).length === 0) continue;
 
-	await db.company.update({ where: { id: row.companyId }, data: patch });
+	await requireRow(
+		db
+			.update(company)
+			.set(patch)
+			.where(whereEq(company.id, row.companyId))
+			.returning(),
+	);
 	updated += 1;
 	console.log(`${row.company.name}: ${Object.keys(patch).join(", ")}`);
 }
@@ -89,4 +94,4 @@ for (const row of rows) {
 console.log(
 	`\nUpdated ${updated} of ${rows.length} enriched companies. Copied ${copied} images.`,
 );
-await db.$disconnect();
+await db.$client.end();

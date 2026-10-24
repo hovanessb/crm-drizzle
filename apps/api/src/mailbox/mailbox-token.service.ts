@@ -5,7 +5,7 @@ import {
 	parseScopes,
 	type SignInAccount,
 } from "@crm/auth/scopes";
-import { type Db } from "@crm/db";
+import { account, and, type Db, eq } from "@crm/db";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
 import {
@@ -32,12 +32,15 @@ export class MailboxTokenService {
 		userId: string,
 		providerId: MailboxProviderId,
 	): Promise<Set<string>> {
-		const account = await this.db.account.findFirst({
-			where: { userId, providerId },
-			select: { scope: true },
-		});
+		const [row] = await this.db
+			.select({ scope: account.scope })
+			.from(account)
+			.where(
+				and(eq(account.userId, userId), eq(account.providerId, providerId)),
+			)
+			.limit(1);
 
-		return parseScopes(account?.scope);
+		return parseScopes(row?.scope);
 	}
 
 	async isConnected(userId: string, source: SyncSource): Promise<boolean> {
@@ -49,22 +52,25 @@ export class MailboxTokenService {
 	}
 
 	async signInAccounts(userId: string): Promise<SignInAccount[]> {
-		return this.db.account.findMany({
-			where: { userId },
-			select: { providerId: true, scope: true },
-		});
+		return this.db
+			.select({ providerId: account.providerId, scope: account.scope })
+			.from(account)
+			.where(eq(account.userId, userId));
 	}
 
 	async hasRefreshToken(
 		userId: string,
 		providerId: MailboxProviderId,
 	): Promise<boolean> {
-		const account = await this.db.account.findFirst({
-			where: { userId, providerId },
-			select: { refreshToken: true },
-		});
+		const [row] = await this.db
+			.select({ refreshToken: account.refreshToken })
+			.from(account)
+			.where(
+				and(eq(account.userId, userId), eq(account.providerId, providerId)),
+			)
+			.limit(1);
 
-		return Boolean(account?.refreshToken);
+		return Boolean(row?.refreshToken);
 	}
 
 	async accessTokenFor(
@@ -120,30 +126,42 @@ export class MailboxTokenService {
 			return false;
 		}
 
-		const cleared = await this.db.account.updateMany({
-			where: { userId, providerId },
-			data: {
+		const cleared = await this.db
+			.update(account)
+			.set({
 				accessToken: null,
 				refreshToken: null,
 				scope: null,
 				accessTokenExpiresAt: null,
 				refreshTokenExpiresAt: null,
-			},
-		});
+			})
+			.where(
+				and(eq(account.userId, userId), eq(account.providerId, providerId)),
+			)
+			.returning({ id: account.id });
 
-		if (cleared.count === 0) return false;
+		if (cleared.length === 0) return false;
 
 		this.logger.log({ message: "Mailbox access revoked", userId, providerId });
 		return true;
 	}
 
 	private async revokeWithGoogle(userId: string): Promise<boolean> {
-		const account = await this.db.account.findFirst({
-			where: { userId, providerId: GOOGLE_PROVIDER_ID },
-			select: { refreshToken: true, accessToken: true },
-		});
+		const [row] = await this.db
+			.select({
+				refreshToken: account.refreshToken,
+				accessToken: account.accessToken,
+			})
+			.from(account)
+			.where(
+				and(
+					eq(account.userId, userId),
+					eq(account.providerId, GOOGLE_PROVIDER_ID),
+				),
+			)
+			.limit(1);
 
-		const token = account?.refreshToken ?? account?.accessToken;
+		const token = row?.refreshToken ?? row?.accessToken;
 		if (!token) return true;
 
 		const response = await fetch(GOOGLE_REVOKE_URL, {

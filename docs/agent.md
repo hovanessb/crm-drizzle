@@ -26,7 +26,7 @@ agent and the API both need it.
 
 `mirror()` copies bytes to Vercel Blob; the record points at our copy. Lives in
 **`@crm/db/blob`** — writers are `lib/brand-images.ts`, `lib/portrait.ts`,
-`FaviconService`, `ImageMirrorService`, `prisma/seed.ts`.
+`FaviconService`, `ImageMirrorService`, `scripts/seed.ts`.
 
 - **The key hashes the bytes** — idempotent, and a redesigned mark gets a new URL.
 - **`COMPANY_IMAGE_FIELDS` (`@crm/db/images`) is the one list of picture columns.**

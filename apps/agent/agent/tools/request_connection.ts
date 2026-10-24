@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { and, db, eq, firstRow, mcpConnection, whereEq } from "@crm/db";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import { vendors } from "@crm/mcp-integrations/catalog";
 import { agentConnectionRequest } from "@crm/validation/agent-connection-request";
@@ -28,15 +28,21 @@ export default defineTool({
 		}
 		const entry = vendors.find((candidate) => candidate.slug === vendor);
 		if (!entry) throw new Error("The MCP platform is unavailable.");
-		const connection = await db.mcpConnection.findUnique({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug: vendor,
-				},
-			},
-			select: { status: true, lastErrorCode: true },
-		});
+		const connection = await firstRow(
+			db
+				.select({
+					status: mcpConnection.status,
+					lastErrorCode: mcpConnection.lastErrorCode,
+				})
+				.from(mcpConnection)
+				.where(
+					and(
+						eq(mcpConnection.organizationId, WORKSPACE_ID),
+						whereEq(mcpConnection.platformSlug, vendor),
+					),
+				)
+				.limit(1),
+		);
 		return agentConnectionRequest.parse({
 			vendor: entry.slug,
 			name: entry.name,

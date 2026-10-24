@@ -1,5 +1,19 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	activity,
+	agentTask,
+	and,
+	company as companyTable,
+	contact as contactTable,
+	db,
+	deal as dealTable,
+	endsWith,
+	eq,
+	inArray,
+	type PgColumn,
+	suppressedContact,
+	user,
+} from "@crm/db";
 import { AgentQueueService } from "../src/agent/agent-queue.service";
 import type { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import { CompaniesService } from "../src/companies/companies.service";
@@ -11,12 +25,13 @@ import { ConversionService } from "../src/currency/conversion.service";
 import { DealsService } from "../src/deals/deals.service";
 import { FieldsService } from "../src/fields/fields.service";
 import { withDiscardedCrmEvents } from "./agent-trigger.stub";
+import { first, one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "bulk-spec";
 const domain = `bulk-${suffix}.test`;
 const ownerId = `owner-${suffix}`;
 const secondOwnerId = `second-owner-${suffix}`;
-const ours = { OR: [{ email: { endsWith: `@${domain}` } }] };
+const ours = (email: PgColumn) => endsWith(email, `@${domain}`);
 
 const agent = {
 	contactCreated: async () => true,
@@ -53,35 +68,35 @@ const deals = new DealsService(db, agent, stamp, conversion, fields);
 let companyId: string;
 
 async function clean() {
-	const owned = await db.company.findMany({
-		where: { domain: { endsWith: domain } },
-		select: { id: true },
-	});
+	const owned = await db
+		.select({ id: companyTable.id })
+		.from(companyTable)
+		.where(endsWith(companyTable.domain, domain));
 	const companyIds = owned.map((row) => row.id);
 
-	await db.deal.deleteMany({ where: { companyId: { in: companyIds } } });
-	await db.activity.deleteMany({ where: { companyId: { in: companyIds } } });
-	await db.agentTask.deleteMany({ where: { companyId: { in: companyIds } } });
-	await db.contact.deleteMany({ where: ours });
-	await db.suppressedContact.deleteMany({ where: ours });
-	await db.company.deleteMany({ where: { domain: { endsWith: domain } } });
-	await db.user.deleteMany({ where: { id: { in: [ownerId, secondOwnerId] } } });
+	await db.delete(dealTable).where(inArray(dealTable.companyId, companyIds));
+	await db.delete(activity).where(inArray(activity.companyId, companyIds));
+	await db.delete(agentTask).where(inArray(agentTask.companyId, companyIds));
+	await db.delete(contactTable).where(ours(contactTable.email));
+	await db.delete(suppressedContact).where(ours(suppressedContact.email));
+	await db.delete(companyTable).where(endsWith(companyTable.domain, domain));
+	await db.delete(user).where(inArray(user.id, [ownerId, secondOwnerId]));
 }
 
 beforeAll(async () => {
 	await clean();
 
-	await db.user.createMany({
-		data: [
-			{ id: ownerId, name: "First Rep", email: `first@${domain}` },
-			{ id: secondOwnerId, name: "Second Rep", email: `second@${domain}` },
-		],
-	});
+	await db.insert(user).values([
+		{ id: ownerId, name: "First Rep", email: `first@${domain}` },
+		{ id: secondOwnerId, name: "Second Rep", email: `second@${domain}` },
+	]);
 
-	const company = await db.company.create({
-		data: { name: `Bulk Co ${suffix}`, domain },
-		select: { id: true },
-	});
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: `Bulk Co ${suffix}`, domain })
+			.returning({ id: companyTable.id }),
+	);
 	companyId = company.id;
 });
 
@@ -114,9 +129,13 @@ describe("assigning an owner to a selection", () => {
 		});
 
 		expect(
-			await db.contact.count({
-				where: { id: { in: [first.id, second.id] }, ownerId: secondOwnerId },
-			}),
+			await db.$count(
+				contactTable,
+				and(
+					inArray(contactTable.id, [first.id, second.id]),
+					eq(contactTable.ownerId, secondOwnerId),
+				),
+			),
 		).toBe(2);
 	});
 
@@ -158,10 +177,13 @@ describe("assigning an owner to a selection", () => {
 		expect(refused?.message).toMatch(/does not work here/);
 
 		expect(
-			await db.contact.findUnique({
-				where: { id: contact.id },
-				select: { ownerId: true },
-			}),
+			await first(
+				db
+					.select({ ownerId: contactTable.ownerId })
+					.from(contactTable)
+					.where(eq(contactTable.id, contact.id))
+					.limit(1),
+			),
 		).toEqual({ ownerId: null });
 	});
 });
@@ -186,9 +208,13 @@ describe("purging a selection", () => {
 		});
 
 		expect(
-			await db.suppressedContact.count({
-				where: { email: { in: [`gone@${domain}`, `also-gone@${domain}`] } },
-			}),
+			await db.$count(
+				suppressedContact,
+				inArray(suppressedContact.email, [
+					`gone@${domain}`,
+					`also-gone@${domain}`,
+				]),
+			),
 		).toBe(2);
 	});
 
@@ -204,7 +230,13 @@ describe("purging a selection", () => {
 		expect(result.failed).toBe(1);
 		expect(result.message).toMatch(/No contact with id/);
 		expect(
-			await db.contact.findUnique({ where: { id: survivor.id } }),
+			await first(
+				db
+					.select()
+					.from(contactTable)
+					.where(eq(contactTable.id, survivor.id))
+					.limit(1),
+			),
 		).toBeNull();
 	});
 
@@ -227,7 +259,11 @@ describe("purging a selection", () => {
 			message: null,
 		});
 
-		expect(await db.deal.findUnique({ where: { id: deal.id } })).toBeNull();
+		expect(
+			await first(
+				db.select().from(dealTable).where(eq(dealTable.id, deal.id)).limit(1),
+			),
+		).toBeNull();
 	});
 });
 
@@ -251,10 +287,13 @@ describe("moving a selection of deals to a stage", () => {
 		expect(refused?.message).toMatch(/teaches nobody anything/);
 
 		expect(
-			await db.deal.findUnique({
-				where: { id: deal.id },
-				select: { stage: true },
-			}),
+			await first(
+				db
+					.select({ stage: dealTable.stage })
+					.from(dealTable)
+					.where(eq(dealTable.id, deal.id))
+					.limit(1),
+			),
 		).toEqual({ stage: "DEMO_BOOKED" });
 	});
 
@@ -287,10 +326,14 @@ describe("moving a selection of deals to a stage", () => {
 			message: null,
 		});
 
-		const closed = await db.deal.findMany({
-			where: { id: { in: [first.id, second.id] } },
-			select: { stage: true, closedReason: true, closedAt: true },
-		});
+		const closed = await db
+			.select({
+				stage: dealTable.stage,
+				closedReason: dealTable.closedReason,
+				closedAt: dealTable.closedAt,
+			})
+			.from(dealTable)
+			.where(inArray(dealTable.id, [first.id, second.id]));
 
 		expect(closed.every((deal) => deal.stage === "CLOSED_LOST")).toBe(true);
 		expect(closed.every((deal) => deal.closedReason === "Budget pulled")).toBe(
@@ -299,13 +342,14 @@ describe("moving a selection of deals to a stage", () => {
 		expect(closed.every((deal) => deal.closedAt !== null)).toBe(true);
 
 		expect(
-			await db.activity.count({
-				where: {
-					dealId: { in: [first.id, second.id] },
-					type: "STAGE_CHANGE",
-					body: "Budget pulled",
-				},
-			}),
+			await db.$count(
+				activity,
+				and(
+					inArray(activity.dealId, [first.id, second.id]),
+					eq(activity.type, "STAGE_CHANGE"),
+					eq(activity.body, "Budget pulled"),
+				),
+			),
 		).toBe(2);
 	});
 });

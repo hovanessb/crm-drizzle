@@ -1,4 +1,4 @@
-import { EnrichmentStatus } from "@crm/db";
+import { and, company, EnrichmentStatus, eq, isNull } from "@crm/db";
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import { Injectable, Logger } from "@nestjs/common";
 import { AgentTriggerService } from "../agent/agent-trigger.service";
@@ -19,29 +19,36 @@ export class CompanyDirectoryService {
 
 		const outcome = await this.agent.withCrmEvents(async (tx, emit) => {
 			await lockIdempotencyKey(tx, `company-directory:${domain}`);
-			const existing = await tx.company.findFirst({
-				where: { domain, archivedAt: null },
-				select: { id: true },
-			});
+			const [existing] = await tx
+				.select({ id: company.id })
+				.from(company)
+				.where(and(eq(company.domain, domain), isNull(company.archivedAt)))
+				.limit(1);
 			if (existing) return { id: existing.id, created: false as const };
 
-			const company = await tx.company.create({
-				data: {
+			const [created] = await tx
+				.insert(company)
+				.values({
 					name: domain,
 					domain,
 					website: `https://${domain}`,
 					enrichmentStatus: EnrichmentStatus.PENDING,
 					ownerId: options.ownerId ?? null,
-				},
-				select: { id: true, name: true, domain: true, createdAt: true },
-			});
+				})
+				.returning({
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					createdAt: company.createdAt,
+				});
+			if (!created) throw new Error("The company insert returned no row.");
 			await emit({
 				type: "company.created",
-				record: { kind: "company", id: company.id },
-				occurredAt: company.createdAt,
-				data: { name: company.name, domain: company.domain },
+				record: { kind: "company", id: created.id },
+				occurredAt: created.createdAt,
+				data: { name: created.name, domain: created.domain },
 			});
-			return { id: company.id, created: true as const };
+			return { id: created.id, created: true as const };
 		});
 		if (!outcome.created) return outcome.id;
 

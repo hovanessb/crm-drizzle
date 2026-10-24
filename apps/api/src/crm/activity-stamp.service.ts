@@ -1,4 +1,20 @@
-import { type Db, type Prisma, Prisma as PrismaNamespace } from "@crm/db";
+import {
+	activity,
+	and,
+	company,
+	contact,
+	type Db,
+	deal,
+	type Executor,
+	eq,
+	isNotNull,
+	isNull,
+	lt,
+	max,
+	or,
+	type SQL,
+	sql,
+} from "@crm/db";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
 
@@ -25,75 +41,106 @@ export class ActivityStampService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async touch(target: ActivityTarget, at: Date): Promise<void> {
-		const stale = {
-			OR: [{ lastActivityAt: null }, { lastActivityAt: { lt: at } }],
-		};
-
 		await Promise.all([
 			target.companyId
-				? this.db.company.updateMany({
-						where: { id: target.companyId, ...stale },
-						data: { lastActivityAt: at },
-					})
+				? this.db
+						.update(company)
+						.set({ lastActivityAt: at })
+						.where(
+							and(
+								eq(company.id, target.companyId),
+								or(
+									isNull(company.lastActivityAt),
+									lt(company.lastActivityAt, at),
+								),
+							),
+						)
 				: null,
 			target.contactId
-				? this.db.contact.updateMany({
-						where: { id: target.contactId, ...stale },
-						data: { lastActivityAt: at },
-					})
+				? this.db
+						.update(contact)
+						.set({ lastActivityAt: at })
+						.where(
+							and(
+								eq(contact.id, target.contactId),
+								or(
+									isNull(contact.lastActivityAt),
+									lt(contact.lastActivityAt, at),
+								),
+							),
+						)
 				: null,
 			target.dealId
-				? this.db.deal.updateMany({
-						where: { id: target.dealId, ...stale },
-						data: { lastActivityAt: at },
-					})
+				? this.db
+						.update(deal)
+						.set({ lastActivityAt: at })
+						.where(
+							and(
+								eq(deal.id, target.dealId),
+								or(isNull(deal.lastActivityAt), lt(deal.lastActivityAt, at)),
+							),
+						)
 				: null,
 		]);
 	}
 
+	private async latest(where: SQL): Promise<Date | null> {
+		const [row] = await this.db
+			.select({ at: max(activity.createdAt) })
+			.from(activity)
+			.where(where);
+		return row?.at ?? null;
+	}
+
 	async recompute(target: ActivityTarget): Promise<void> {
 		if (target.companyId) {
-			const { _max } = await this.db.activity.aggregate({
-				where: { companyId: target.companyId },
-				_max: { createdAt: true },
-			});
-			await this.db.company.update({
-				where: { id: target.companyId },
-				data: { lastActivityAt: _max.createdAt },
-			});
+			const lastActivityAt = await this.latest(
+				eq(activity.companyId, target.companyId),
+			);
+			await this.db
+				.update(company)
+				.set({ lastActivityAt })
+				.where(eq(company.id, target.companyId));
 		}
 
 		if (target.contactId) {
-			const { _max } = await this.db.activity.aggregate({
-				where: { contactId: target.contactId },
-				_max: { createdAt: true },
-			});
-			await this.db.contact.update({
-				where: { id: target.contactId },
-				data: { lastActivityAt: _max.createdAt },
-			});
+			const lastActivityAt = await this.latest(
+				eq(activity.contactId, target.contactId),
+			);
+			await this.db
+				.update(contact)
+				.set({ lastActivityAt })
+				.where(eq(contact.id, target.contactId));
 		}
 
 		if (target.dealId) {
-			const { _max } = await this.db.activity.aggregate({
-				where: { dealId: target.dealId },
-				_max: { createdAt: true },
-			});
-			await this.db.deal.update({
-				where: { id: target.dealId },
-				data: { lastActivityAt: _max.createdAt },
-			});
+			const lastActivityAt = await this.latest(
+				eq(activity.dealId, target.dealId),
+			);
+			await this.db
+				.update(deal)
+				.set({ lastActivityAt })
+				.where(eq(deal.id, target.dealId));
 		}
 	}
 
 	async targetsOf(
-		where: Prisma.ActivityWhereInput,
-		client: Prisma.TransactionClient = this.db,
+		where: SQL | undefined,
+		client: Executor = this.db,
 	): Promise<StampTargets> {
 		const [companies, contacts, deals] = await Promise.all([
-			client.activity.groupBy({ by: ["companyId"], where }),
-			client.activity.groupBy({ by: ["contactId"], where }),
-			client.activity.groupBy({ by: ["dealId"], where }),
+			client
+				.selectDistinct({ companyId: activity.companyId })
+				.from(activity)
+				.where(and(where, isNotNull(activity.companyId))),
+			client
+				.selectDistinct({ contactId: activity.contactId })
+				.from(activity)
+				.where(and(where, isNotNull(activity.contactId))),
+			client
+				.selectDistinct({ dealId: activity.dealId })
+				.from(activity)
+				.where(and(where, isNotNull(activity.dealId))),
 		]);
 
 		return {
@@ -112,7 +159,9 @@ export class ActivityStampService {
 
 		if (statements.length === 0) return;
 
-		await this.db.$transaction(statements);
+		await this.db.transaction(async (tx) => {
+			for (const statement of statements) await tx.execute(statement);
+		});
 	}
 
 	async recomputeAfterDelete(
@@ -133,23 +182,26 @@ export class ActivityStampService {
 		}
 	}
 
-	private restamp(table: string, column: string, ids: string[]) {
+	private restamp(table: string, column: string, ids: string[]): SQL | null {
 		if (ids.length === 0) return null;
 
-		const record = PrismaNamespace.raw(`"${table}"`);
-		const key = PrismaNamespace.raw(`"${column}"`);
+		const record = sql.identifier(table);
+		const key = sql.identifier(column);
 
-		return this.db.$executeRaw`
+		return sql`
 			UPDATE ${record} r
 			SET "lastActivityAt" = (
 				SELECT MAX(a."createdAt") FROM "activity" a WHERE a.${key} = r.id
 			)
-			WHERE r.id IN (${PrismaNamespace.join(ids)})`;
+			WHERE r.id IN (${sql.join(
+				ids.map((id) => sql`${id}`),
+				sql`, `,
+			)})`;
 	}
 
 	async recomputeAll(): Promise<void> {
-		await this.db.$transaction([
-			this.db.$executeRaw`
+		const statements = [
+			sql`
 				UPDATE "company" c
 				SET "lastActivityAt" = a.max
 				FROM (
@@ -157,11 +209,11 @@ export class ActivityStampService {
 					FROM "activity" WHERE "companyId" IS NOT NULL GROUP BY "companyId"
 				) a
 				WHERE c.id = a.id AND c."lastActivityAt" IS DISTINCT FROM a.max`,
-			this.db.$executeRaw`
+			sql`
 				UPDATE "company" SET "lastActivityAt" = NULL
 				WHERE "lastActivityAt" IS NOT NULL
 				AND id NOT IN (SELECT "companyId" FROM "activity" WHERE "companyId" IS NOT NULL)`,
-			this.db.$executeRaw`
+			sql`
 				UPDATE "contact" c
 				SET "lastActivityAt" = a.max
 				FROM (
@@ -169,11 +221,11 @@ export class ActivityStampService {
 					FROM "activity" WHERE "contactId" IS NOT NULL GROUP BY "contactId"
 				) a
 				WHERE c.id = a.id AND c."lastActivityAt" IS DISTINCT FROM a.max`,
-			this.db.$executeRaw`
+			sql`
 				UPDATE "contact" SET "lastActivityAt" = NULL
 				WHERE "lastActivityAt" IS NOT NULL
 				AND id NOT IN (SELECT "contactId" FROM "activity" WHERE "contactId" IS NOT NULL)`,
-			this.db.$executeRaw`
+			sql`
 				UPDATE "deal" d
 				SET "lastActivityAt" = a.max
 				FROM (
@@ -181,10 +233,14 @@ export class ActivityStampService {
 					FROM "activity" WHERE "dealId" IS NOT NULL GROUP BY "dealId"
 				) a
 				WHERE d.id = a.id AND d."lastActivityAt" IS DISTINCT FROM a.max`,
-			this.db.$executeRaw`
+			sql`
 				UPDATE "deal" SET "lastActivityAt" = NULL
 				WHERE "lastActivityAt" IS NOT NULL
 				AND id NOT IN (SELECT "dealId" FROM "activity" WHERE "dealId" IS NOT NULL)`,
-		]);
+		];
+
+		await this.db.transaction(async (tx) => {
+			for (const statement of statements) await tx.execute(statement);
+		});
 	}
 }

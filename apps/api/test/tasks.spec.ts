@@ -1,11 +1,20 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { ActivityType, db } from "@crm/db";
+import {
+	ActivityType,
+	activity,
+	and,
+	company as companyTable,
+	db,
+	eq,
+	user,
+} from "@crm/db";
 import { ActivitiesService } from "../src/activities/activities.service";
 import {
 	serializeTaskDueDay,
 	taskDayBoundaries,
 } from "../src/activities/task-due-date";
 import { ActivityStampService } from "../src/crm/activity-stamp.service";
+import { one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "tasks-spec";
 const userId = `tasks-user-${suffix}`;
@@ -15,55 +24,58 @@ const activities = new ActivitiesService(db, stamp);
 let companyId: string;
 
 async function clean() {
-	await db.activity.deleteMany({ where: { createdById: userId } });
-	await db.company.deleteMany({ where: { domain } });
-	await db.user.deleteMany({ where: { id: userId } });
+	await db.delete(activity).where(eq(activity.createdById, userId));
+	await db.delete(companyTable).where(eq(companyTable.domain, domain));
+	await db.delete(user).where(eq(user.id, userId));
 }
 
 beforeAll(async () => {
 	await clean();
-	await db.user.create({
-		data: { id: userId, name: "Task Owner", email: `owner@${domain}` },
-	});
-	const company = await db.company.create({
-		data: { name: "Task Company", domain },
-		select: { id: true },
-	});
+	await one(
+		db
+			.insert(user)
+			.values({ id: userId, name: "Task Owner", email: `owner@${domain}` })
+			.returning(),
+	);
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: "Task Company", domain })
+			.returning({ id: companyTable.id }),
+	);
 	companyId = company.id;
 
 	const { startOfToday } = taskDayBoundaries(new Date());
 	const yesterday = new Date(startOfToday.getTime() - 86_400_000);
-	await db.activity.createMany({
-		data: [
-			{
-				type: ActivityType.TASK,
-				subject: "Ship 100% complete",
-				dueAt: startOfToday,
-				companyId,
-				createdById: userId,
-			},
-			{
-				type: ActivityType.TASK,
-				subject: "Past task",
-				dueAt: yesterday,
-				companyId,
-				createdById: userId,
-			},
-			{
-				type: ActivityType.TASK,
-				subject: "No date task",
-				companyId,
-				createdById: userId,
-			},
-			{
-				type: ActivityType.TASK,
-				subject: "Done task",
-				completedAt: new Date(),
-				companyId,
-				createdById: userId,
-			},
-		],
-	});
+	await db.insert(activity).values([
+		{
+			type: ActivityType.TASK,
+			subject: "Ship 100% complete",
+			dueAt: startOfToday,
+			companyId,
+			createdById: userId,
+		},
+		{
+			type: ActivityType.TASK,
+			subject: "Past task",
+			dueAt: yesterday,
+			companyId,
+			createdById: userId,
+		},
+		{
+			type: ActivityType.TASK,
+			subject: "No date task",
+			companyId,
+			createdById: userId,
+		},
+		{
+			type: ActivityType.TASK,
+			subject: "Done task",
+			completedAt: new Date(),
+			companyId,
+			createdById: userId,
+		},
+	]);
 });
 
 afterAll(clean);
@@ -138,10 +150,18 @@ describe("task list", () => {
 
 describe("task editing", () => {
 	it("updates a task with a calendar day", async () => {
-		const task = await db.activity.findFirstOrThrow({
-			where: { createdById: userId, subject: "No date task" },
-			select: { id: true },
-		});
+		const task = await one(
+			db
+				.select({ id: activity.id })
+				.from(activity)
+				.where(
+					and(
+						eq(activity.createdById, userId),
+						eq(activity.subject, "No date task"),
+					),
+				)
+				.limit(1),
+		);
 
 		const updated = await activities.update({
 			id: task.id,

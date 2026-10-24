@@ -1,4 +1,18 @@
-import { db } from "@crm/db";
+import {
+	and,
+	asc,
+	db,
+	desc,
+	type Executor,
+	eq,
+	fieldDefinition,
+	fieldOption,
+	fieldValue,
+	firstRow,
+	isNull,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import type { FieldEntity, FieldType } from "@crm/db/enums";
 import {
 	attachValues,
@@ -16,18 +30,33 @@ import {
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import { currentFocus } from "./focus";
 
-const WITH_OPTIONS = { options: { orderBy: { position: "asc" } } } as const;
+const WITH_OPTIONS = { options: { orderBy: [asc(fieldOption.position)] } };
 
 export type { FieldEntity, FieldType, RecordField, SerializedField };
 
 async function definitionsFor(
 	entity: FieldEntity,
 ): Promise<FieldDefinitionWithOptions[]> {
-	return db.fieldDefinition.findMany({
-		where: { entity, archivedAt: null },
-		include: WITH_OPTIONS,
-		orderBy: { position: "asc" },
+	return db.query.fieldDefinition.findMany({
+		where: and(
+			eq(fieldDefinition.entity, entity),
+			isNull(fieldDefinition.archivedAt),
+		),
+		with: WITH_OPTIONS,
+		orderBy: [asc(fieldDefinition.position)],
 	});
+}
+
+async function definitionWithOptions(
+	executor: Executor,
+	id: string,
+): Promise<FieldDefinitionWithOptions> {
+	const definition = await executor.query.fieldDefinition.findFirst({
+		where: eq(fieldDefinition.id, id),
+		with: WITH_OPTIONS,
+	});
+	if (!definition) throw new Error(`No field definition with id ${id}.`);
+	return definition;
 }
 
 export async function listFields(
@@ -45,7 +74,7 @@ export async function readFields(
 
 	const [definitions, rows] = await Promise.all([
 		definitionsFor(entity),
-		db.fieldValue.findMany({ where: { [column]: recordId } }),
+		db.select().from(fieldValue).where(eq(fieldValue[column], recordId)),
 	]);
 
 	return attachValues(definitions, rows);
@@ -81,7 +110,7 @@ export async function writeField(input: {
 	const isBackfill = currentFocus().taskKind === "field-backfill";
 
 	try {
-		return await db.$transaction(async (tx) => {
+		return await db.transaction(async (tx) => {
 			if (isBackfill) {
 				const column = recordColumn(input.entity);
 				await lockIdempotencyKey(
@@ -89,9 +118,18 @@ export async function writeField(input: {
 					`field-value:${definition.id}:${input.recordId}`,
 				);
 
-				const row = await tx.fieldValue.findFirst({
-					where: { fieldId: definition.id, [column]: input.recordId },
-				});
+				const row = await firstRow(
+					tx
+						.select()
+						.from(fieldValue)
+						.where(
+							and(
+								eq(fieldValue.fieldId, definition.id),
+								eq(fieldValue[column], input.recordId),
+							),
+						)
+						.limit(1),
+				);
 
 				if (readValue(definition, row ?? undefined) !== null) {
 					return {
@@ -129,10 +167,18 @@ export async function createField(input: {
 		return { created: false, reason: "That label does not make a usable key." };
 	}
 
-	const taken = await db.fieldDefinition.findUnique({
-		where: { entity_key: { entity: input.entity, key } },
-		select: { id: true },
-	});
+	const taken = await firstRow(
+		db
+			.select({ id: fieldDefinition.id })
+			.from(fieldDefinition)
+			.where(
+				and(
+					whereEq(fieldDefinition.entity, input.entity),
+					whereEq(fieldDefinition.key, key),
+				),
+			)
+			.limit(1),
+	);
 
 	if (taken) {
 		return {
@@ -145,30 +191,40 @@ export async function createField(input: {
 		return { created: false, reason: "A select needs at least one option." };
 	}
 
-	const last = await db.fieldDefinition.findFirst({
-		where: { entity: input.entity },
-		orderBy: { position: "desc" },
-		select: { position: true },
-	});
+	const last = await firstRow(
+		db
+			.select({ position: fieldDefinition.position })
+			.from(fieldDefinition)
+			.where(whereEq(fieldDefinition.entity, input.entity))
+			.orderBy(desc(fieldDefinition.position))
+			.limit(1),
+	);
 
-	const definition = await db.fieldDefinition.create({
-		data: {
-			entity: input.entity,
-			key,
-			label: input.label,
-			type: input.type,
-			agentBrief: input.agentBrief ?? null,
-			position: (last?.position ?? -1) + 1,
-			options: usesOptions(input.type)
-				? {
-						create: (input.options ?? []).map((label, index) => ({
-							label,
-							position: index,
-						})),
-					}
-				: undefined,
-		},
-		include: WITH_OPTIONS,
+	const definition = await db.transaction(async (tx) => {
+		const created = await requireRow(
+			tx
+				.insert(fieldDefinition)
+				.values({
+					entity: input.entity,
+					key,
+					label: input.label,
+					type: input.type,
+					agentBrief: input.agentBrief ?? null,
+					position: (last?.position ?? -1) + 1,
+				})
+				.returning({ id: fieldDefinition.id }),
+		);
+		const options = usesOptions(input.type) ? (input.options ?? []) : [];
+		if (options.length > 0) {
+			await tx.insert(fieldOption).values(
+				options.map((label, index) => ({
+					fieldId: created.id,
+					label,
+					position: index,
+				})),
+			);
+		}
+		return definitionWithOptions(tx, created.id);
 	});
 
 	return serializeField(definition);
@@ -180,10 +236,18 @@ export async function updateFieldBrief(input: {
 	agentBrief: string | null;
 	agentFilled?: boolean;
 }): Promise<SerializedField | { updated: false; reason: string }> {
-	const existing = await db.fieldDefinition.findUnique({
-		where: { entity_key: { entity: input.entity, key: input.key } },
-		select: { id: true },
-	});
+	const existing = await firstRow(
+		db
+			.select({ id: fieldDefinition.id })
+			.from(fieldDefinition)
+			.where(
+				and(
+					whereEq(fieldDefinition.entity, input.entity),
+					whereEq(fieldDefinition.key, input.key),
+				),
+			)
+			.limit(1),
+	);
 
 	if (!existing) {
 		return {
@@ -192,11 +256,11 @@ export async function updateFieldBrief(input: {
 		};
 	}
 
-	const definition = await db.fieldDefinition.update({
-		where: { id: existing.id },
-		data: { agentBrief: input.agentBrief, agentFilled: input.agentFilled },
-		include: WITH_OPTIONS,
-	});
+	await db
+		.update(fieldDefinition)
+		.set({ agentBrief: input.agentBrief, agentFilled: input.agentFilled })
+		.where(eq(fieldDefinition.id, existing.id));
+	const definition = await definitionWithOptions(db, existing.id);
 
 	return serializeField(definition);
 }
@@ -205,10 +269,18 @@ export async function archiveField(input: {
 	entity: FieldEntity;
 	key: string;
 }): Promise<{ archived: boolean; reason?: string }> {
-	const existing = await db.fieldDefinition.findUnique({
-		where: { entity_key: { entity: input.entity, key: input.key } },
-		select: { id: true },
-	});
+	const existing = await firstRow(
+		db
+			.select({ id: fieldDefinition.id })
+			.from(fieldDefinition)
+			.where(
+				and(
+					whereEq(fieldDefinition.entity, input.entity),
+					whereEq(fieldDefinition.key, input.key),
+				),
+			)
+			.limit(1),
+	);
 
 	if (!existing) {
 		return {
@@ -217,10 +289,13 @@ export async function archiveField(input: {
 		};
 	}
 
-	await db.fieldDefinition.update({
-		where: { id: existing.id },
-		data: { archivedAt: new Date() },
-	});
+	await requireRow(
+		db
+			.update(fieldDefinition)
+			.set({ archivedAt: new Date() })
+			.where(whereEq(fieldDefinition.id, existing.id))
+			.returning(),
+	);
 
 	return { archived: true };
 }

@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { asc, type Db, user } from "@crm/db";
 import { Injectable } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
 
@@ -14,9 +14,14 @@ export class UsersService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async list(): Promise<UserOption[]> {
-		return this.db.user.findMany({
-			select: { id: true, name: true, email: true, image: true },
-			orderBy: [{ name: "asc" }, { email: "asc" }],
-		});
+		return this.db
+			.select({
+				id: user.id,
+				name: user.name,
+				email: user.email,
+				image: user.image,
+			})
+			.from(user)
+			.orderBy(asc(user.name), asc(user.email));
 	}
 }

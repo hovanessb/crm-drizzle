@@ -1,4 +1,16 @@
-import { db, type Prisma } from "@crm/db";
+import {
+	and,
+	db,
+	desc,
+	firstRow,
+	type JsonValue,
+	mcpConnection,
+	mcpToolSnapshot,
+	ne,
+	notInArray,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { vendorAccess, vendorBySlug } from "@crm/mcp-integrations/catalog";
 import {
 	classifyTool,
@@ -21,16 +33,24 @@ const toolsReply = z.object({
 });
 
 export async function runMcpToolDiscovery(
-	payload: Prisma.JsonValue | null,
+	payload: JsonValue | null,
 ): Promise<string> {
 	const input = discoveryPayload.parse(payload);
 	const vendor = vendorBySlug(input.platformSlug);
 	if (!vendor) throw new Error("The MCP platform is unavailable.");
 
-	const connection = await db.mcpConnection.findUnique({
-		where: { id: input.connectionId },
-		select: { id: true, platformSlug: true, status: true, accessMode: true },
-	});
+	const connection = await firstRow(
+		db
+			.select({
+				id: mcpConnection.id,
+				platformSlug: mcpConnection.platformSlug,
+				status: mcpConnection.status,
+				accessMode: mcpConnection.accessMode,
+			})
+			.from(mcpConnection)
+			.where(whereEq(mcpConnection.id, input.connectionId))
+			.limit(1),
+	);
 	if (
 		!connection ||
 		connection.platformSlug !== vendor.slug ||
@@ -45,21 +65,27 @@ export async function runMcpToolDiscovery(
 			connection.accessMode === "READ_ONLY" ? "read_only" : "read_write";
 		const tools = await listTools(vendorAccess(vendor, mode).url, token.token);
 		await storeTools(connection.id, vendor, tools);
-		await db.mcpConnection.update({
-			where: { id: connection.id },
-			data: {
-				status: "CONNECTED",
-				lastSuccessfulCallAt: new Date(),
-				lastErrorCode: null,
-			},
-		});
+		await requireRow(
+			db
+				.update(mcpConnection)
+				.set({
+					status: "CONNECTED",
+					lastSuccessfulCallAt: new Date(),
+					lastErrorCode: null,
+				})
+				.where(whereEq(mcpConnection.id, connection.id))
+				.returning(),
+		);
 		return `Discovered ${tools.length} ${vendor.name} MCP tools.`;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "discovery_failed";
-		await db.mcpConnection.update({
-			where: { id: connection.id },
-			data: { status: "ERROR", lastErrorCode: message.slice(0, 120) },
-		});
+		await requireRow(
+			db
+				.update(mcpConnection)
+				.set({ status: "ERROR", lastErrorCode: message.slice(0, 120) })
+				.where(whereEq(mcpConnection.id, connection.id))
+				.returning(),
+		);
 		throw error;
 	}
 }
@@ -85,10 +111,11 @@ async function storeTools(
 	vendor: NonNullable<ReturnType<typeof vendorBySlug>>,
 	tools: z.infer<typeof toolsReply>["tools"],
 ): Promise<void> {
-	const existing = await db.mcpToolSnapshot.findMany({
-		where: { connectionId },
-		orderBy: { createdAt: "desc" },
-	});
+	const existing = await db
+		.select()
+		.from(mcpToolSnapshot)
+		.where(whereEq(mcpToolSnapshot.connectionId, connectionId))
+		.orderBy(desc(mcpToolSnapshot.createdAt));
 	const latest = new Map<string, (typeof existing)[number]>();
 	for (const snapshot of existing) {
 		if (!latest.has(snapshot.name)) latest.set(snapshot.name, snapshot);
@@ -96,67 +123,77 @@ async function storeTools(
 	const seen = new Set(tools.map((tool) => tool.name));
 	const now = new Date();
 
-	await db.$transaction(async (tx) => {
+	await db.transaction(async (tx) => {
 		for (const tool of tools) {
 			const fingerprint = toolFingerprint(tool);
 			const previous = latest.get(tool.name);
 			if (previous?.fingerprint === fingerprint) {
-				await tx.mcpToolSnapshot.update({
-					where: { id: previous.id },
-					data: {
-						lastSeenAt: now,
-						reviewState:
-							previous.reviewState === "REMOVED" ? "PENDING" : undefined,
-					},
-				});
+				await requireRow(
+					tx
+						.update(mcpToolSnapshot)
+						.set({
+							lastSeenAt: now,
+							reviewState:
+								previous.reviewState === "REMOVED" ? "PENDING" : undefined,
+						})
+						.where(whereEq(mcpToolSnapshot.id, previous.id))
+						.returning(),
+				);
 				continue;
 			}
 
-			await tx.mcpToolSnapshot.updateMany({
-				where: {
-					connectionId,
-					name: tool.name,
-					reviewState: { not: "REMOVED" },
-				},
-				data: { reviewState: "CHANGED" },
-			});
-			await tx.mcpToolSnapshot.upsert({
-				where: {
-					connectionId_name_fingerprint: {
+			await tx
+				.update(mcpToolSnapshot)
+				.set({ reviewState: "CHANGED" })
+				.where(
+					and(
+						whereEq(mcpToolSnapshot.connectionId, connectionId),
+						whereEq(mcpToolSnapshot.name, tool.name),
+						ne(mcpToolSnapshot.reviewState, "REMOVED"),
+					),
+				);
+			await requireRow(
+				tx
+					.insert(mcpToolSnapshot)
+					.values({
 						connectionId,
 						name: tool.name,
+						description: tool.description,
+						inputSchema: tool.inputSchema,
+						annotations: tool.annotations,
 						fingerprint,
-					},
-				},
-				create: {
-					connectionId,
-					name: tool.name,
-					description: tool.description,
-					inputSchema: tool.inputSchema,
-					annotations: tool.annotations,
-					fingerprint,
-					callKind: classifyTool(vendor, tool),
-					reviewState: "PENDING",
-					lastSeenAt: now,
-				},
-				update: {
-					description: tool.description,
-					inputSchema: tool.inputSchema,
-					annotations: tool.annotations,
-					callKind: classifyTool(vendor, tool),
-					reviewState: "PENDING",
-					lastSeenAt: now,
-				},
-			});
+						callKind: classifyTool(vendor, tool),
+						reviewState: "PENDING",
+						lastSeenAt: now,
+					})
+					.onConflictDoUpdate({
+						target: [
+							mcpToolSnapshot.connectionId,
+							mcpToolSnapshot.name,
+							mcpToolSnapshot.fingerprint,
+						],
+						set: {
+							description: tool.description,
+							inputSchema: tool.inputSchema,
+							annotations: tool.annotations,
+							callKind: classifyTool(vendor, tool),
+							reviewState: "PENDING",
+							lastSeenAt: now,
+						},
+					})
+					.returning(),
+			);
 		}
 
-		await tx.mcpToolSnapshot.updateMany({
-			where: {
-				connectionId,
-				name: { notIn: [...seen] },
-				reviewState: { not: "REMOVED" },
-			},
-			data: { reviewState: "REMOVED" },
-		});
+		await tx
+			.update(mcpToolSnapshot)
+			.set({ reviewState: "REMOVED" })
+			.where(
+				and(
+					whereEq(mcpToolSnapshot.connectionId, connectionId),
+					notInArray(mcpToolSnapshot.name, [...seen]),
+					ne(mcpToolSnapshot.reviewState, "REMOVED"),
+				),
+			);
 	});
 }

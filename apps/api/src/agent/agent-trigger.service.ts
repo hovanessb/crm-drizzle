@@ -1,4 +1,21 @@
-import { type Db, type FieldEntity, Prisma } from "@crm/db";
+import {
+	agentRun,
+	agentTask,
+	and,
+	type Db,
+	desc,
+	type Executor,
+	eq,
+	type FieldEntity,
+	gte,
+	inArray,
+	isNotNull,
+	isNull,
+	type JsonObject,
+	type JsonValue,
+	type NewAgentTask,
+	sql,
+} from "@crm/db";
 import { PRIORITY } from "@crm/db/agent-tasks";
 import { CRM_EVENT_CATALOG, type CrmEventType } from "@crm/db/crm-events";
 import { RECORD_ID_COLUMNS } from "@crm/db/fields";
@@ -17,7 +34,7 @@ export type CrmEventInput = {
 			id: string;
 		};
 		occurredAt: Date;
-		data: Prisma.InputJsonObject;
+		data: JsonObject;
 	};
 }[CrmEventType];
 
@@ -150,14 +167,11 @@ export class AgentTriggerService {
 	}
 
 	async withTasks<Result>(
-		work: (
-			tx: Prisma.TransactionClient,
-			queue: AgentTaskQueue,
-		) => Promise<Result>,
+		work: (tx: Executor, queue: AgentTaskQueue) => Promise<Result>,
 	): Promise<Result> {
 		let queued = false;
 
-		const result = await this.db.$transaction((tx) =>
+		const result = await this.db.transaction((tx) =>
 			work(tx, {
 				slackChannelJoinRequested: async (channelId, channelName) => {
 					const created = await this.queueSlackChannelJoin(
@@ -178,7 +192,7 @@ export class AgentTriggerService {
 	private queueSlackChannelJoin(
 		channelId: string,
 		channelName: string,
-		client?: Prisma.TransactionClient,
+		client?: Executor,
 	): Promise<boolean> {
 		return this.enqueue(
 			{
@@ -200,12 +214,12 @@ export class AgentTriggerService {
 
 	async withCrmEvents<Result>(
 		work: (
-			tx: Prisma.TransactionClient,
+			tx: Executor,
 			emit: (input: CrmEventInput) => Promise<void>,
 		) => Promise<Result>,
 	): Promise<Result> {
 		let queued: CrmEventInput[] = [];
-		const result = await this.db.$transaction(async (tx) => {
+		const result = await this.db.transaction(async (tx) => {
 			const pending: CrmEventInput[] = [];
 			const completed = await work(tx, async (input) => {
 				pending.push(input);
@@ -239,27 +253,30 @@ export class AgentTriggerService {
 
 		const column = RECORD_ID_COLUMNS[entity];
 		const dueAt = new Date();
-		const data: Prisma.AgentTaskCreateManyInput[] = recordIds.map((id) => ({
+		const data: NewAgentTask[] = recordIds.map((id) => ({
 			[column]: id,
 			kind: "field-backfill",
 			reason,
 			priority: PRIORITY.fieldBackfill,
 			budget: 8,
 			dueAt,
-			payload: { entity, keys } satisfies Prisma.InputJsonValue,
+			payload: { entity, keys } satisfies JsonValue,
 		}));
-		const result = await this.db.agentTask.createMany({ data });
+		const inserted = await this.db
+			.insert(agentTask)
+			.values(data)
+			.returning({ id: agentTask.id });
 
 		this.logger.log({
 			message: "Agent task queued",
 			kind: "field-backfill",
 			entity,
 			keys,
-			queued: result.count,
+			queued: inserted.length,
 		});
-		if (result.count > 0) this.poke();
+		if (inserted.length > 0) this.poke();
 
-		return { queued: result.count };
+		return { queued: inserted.length };
 	}
 
 	async fieldBackfillRecords(
@@ -278,32 +295,33 @@ export class AgentTriggerService {
 
 		const queueOne = async (id: string): Promise<void> => {
 			try {
-				const outcome = await this.db.$transaction(async (tx) => {
+				const outcome = await this.db.transaction(async (tx) => {
 					await lockIdempotencyKey(
 						tx,
 						`agent-task:field-backfill:${entity}:${id}`,
 					);
 
-					const pending = await tx.agentTask.findFirst({
-						where: {
-							kind: "field-backfill",
-							finishedAt: null,
-							[column]: id,
-						} as Prisma.AgentTaskWhereInput,
-						select: { id: true, payload: true },
-					});
+					const [pending] = await tx
+						.select({ id: agentTask.id, payload: agentTask.payload })
+						.from(agentTask)
+						.where(
+							and(
+								eq(agentTask.kind, "field-backfill"),
+								isNull(agentTask.finishedAt),
+								eq(agentTask[column], id),
+							),
+						)
+						.limit(1);
 
 					if (!pending) {
-						await tx.agentTask.create({
-							data: {
-								[column]: id,
-								kind: "field-backfill",
-								reason,
-								priority: PRIORITY.fieldBackfill,
-								budget: 8,
-								dueAt: new Date(),
-								payload: { entity, keys } satisfies Prisma.InputJsonValue,
-							},
+						await tx.insert(agentTask).values({
+							[column]: id,
+							kind: "field-backfill",
+							reason,
+							priority: PRIORITY.fieldBackfill,
+							budget: 8,
+							dueAt: new Date(),
+							payload: { entity, keys } satisfies JsonValue,
 						});
 						return "queued" as const;
 					}
@@ -313,15 +331,10 @@ export class AgentTriggerService {
 					const nextKeys = [...new Set([...priorKeys, ...keys])];
 					if (nextKeys.length === priorKeys.length) return "unchanged" as const;
 
-					await tx.agentTask.update({
-						where: { id: pending.id },
-						data: {
-							payload: {
-								entity,
-								keys: nextKeys,
-							} satisfies Prisma.InputJsonValue,
-						},
-					});
+					await tx
+						.update(agentTask)
+						.set({ payload: { entity, keys: nextKeys } satisfies JsonValue })
+						.where(eq(agentTask.id, pending.id));
 					return "merged" as const;
 				});
 
@@ -388,17 +401,19 @@ export class AgentTriggerService {
 			const since = new Date(
 				Date.now() - AGENT_DISPATCH.cancel.redeliverWithinMs,
 			);
-			const runs = await this.db.agentRun.findMany({
-				where: {
-					status: "CANCELLED",
-					errorCode: AGENT_DISPATCH.cancel.errorCode,
-					startedAt: { not: null },
-					finishedAt: { gte: since },
-				},
-				orderBy: { finishedAt: "desc" },
-				take: AGENT_DISPATCH.cancel.redeliverBatch,
-				select: { id: true },
-			});
+			const runs = await this.db
+				.select({ id: agentRun.id })
+				.from(agentRun)
+				.where(
+					and(
+						eq(agentRun.status, "CANCELLED"),
+						eq(agentRun.errorCode, AGENT_DISPATCH.cancel.errorCode),
+						isNotNull(agentRun.startedAt),
+						gte(agentRun.finishedAt, since),
+					),
+				)
+				.orderBy(desc(agentRun.finishedAt))
+				.limit(AGENT_DISPATCH.cancel.redeliverBatch);
 
 			const outstanding = new Set(runs.map((run) => run.id));
 			for (const runId of this.cancellationsDelivered) {
@@ -435,14 +450,19 @@ export class AgentTriggerService {
 		if (ids.length === 0) return { queued: 0, alreadyQueued: 0 };
 
 		try {
-			const outstanding = await this.db.agentTask.findMany({
-				where: {
-					kind: input.kind,
-					finishedAt: null,
-					[subject]: { in: ids },
-				},
-				select: { companyId: true, contactId: true },
-			});
+			const outstanding = await this.db
+				.select({
+					companyId: agentTask.companyId,
+					contactId: agentTask.contactId,
+				})
+				.from(agentTask)
+				.where(
+					and(
+						eq(agentTask.kind, input.kind),
+						isNull(agentTask.finishedAt),
+						inArray(agentTask[subject], ids),
+					),
+				);
 
 			const taken = new Set(
 				outstanding.map((row) =>
@@ -452,8 +472,8 @@ export class AgentTriggerService {
 			const fresh = ids.filter((id) => !taken.has(id));
 
 			if (fresh.length > 0) {
-				await this.db.agentTask.createMany({
-					data: fresh.map((id) => ({
+				await this.db.insert(agentTask).values(
+					fresh.map((id) => ({
 						contactId: input.contactIds ? id : null,
 						companyId: input.companyIds ? id : null,
 						kind: input.kind,
@@ -462,7 +482,7 @@ export class AgentTriggerService {
 						budget: input.budget ?? 4,
 						dueAt: new Date(),
 					})),
-				});
+				);
 			}
 
 			this.logger.log({
@@ -495,50 +515,55 @@ export class AgentTriggerService {
 			reason: string;
 			priority: number;
 			budget: number;
-			payload?: Prisma.InputJsonValue;
+			payload?: JsonValue;
 			subject?: { path: string[]; value: string };
 		},
 		required = false,
-		client?: Prisma.TransactionClient,
+		client?: Executor,
 	): Promise<boolean> {
 		try {
-			const write = async (tx: Prisma.TransactionClient) => {
+			const write = async (tx: Executor) => {
 				await lockIdempotencyKey(
 					tx,
 					`agent-task:${task.kind}:${task.contactId ?? ""}:${task.companyId ?? ""}:${task.subject?.value ?? ""}`,
 				);
-				const pending = await tx.agentTask.findFirst({
-					where: {
-						kind: task.kind,
-						finishedAt: null,
-						contactId: task.contactId ?? undefined,
-						companyId: task.companyId ?? undefined,
-						payload: task.subject
-							? { path: task.subject.path, equals: task.subject.value }
-							: undefined,
-					},
-					select: { id: true },
-				});
+				const [pending] = await tx
+					.select({ id: agentTask.id })
+					.from(agentTask)
+					.where(
+						and(
+							eq(agentTask.kind, task.kind),
+							isNull(agentTask.finishedAt),
+							task.contactId
+								? eq(agentTask.contactId, task.contactId)
+								: undefined,
+							task.companyId
+								? eq(agentTask.companyId, task.companyId)
+								: undefined,
+							task.subject
+								? sql`${agentTask.payload} #>> ${`{${task.subject.path.join(",")}}`} = ${task.subject.value}`
+								: undefined,
+						),
+					)
+					.limit(1);
 				if (pending) return false;
 
-				await tx.agentTask.create({
-					data: {
-						contactId: task.contactId ?? null,
-						companyId: task.companyId ?? null,
-						kind: task.kind,
-						reason: task.reason,
-						priority: task.priority,
-						budget: task.budget,
-						dueAt: new Date(),
-						payload: task.payload ?? undefined,
-					},
+				await tx.insert(agentTask).values({
+					contactId: task.contactId ?? null,
+					companyId: task.companyId ?? null,
+					kind: task.kind,
+					reason: task.reason,
+					priority: task.priority,
+					budget: task.budget,
+					dueAt: new Date(),
+					payload: task.payload,
 				});
 				return true;
 			};
 
 			const created = client
 				? await write(client)
-				: await this.db.$transaction(write);
+				: await this.db.transaction(write);
 			if (!created) return false;
 
 			this.logger.log({
@@ -562,13 +587,13 @@ export class AgentTriggerService {
 	}
 
 	private async createEventTasks(
-		tx: Prisma.TransactionClient,
+		tx: Executor,
 		inputs: CrmEventInput[],
 	): Promise<void> {
 		if (inputs.length === 0) return;
 		const dueAt = new Date();
-		await tx.agentTask.createMany({
-			data: inputs.map((input) => ({
+		await tx.insert(agentTask).values(
+			inputs.map((input) => ({
 				contactId: input.record.kind === "contact" ? input.record.id : null,
 				companyId: input.record.kind === "company" ? input.record.id : null,
 				dealId: input.record.kind === "deal" ? input.record.id : null,
@@ -584,7 +609,7 @@ export class AgentTriggerService {
 				budget: 1,
 				dueAt,
 			})),
-		});
+		);
 	}
 
 	canReachAgent(): boolean {

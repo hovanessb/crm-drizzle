@@ -1,3 +1,19 @@
+import {
+	asc,
+	type Column,
+	count,
+	desc,
+	type Executor,
+	gte,
+	inArray,
+	isNotNull,
+	isNull,
+	or,
+	type PgColumn,
+	type PgTable,
+	type SQL,
+	sql,
+} from "@crm/db";
 import { z } from "zod";
 
 export const listInput = z.object({
@@ -38,6 +54,18 @@ export interface OrderByColumns<TOrderBy> {
 	[column: string]: (dir: SortDirection) => TOrderBy;
 }
 
+type Sortable = Column | SQL | SQL.Aliased;
+
+export function sortBy(column: Sortable, dir: SortDirection): SQL {
+	return dir === "asc" ? asc(column) : desc(column);
+}
+
+export function sortNullsLast(column: Sortable, dir: SortDirection): SQL {
+	return dir === "asc"
+		? sql`${column} asc nulls last`
+		: sql`${column} desc nulls last`;
+}
+
 export function resolveOrderBy<TOrderBy>(
 	input: Pick<ListInput, "sort" | "dir">,
 	columns: OrderByColumns<TOrderBy>,
@@ -49,7 +77,7 @@ export function resolveOrderBy<TOrderBy>(
 
 export function countsByKey<
 	TKey extends string,
-	TGroup extends { _count: { _all: number } } & {
+	TGroup extends { count: number } & {
 		[K in TKey]?: string | null;
 	},
 >(groups: TGroup[], key: TKey, nullKey?: string): FacetCount {
@@ -58,10 +86,29 @@ export function countsByKey<
 	for (const group of groups) {
 		const value = group[key] ?? nullKey;
 		if (value == null) continue;
-		counts[value] = (counts[value] ?? 0) + group._count._all;
+		counts[value] = (counts[value] ?? 0) + group.count;
 	}
 
 	return counts;
+}
+
+export type GroupCount = { value: string | null; count: number };
+
+export async function groupCounts(
+	db: Executor,
+	table: PgTable,
+	column: PgColumn,
+	where: SQL | undefined,
+): Promise<GroupCount[]> {
+	const rows = await db
+		.select({ value: column, count: count() })
+		.from(table)
+		.where(where)
+		.groupBy(column);
+	return rows.map((row) => ({
+		value: row.value === null ? null : String(row.value),
+		count: Number(row.count),
+	}));
 }
 
 export const FACET_UNASSIGNED = "unassigned";
@@ -71,22 +118,17 @@ export function splitSentinel(values: string[], sentinel: string) {
 	return { ids, includesSentinel: ids.length !== values.length };
 }
 
-export function ownerFilter<
-	TWhere =
-		| { ownerId: { in: string[] } }
-		| { ownerId: null }
-		| { OR: unknown[] },
->(values: string[]): TWhere | undefined {
+export function ownerFilter(column: Column, values: string[]): SQL | undefined {
 	if (values.length === 0) return undefined;
 
 	const { ids, includesSentinel } = splitSentinel(values, FACET_UNASSIGNED);
-	if (includesSentinel && ids.length === 0) return { ownerId: null } as TWhere;
-	if (!includesSentinel) return { ownerId: { in: ids } } as TWhere;
-	return { OR: [{ ownerId: { in: ids } }, { ownerId: null }] } as TWhere;
+	if (includesSentinel && ids.length === 0) return isNull(column);
+	if (!includesSentinel) return inArray(column, ids);
+	return or(inArray(column, ids), isNull(column));
 }
 
-export function archivedFilter(archived: boolean) {
-	return { archivedAt: archived ? { not: null } : null };
+export function archivedFilter(column: Column, archived: boolean): SQL {
+	return archived ? isNotNull(column) : isNull(column);
 }
 
 const ACTIVITY_WINDOWS = ["7", "30", "90"] as const;
@@ -104,19 +146,21 @@ function activityCutoff(days: number): Date {
 }
 
 export function activityFilter(
+	column: Column,
 	values: string[],
-): { lastActivityAt: { gte: Date } } | undefined {
+): SQL | undefined {
 	if (values.length === 0) return undefined;
 	const days = values.reduce((max, value) => Math.max(max, Number(value)), 0);
-	return { lastActivityAt: { gte: activityCutoff(days) } };
+	return gte(column, activityCutoff(days));
 }
 
 export async function activityFacetCounts(
-	countWhere: (where: { lastActivityAt: { gte: Date } }) => Promise<number>,
+	column: Column,
+	countWhere: (where: SQL) => Promise<number>,
 ): Promise<FacetCount> {
 	const counts = await Promise.all(
 		ACTIVITY_WINDOWS.map((days) =>
-			countWhere({ lastActivityAt: { gte: activityCutoff(Number(days)) } }),
+			countWhere(gte(column, activityCutoff(Number(days)))),
 		),
 	);
 	return Object.fromEntries(

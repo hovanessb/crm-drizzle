@@ -1,5 +1,15 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { db, EnrichmentStatus } from "@crm/db";
+import {
+	agentTask,
+	company as companyTable,
+	db,
+	EnrichmentStatus,
+	firstRow,
+	inArray,
+	requireRow,
+	sql,
+	whereEq,
+} from "@crm/db";
 import { readContextDevKey, writeContextDevKey } from "@crm/db/settings";
 import { runBrand } from "../agent/lib/brand";
 import { settle } from "../agent/lib/enrichment";
@@ -22,21 +32,25 @@ const tasks: string[] = [];
 
 afterEach(async () => {
 	if (tasks.length > 0) {
-		await db.agentTask.deleteMany({ where: { id: { in: tasks.splice(0) } } });
+		await db.delete(agentTask).where(inArray(agentTask.id, tasks.splice(0)));
 	}
 	if (created.length === 0) return;
-	await db.company.deleteMany({ where: { id: { in: created.splice(0) } } });
+	await db
+		.delete(companyTable)
+		.where(inArray(companyTable.id, created.splice(0)));
 });
 
 async function company(status: EnrichmentStatus) {
-	const row = await db.company.create({
-		data: {
-			name: "Keyless Probe",
-			domain: `keyless-${created.length}-${status}.test`.toLowerCase(),
-			enrichmentStatus: status,
-		},
-		select: { id: true },
-	});
+	const row = await requireRow(
+		db
+			.insert(companyTable)
+			.values({
+				name: "Keyless Probe",
+				domain: `keyless-${created.length}-${status}.test`.toLowerCase(),
+				enrichmentStatus: status,
+			})
+			.returning({ id: companyTable.id }),
+	);
 
 	created.push(row.id);
 	return row.id;
@@ -51,23 +65,25 @@ const subjectOf = (companyId: string) => ({
 });
 
 async function retiredSubjectOf(companyId: string) {
-	await db.$executeRaw`
+	await db.execute(sql`
 		UPDATE "company"
 		SET "updatedAt" = NOW() - INTERVAL '1 second'
 		WHERE id = ${companyId}
-	`;
+	`);
 
-	const row = await db.agentTask.create({
-		data: {
-			companyId,
-			kind: "brand",
-			reason: "keyless",
-			attempts: 3,
-			dueAt: new Date(),
-			finishedAt: new Date(),
-		},
-		select: { id: true },
-	});
+	const row = await requireRow(
+		db
+			.insert(agentTask)
+			.values({
+				companyId,
+				kind: "brand",
+				reason: "keyless",
+				attempts: 3,
+				dueAt: new Date(),
+				finishedAt: new Date(),
+			})
+			.returning({ id: agentTask.id }),
+	);
 
 	tasks.push(row.id);
 	return { ...subjectOf(companyId), id: row.id };
@@ -75,10 +91,13 @@ async function retiredSubjectOf(companyId: string) {
 
 const statusOf = async (id: string) =>
 	(
-		await db.company.findUnique({
-			where: { id },
-			select: { enrichmentStatus: true },
-		})
+		await firstRow(
+			db
+				.select({ enrichmentStatus: companyTable.enrichmentStatus })
+				.from(companyTable)
+				.where(whereEq(companyTable.id, id))
+				.limit(1),
+		)
 	)?.enrichmentStatus;
 
 describe("a brand task with no key", () => {
@@ -136,13 +155,15 @@ describe("a brand task with no key", () => {
 });
 
 async function domainlessCompany(status: EnrichmentStatus) {
-	const row = await db.company.create({
-		data: {
-			name: `Keyless Probe ${created.length}`,
-			enrichmentStatus: status,
-		},
-		select: { id: true },
-	});
+	const row = await requireRow(
+		db
+			.insert(companyTable)
+			.values({
+				name: `Keyless Probe ${created.length}`,
+				enrichmentStatus: status,
+			})
+			.returning({ id: companyTable.id }),
+	);
 
 	created.push(row.id);
 	return row.id;

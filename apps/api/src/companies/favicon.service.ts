@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { and, company, type Db, eq, isNull } from "@crm/db";
 import { mirror } from "@crm/db/blob";
 import { resolveFavicon } from "@crm/db/favicon";
 import { Injectable, Logger } from "@nestjs/common";
@@ -18,10 +18,21 @@ export class FaviconService {
 			const iconUrl =
 				(await mirror(resolved, `companies/${companyId}/icon`)) ?? resolved;
 
-			const { count } = await this.db.company.updateMany({
-				where: { id: companyId, iconUrl: null, domain },
-				data: { iconUrl },
-			});
+			const count = (
+				await this.db
+					.update(company)
+					.set({ iconUrl })
+					.where(
+						and(
+							eq(company.id, companyId),
+							isNull(company.iconUrl),
+							domain === null
+								? isNull(company.domain)
+								: eq(company.domain, domain),
+						),
+					)
+					.returning({ id: company.id })
+			).length;
 
 			if (count > 0) {
 				this.logger.log({ message: "Favicon resolved", companyId, iconUrl });

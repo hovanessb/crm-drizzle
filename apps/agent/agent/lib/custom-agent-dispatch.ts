@@ -1,4 +1,37 @@
-import { db, type Prisma } from "@crm/db";
+import {
+	agentAction,
+	agentAuditEvent,
+	agentConversation,
+	agentConversationAttachment,
+	agentConversationSubmission,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentTrigger,
+	and,
+	asc,
+	db,
+	type Executor,
+	eq,
+	firstRow,
+	inArray,
+	isNotNull,
+	isNull,
+	type JsonObject,
+	type JsonValue,
+	lt,
+	lte,
+	type NewAgentRun,
+	ne,
+	notExists,
+	or,
+	orNull,
+	orThrow,
+	queryRows,
+	requireRow,
+	sql,
+	whereEq,
+} from "@crm/db";
 import { CRM_EVENT_CATALOG } from "@crm/db/crm-events";
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import { crmEventTask } from "@crm/validation/agent-events";
@@ -69,18 +102,37 @@ const builderSubmissionMessage = z
 
 export async function pendingBuilderSubmissionIds(): Promise<string[]> {
 	await recoverBuilderSubmissions();
-	const rows = await db.agentConversationSubmission.findMany({
-		where: {
-			status: "PENDING",
-			conversation: {
-				kind: "BUILDER",
-				OR: [{ sessionId: null }, { continuationToken: { not: null } }],
-			},
-		},
-		orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-		take: BUILDER_BATCH * 3,
-		select: { id: true, conversationId: true },
-	});
+	const rows = await db
+		.select({
+			id: agentConversationSubmission.id,
+			conversationId: agentConversationSubmission.conversationId,
+		})
+		.from(agentConversationSubmission)
+		.where(
+			and(
+				eq(agentConversationSubmission.status, "PENDING"),
+				inArray(
+					agentConversationSubmission.conversationId,
+					db
+						.select({ id: agentConversation.id })
+						.from(agentConversation)
+						.where(
+							and(
+								eq(agentConversation.kind, "BUILDER"),
+								or(
+									isNull(agentConversation.sessionId),
+									isNotNull(agentConversation.continuationToken),
+								),
+							),
+						),
+				),
+			),
+		)
+		.orderBy(
+			asc(agentConversationSubmission.createdAt),
+			asc(agentConversationSubmission.id),
+		)
+		.limit(BUILDER_BATCH * 3);
 
 	const seen = new Set<string>();
 	return rows
@@ -102,11 +154,14 @@ export async function dispatchBuilderSubmission(
 	submissionId: string,
 	send: SendFn,
 ) {
-	const submission = await db.$transaction(async (tx) => {
-		const seed = await tx.agentConversationSubmission.findUnique({
-			where: { id: submissionId },
-			select: { conversationId: true },
-		});
+	const submission = await db.transaction(async (tx) => {
+		const seed = await firstRow(
+			tx
+				.select({ conversationId: agentConversationSubmission.conversationId })
+				.from(agentConversationSubmission)
+				.where(whereEq(agentConversationSubmission.id, submissionId))
+				.limit(1),
+		);
 		if (!seed) throw new Error("Builder submission is unavailable.");
 
 		const conversation = await lockBuilderConversation(tx, seed.conversationId);
@@ -118,15 +173,40 @@ export async function dispatchBuilderSubmission(
 		}
 
 		const [active, firstPending] = await Promise.all([
-			tx.agentConversationSubmission.findFirst({
-				where: { conversationId: conversation.id, status: "SENDING" },
-				select: { id: true },
-			}),
-			tx.agentConversationSubmission.findFirst({
-				where: { conversationId: conversation.id, status: "PENDING" },
-				orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-				select: { id: true },
-			}),
+			firstRow(
+				tx
+					.select({ id: agentConversationSubmission.id })
+					.from(agentConversationSubmission)
+					.where(
+						and(
+							whereEq(
+								agentConversationSubmission.conversationId,
+								conversation.id,
+							),
+							eq(agentConversationSubmission.status, "SENDING"),
+						),
+					)
+					.limit(1),
+			),
+			firstRow(
+				tx
+					.select({ id: agentConversationSubmission.id })
+					.from(agentConversationSubmission)
+					.where(
+						and(
+							whereEq(
+								agentConversationSubmission.conversationId,
+								conversation.id,
+							),
+							eq(agentConversationSubmission.status, "PENDING"),
+						),
+					)
+					.orderBy(
+						asc(agentConversationSubmission.createdAt),
+						asc(agentConversationSubmission.id),
+					)
+					.limit(1),
+			),
 		]);
 		if (active || firstPending?.id !== submissionId) {
 			throw new Error(
@@ -134,47 +214,53 @@ export async function dispatchBuilderSubmission(
 			);
 		}
 
-		await tx.agentConversationSubmission.update({
-			where: { id: submissionId },
-			data: {
-				status: "SENDING",
-				attemptCount: { increment: 1 },
-				sentAt: new Date(),
-				errorCode: null,
-				errorMessage: null,
-			},
-		});
-		await tx.agentConversation.update({
-			where: { id: conversation.id },
-			data: { continuationToken: null },
-		});
+		await requireRow(
+			tx
+				.update(agentConversationSubmission)
+				.set({
+					status: "SENDING",
+					attemptCount: sql`${agentConversationSubmission.attemptCount} + 1`,
+					sentAt: new Date(),
+					errorCode: null,
+					errorMessage: null,
+				})
+				.where(whereEq(agentConversationSubmission.id, submissionId))
+				.returning(),
+		);
+		await requireRow(
+			tx
+				.update(agentConversation)
+				.set({ continuationToken: null })
+				.where(whereEq(agentConversation.id, conversation.id))
+				.returning(),
+		);
 
-		return tx.agentConversationSubmission.findUniqueOrThrow({
-			where: { id: submissionId },
-			select: {
-				id: true,
-				commandType: true,
-				message: true,
-				attemptCount: true,
-				attachments: {
-					orderBy: { position: "asc" },
-					select: {
-						name: true,
-						mediaType: true,
-						content: true,
+		return tx.query.agentConversationSubmission
+			.findFirst({
+				where: whereEq(agentConversationSubmission.id, submissionId),
+				columns: {
+					id: true,
+					commandType: true,
+					message: true,
+					attemptCount: true,
+				},
+				with: {
+					attachments: {
+						orderBy: [asc(agentConversationAttachment.position)],
+						columns: { name: true, mediaType: true, content: true },
+					},
+					conversation: {
+						columns: {
+							id: true,
+							title: true,
+							userId: true,
+							kind: true,
+							permissionMode: true,
+						},
 					},
 				},
-				conversation: {
-					select: {
-						id: true,
-						title: true,
-						userId: true,
-						kind: true,
-						permissionMode: true,
-					},
-				},
-			},
-		});
+			})
+			.then(orThrow);
 	});
 	const conversationId = submission.conversation.id;
 
@@ -210,63 +296,83 @@ export async function dispatchBuilderSubmission(
 			},
 		);
 
-		await db.$transaction(async (tx) => {
+		await db.transaction(async (tx) => {
 			const conversation = await lockBuilderConversation(tx, conversationId);
 			if (!conversation) return;
-			await tx.agentConversationSubmission.update({
-				where: { id: submission.id },
-				data: { status: "ACCEPTED", acceptedAt: new Date() },
-			});
-			await tx.agentConversation.update({
-				where: { id: conversationId },
-				data: {
-					sessionId: session.id,
-				},
-			});
+			await requireRow(
+				tx
+					.update(agentConversationSubmission)
+					.set({ status: "ACCEPTED", acceptedAt: new Date() })
+					.where(whereEq(agentConversationSubmission.id, submission.id))
+					.returning(),
+			);
+			await requireRow(
+				tx
+					.update(agentConversation)
+					.set({
+						sessionId: session.id,
+					})
+					.where(whereEq(agentConversation.id, conversationId))
+					.returning(),
+			);
 		});
 
 		return session;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		const retry = submission.attemptCount < MAX_BUILDER_ATTEMPTS;
-		await db.$transaction(async (tx) => {
+		await db.transaction(async (tx) => {
 			const conversation = await lockBuilderConversation(tx, conversationId);
 			if (!conversation) return;
-			await tx.agentConversationSubmission.update({
-				where: { id: submission.id },
-				data: {
-					status: retry ? "PENDING" : "FAILED",
-					errorCode: "DELIVERY_FAILED",
-					errorMessage: message,
-				},
-			});
-			await tx.agentConversation.update({
-				where: { id: conversationId },
-				data: { continuationToken: builderToken(conversationId) },
-			});
+			await requireRow(
+				tx
+					.update(agentConversationSubmission)
+					.set({
+						status: retry ? "PENDING" : "FAILED",
+						errorCode: "DELIVERY_FAILED",
+						errorMessage: message,
+					})
+					.where(whereEq(agentConversationSubmission.id, submission.id))
+					.returning(),
+			);
+			await requireRow(
+				tx
+					.update(agentConversation)
+					.set({ continuationToken: builderToken(conversationId) })
+					.where(whereEq(agentConversation.id, conversationId))
+					.returning(),
+			);
 		});
 		throw error;
 	}
 }
 
 export async function queueDueAgentRuns(now = new Date()): Promise<number> {
-	const triggers = await db.agentTrigger.findMany({
-		where: {
-			enabled: true,
-			type: "SCHEDULE",
-			nextRunAt: { lte: now },
-			agent: { status: "LIVE" },
-		},
-		orderBy: [{ nextRunAt: "asc" }, { id: "asc" }],
-		take: RUN_BATCH,
-		select: {
-			id: true,
-			agentId: true,
-			versionId: true,
-			nextRunAt: true,
-			config: true,
-		},
-	});
+	const triggers = await db
+		.select({
+			id: agentTrigger.id,
+			agentId: agentTrigger.agentId,
+			versionId: agentTrigger.versionId,
+			nextRunAt: agentTrigger.nextRunAt,
+			config: agentTrigger.config,
+		})
+		.from(agentTrigger)
+		.where(
+			and(
+				eq(agentTrigger.enabled, true),
+				eq(agentTrigger.type, "SCHEDULE"),
+				lte(agentTrigger.nextRunAt, now),
+				inArray(
+					agentTrigger.agentId,
+					db
+						.select({ id: agentDefinition.id })
+						.from(agentDefinition)
+						.where(eq(agentDefinition.status, "LIVE")),
+				),
+			),
+		)
+		.orderBy(asc(agentTrigger.nextRunAt), asc(agentTrigger.id))
+		.limit(RUN_BATCH);
 
 	let queued = 0;
 	for (const trigger of triggers) {
@@ -277,28 +383,33 @@ export async function queueDueAgentRuns(now = new Date()): Promise<number> {
 		).intervalMinutes;
 		const nextRunAt = advance(scheduledAt, intervalMinutes, now);
 		const idempotencyKey = `${trigger.id}:${scheduledAt.toISOString()}`;
-		const claimed = await db.$transaction(async (tx) => {
-			const [agent] = await tx.$queryRaw<Array<{ id: string; status: string }>>`
+		const claimed = await db.transaction(async (tx) => {
+			const [agent] = await queryRows<{ id: string; status: string }>(
+				tx,
+				sql`
 				SELECT id, status
 				FROM "agentDefinition"
 				WHERE id = ${trigger.agentId}
 				FOR UPDATE
-			`;
+			`,
+			);
 			if (agent?.status !== "LIVE") return false;
 
-			const updated = await tx.agentTrigger.updateMany({
-				where: {
-					id: trigger.id,
-					nextRunAt: scheduledAt,
-					enabled: true,
-				},
-				data: { nextRunAt, lastRunAt: scheduledAt },
-			});
-			if (updated.count === 0) return false;
+			const updated = await tx
+				.update(agentTrigger)
+				.set({ nextRunAt, lastRunAt: scheduledAt })
+				.where(
+					and(
+						whereEq(agentTrigger.id, trigger.id),
+						whereEq(agentTrigger.nextRunAt, scheduledAt),
+						eq(agentTrigger.enabled, true),
+					),
+				);
+			if (updated.rowCount === 0) return false;
 
-			await tx.agentRun.upsert({
-				where: { idempotencyKey },
-				create: {
+			await queueRun(
+				tx,
+				{
 					agentId: trigger.agentId,
 					versionId: trigger.versionId,
 					triggerId: trigger.id,
@@ -306,12 +417,9 @@ export async function queueDueAgentRuns(now = new Date()): Promise<number> {
 					idempotencyKey,
 					correlationId: crypto.randomUUID(),
 					input: { scheduledFor: scheduledAt.toISOString() },
-					events: {
-						create: { sequence: 0, type: "run.queued", data: {} },
-					},
 				},
-				update: {},
-			});
+				{},
+			);
 			return true;
 		});
 		if (claimed) queued += 1;
@@ -345,42 +453,61 @@ export async function queueEventAgentRuns(
 		throw new Error("The queued agent event is invalid.");
 	}
 
-	const triggers = await db.agentTrigger.findMany({
-		where: {
-			enabled: true,
-			type: "EVENT",
-			agent: { status: "LIVE" },
-		},
-		orderBy: { id: "asc" },
-		select: {
-			id: true,
-			agentId: true,
-			versionId: true,
-			config: true,
-		},
-	});
+	const triggers = await db
+		.select({
+			id: agentTrigger.id,
+			agentId: agentTrigger.agentId,
+			versionId: agentTrigger.versionId,
+			config: agentTrigger.config,
+		})
+		.from(agentTrigger)
+		.where(
+			and(
+				eq(agentTrigger.enabled, true),
+				eq(agentTrigger.type, "EVENT"),
+				inArray(
+					agentTrigger.agentId,
+					db
+						.select({ id: agentDefinition.id })
+						.from(agentDefinition)
+						.where(eq(agentDefinition.status, "LIVE")),
+				),
+			),
+		)
+		.orderBy(asc(agentTrigger.id));
 
 	let matched = 0;
 	for (const trigger of triggers) {
 		if (readAgentTriggerConfig(trigger.config).event !== eventType) continue;
 		const idempotencyKey = `event:${task.id}:trigger:${trigger.id}`;
 
-		const queued = await db.$transaction(async (tx) => {
+		const queued = await db.transaction(async (tx) => {
 			await lockIdempotencyKey(tx, idempotencyKey);
-			const eligible = await tx.agentTrigger.findFirst({
-				where: {
-					id: trigger.id,
-					enabled: true,
-					type: "EVENT",
-					agent: { status: "LIVE" },
-				},
-				select: { id: true },
-			});
+			const eligible = await firstRow(
+				tx
+					.select({ id: agentTrigger.id })
+					.from(agentTrigger)
+					.where(
+						and(
+							whereEq(agentTrigger.id, trigger.id),
+							eq(agentTrigger.enabled, true),
+							eq(agentTrigger.type, "EVENT"),
+							inArray(
+								agentTrigger.agentId,
+								db
+									.select({ id: agentDefinition.id })
+									.from(agentDefinition)
+									.where(eq(agentDefinition.status, "LIVE")),
+							),
+						),
+					)
+					.limit(1),
+			);
 			if (!eligible) return false;
 
-			await tx.agentRun.upsert({
-				where: { idempotencyKey },
-				create: {
+			await queueRun(
+				tx,
+				{
 					agentId: trigger.agentId,
 					versionId: trigger.versionId,
 					triggerId: trigger.id,
@@ -391,20 +518,18 @@ export async function queueEventAgentRuns(
 						event: { type: eventType, occurredAt, data },
 						record: { kind: recordKind, id: recordId },
 					},
-					events: {
-						create: {
-							sequence: 0,
-							type: "run.queued",
-							data: { eventType, taskId: task.id },
-						},
-					},
 				},
-				update: {},
-			});
-			await tx.agentTrigger.updateMany({
-				where: { id: trigger.id, enabled: true },
-				data: { lastRunAt: occurredAtDate },
-			});
+				{ eventType, taskId: task.id },
+			);
+			await tx
+				.update(agentTrigger)
+				.set({ lastRunAt: occurredAtDate })
+				.where(
+					and(
+						whereEq(agentTrigger.id, trigger.id),
+						eq(agentTrigger.enabled, true),
+					),
+				);
 			return true;
 		});
 		if (queued) matched += 1;
@@ -415,20 +540,45 @@ export async function queueEventAgentRuns(
 
 export async function pendingAgentRunIds(): Promise<string[]> {
 	await recoverAgentRuns();
-	const rows = await db.agentRun.findMany({
-		where: {
-			status: "QUEUED",
-			agent: {
-				status: "LIVE",
-				runs: {
-					none: { status: { in: ["RUNNING", "WAITING_FOR_APPROVAL"] } },
-				},
-			},
-		},
-		orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-		take: RUN_BATCH * 4,
-		select: { id: true, agentId: true, versionId: true },
-	});
+	const rows = await db
+		.select({
+			id: agentRun.id,
+			agentId: agentRun.agentId,
+			versionId: agentRun.versionId,
+		})
+		.from(agentRun)
+		.where(
+			and(
+				eq(agentRun.status, "QUEUED"),
+				inArray(
+					agentRun.agentId,
+					db
+						.select({ id: agentDefinition.id })
+						.from(agentDefinition)
+						.where(
+							and(
+								eq(agentDefinition.status, "LIVE"),
+								notExists(
+									db
+										.select({ id: agentRun.agentId })
+										.from(agentRun)
+										.where(
+											and(
+												eq(agentRun.agentId, agentDefinition.id),
+												inArray(agentRun.status, [
+													"RUNNING",
+													"WAITING_FOR_APPROVAL",
+												]),
+											),
+										),
+								),
+							),
+						),
+				),
+			),
+		)
+		.orderBy(asc(agentRun.createdAt), asc(agentRun.id))
+		.limit(RUN_BATCH * 4);
 
 	const runnable: string[] = [];
 	const selectedAgents = new Set<string>();
@@ -477,52 +627,62 @@ export async function drainAgentRuns(send: SendFn): Promise<number> {
 }
 
 export async function dispatchAgentRun(runId: string, send: SendFn) {
-	const run = await db.agentRun.findUnique({
-		where: { id: runId },
-		select: {
-			id: true,
-			status: true,
-			agentId: true,
-			versionId: true,
-			initiatedById: true,
-			agent: {
-				select: { name: true, createdById: true, status: true },
+	const run = await db.query.agentRun
+		.findFirst({
+			where: whereEq(agentRun.id, runId),
+			columns: {
+				id: true,
+				status: true,
+				agentId: true,
+				versionId: true,
+				initiatedById: true,
 			},
-			version: { select: { modelId: true } },
-		},
-	});
+			with: {
+				agent: { columns: { name: true, createdById: true, status: true } },
+				version: { columns: { modelId: true } },
+			},
+		})
+		.then(orNull);
 	if (run?.status !== "QUEUED" || run.agent.status !== "LIVE") {
 		throw new Error("Agent run was already claimed or is not live.");
 	}
 
-	const claim = await db.$transaction(async (tx) => {
-		const [agent] = await tx.$queryRaw<Array<{ id: string; status: string }>>`
+	const claim = await db.transaction(async (tx) => {
+		const [agent] = await queryRows<{ id: string; status: string }>(
+			tx,
+			sql`
 			SELECT id, status
 			FROM "agentDefinition"
 			WHERE id = ${run.agentId}
 			FOR UPDATE
-		`;
+		`,
+		);
 		if (agent?.status !== "LIVE") return "unavailable" as const;
 
-		const active = await tx.agentRun.findFirst({
-			where: {
-				agentId: run.agentId,
-				id: { not: run.id },
-				status: { in: ["RUNNING", "WAITING_FOR_APPROVAL"] },
-			},
-			select: { id: true },
-		});
+		const active = await firstRow(
+			tx
+				.select({ id: agentRun.id })
+				.from(agentRun)
+				.where(
+					and(
+						whereEq(agentRun.agentId, run.agentId),
+						ne(agentRun.id, run.id),
+						inArray(agentRun.status, ["RUNNING", "WAITING_FOR_APPROVAL"]),
+					),
+				)
+				.limit(1),
+		);
 		if (active) return "deferred" as const;
 
-		const updated = await tx.agentRun.updateMany({
-			where: { id: runId, status: "QUEUED" },
-			data: {
+		const updated = await tx
+			.update(agentRun)
+			.set({
 				status: "RUNNING",
 				startedAt: new Date(),
 				modelId: run.version.modelId,
-			},
-		});
-		return updated.count === 1
+			})
+			.where(and(whereEq(agentRun.id, runId), eq(agentRun.status, "QUEUED")));
+		return updated.rowCount === 1
 			? ("claimed" as const)
 			: ("unavailable" as const);
 	});
@@ -553,10 +713,10 @@ export async function dispatchAgentRun(runId: string, send: SendFn) {
 			title: `${run.agent.name} run`,
 		});
 
-		await db.agentRun.updateMany({
-			where: { id: run.id, status: "RUNNING" },
-			data: { sessionId: session.id },
-		});
+		await db
+			.update(agentRun)
+			.set({ sessionId: session.id })
+			.where(and(whereEq(agentRun.id, run.id), eq(agentRun.status, "RUNNING")));
 		return session;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -566,7 +726,7 @@ export async function dispatchAgentRun(runId: string, send: SendFn) {
 }
 
 export async function failRun(runId: string, code: string, message: string) {
-	return db.$transaction(async (tx) => {
+	return db.transaction(async (tx) => {
 		const run = await lockAgentRun(tx, runId);
 		if (run.status === "FAILED") {
 			return { id: run.id, status: "FAILED" as const };
@@ -577,52 +737,61 @@ export async function failRun(runId: string, code: string, message: string) {
 
 		const sequence = run.nextEventSequence + 1;
 		const finishedAt = new Date();
-		await tx.agentRun.update({
-			where: { id: runId },
-			data: {
-				status: "FAILED",
-				errorCode: code,
-				errorMessage: message,
-				finishedAt,
-				nextEventSequence: sequence,
-			},
-		});
-		await tx.agentRunEvent.create({
-			data: {
-				id: runTerminalEventId(run.id, "failed"),
-				runId: run.id,
-				sequence,
-				type: "run.failed",
-				data: { code, message },
-				emittedAt: finishedAt,
-			},
-		});
-		await tx.agentAuditEvent.upsert({
-			where: {
-				agentId_type_requestId: {
-					agentId: run.agentId,
+		await requireRow(
+			tx
+				.update(agentRun)
+				.set({
+					status: "FAILED",
+					errorCode: code,
+					errorMessage: message,
+					finishedAt,
+					nextEventSequence: sequence,
+				})
+				.where(whereEq(agentRun.id, runId))
+				.returning(),
+		);
+		await requireRow(
+			tx
+				.insert(agentRunEvent)
+				.values({
+					id: runTerminalEventId(run.id, "failed"),
+					runId: run.id,
+					sequence,
 					type: "run.failed",
+					data: { code, message },
+					emittedAt: finishedAt,
+				})
+				.returning(),
+		);
+		await requireRow(
+			tx
+				.insert(agentAuditEvent)
+				.values({
+					agentId: run.agentId,
+					versionId: run.versionId,
+					actorType: "AGENT",
+					actorId: run.id,
+					type: "run.failed",
+					summary: message,
 					requestId: run.id,
-				},
-			},
-			create: {
-				agentId: run.agentId,
-				versionId: run.versionId,
-				actorType: "AGENT",
-				actorId: run.id,
-				type: "run.failed",
-				summary: message,
-				requestId: run.id,
-			},
-			update: {},
-		});
+				})
+				.onConflictDoUpdate({
+					target: [
+						agentAuditEvent.agentId,
+						agentAuditEvent.type,
+						agentAuditEvent.requestId,
+					],
+					set: { agentId: sql`excluded.${sql.identifier("agentId")}` },
+				})
+				.returning(),
+		);
 
 		return { id: run.id, status: "FAILED" as const };
 	});
 }
 
 export async function cancelRun(runId: string, code: string, message: string) {
-	return db.$transaction(async (tx) => {
+	return db.transaction(async (tx) => {
 		const run = await lockAgentRun(tx, runId);
 		if (isTerminalRunStatus(run.status)) {
 			return { id: run.id, status: run.status, settled: false };
@@ -630,54 +799,68 @@ export async function cancelRun(runId: string, code: string, message: string) {
 
 		const sequence = run.nextEventSequence + 1;
 		const finishedAt = new Date();
-		await tx.agentRun.update({
-			where: { id: runId },
-			data: {
-				status: "CANCELLED",
-				errorCode: code,
-				errorMessage: message,
-				finishedAt,
-				nextEventSequence: sequence,
-			},
-		});
-		await tx.agentAction.updateMany({
-			where: { runId: run.id, status: { in: ["PLANNED", "RUNNING"] } },
-			data: {
+		await requireRow(
+			tx
+				.update(agentRun)
+				.set({
+					status: "CANCELLED",
+					errorCode: code,
+					errorMessage: message,
+					finishedAt,
+					nextEventSequence: sequence,
+				})
+				.where(whereEq(agentRun.id, runId))
+				.returning(),
+		);
+		await tx
+			.update(agentAction)
+			.set({
 				status: "CANCELLED",
 				errorCode: code,
 				errorMessage: message,
 				completedAt: finishedAt,
-			},
-		});
-		await tx.agentRunEvent.create({
-			data: {
-				id: runTerminalEventId(run.id, "cancelled"),
-				runId: run.id,
-				sequence,
-				type: "run.cancelled",
-				data: { code, message },
-				emittedAt: finishedAt,
-			},
-		});
-		await tx.agentAuditEvent.upsert({
-			where: {
-				agentId_type_requestId: {
-					agentId: run.agentId,
+			})
+			.where(
+				and(
+					whereEq(agentAction.runId, run.id),
+					inArray(agentAction.status, ["PLANNED", "RUNNING"]),
+				),
+			);
+		await requireRow(
+			tx
+				.insert(agentRunEvent)
+				.values({
+					id: runTerminalEventId(run.id, "cancelled"),
+					runId: run.id,
+					sequence,
 					type: "run.cancelled",
+					data: { code, message },
+					emittedAt: finishedAt,
+				})
+				.returning(),
+		);
+		await requireRow(
+			tx
+				.insert(agentAuditEvent)
+				.values({
+					agentId: run.agentId,
+					versionId: run.versionId,
+					actorType: "AGENT",
+					actorId: run.id,
+					type: "run.cancelled",
+					summary: message,
 					requestId: run.id,
-				},
-			},
-			create: {
-				agentId: run.agentId,
-				versionId: run.versionId,
-				actorType: "AGENT",
-				actorId: run.id,
-				type: "run.cancelled",
-				summary: message,
-				requestId: run.id,
-			},
-			update: {},
-		});
+				})
+				.onConflictDoUpdate({
+					target: [
+						agentAuditEvent.agentId,
+						agentAuditEvent.type,
+						agentAuditEvent.requestId,
+					],
+					set: { agentId: sql`excluded.${sql.identifier("agentId")}` },
+				})
+				.returning(),
+		);
 
 		return { id: run.id, status: "CANCELLED" as const, settled: true };
 	});
@@ -701,26 +884,35 @@ export function runIdFromToken(token: string | undefined): string | null {
 
 async function recoverBuilderSubmissions() {
 	const stale = new Date(Date.now() - BUILDER_LEASE_MS);
-	const rows = await db.agentConversationSubmission.findMany({
-		where: {
-			status: "SENDING",
-			sentAt: { lt: stale },
-		},
-		orderBy: [{ sentAt: "asc" }, { id: "asc" }],
-		take: BUILDER_BATCH * 3,
-		select: { id: true, conversationId: true, attemptCount: true },
-	});
+	const rows = await db
+		.select({
+			id: agentConversationSubmission.id,
+			conversationId: agentConversationSubmission.conversationId,
+			attemptCount: agentConversationSubmission.attemptCount,
+		})
+		.from(agentConversationSubmission)
+		.where(
+			and(
+				eq(agentConversationSubmission.status, "SENDING"),
+				lt(agentConversationSubmission.sentAt, stale),
+			),
+		)
+		.orderBy(
+			asc(agentConversationSubmission.sentAt),
+			asc(agentConversationSubmission.id),
+		)
+		.limit(BUILDER_BATCH * 3);
 
 	for (const row of rows) {
-		await db.$transaction(async (tx) => {
+		await db.transaction(async (tx) => {
 			const conversation = await lockBuilderConversation(
 				tx,
 				row.conversationId,
 			);
 			if (conversation?.kind !== "BUILDER") return;
-			const claimed = await tx.agentConversationSubmission.updateMany({
-				where: { id: row.id, status: "SENDING", sentAt: { lt: stale } },
-				data:
+			const claimed = await tx
+				.update(agentConversationSubmission)
+				.set(
 					row.attemptCount < MAX_BUILDER_ATTEMPTS
 						? { status: "PENDING" }
 						: {
@@ -729,13 +921,25 @@ async function recoverBuilderSubmissions() {
 								errorMessage:
 									"The builder could not accept this message after three attempts.",
 							},
-			});
-			if (claimed.count === 0) return;
+				)
+				.where(
+					and(
+						whereEq(agentConversationSubmission.id, row.id),
+						eq(agentConversationSubmission.status, "SENDING"),
+						lt(agentConversationSubmission.sentAt, stale),
+					),
+				);
+			if (claimed.rowCount === 0) return;
 
-			await tx.agentConversation.updateMany({
-				where: { id: row.conversationId, kind: "BUILDER" },
-				data: { continuationToken: builderToken(row.conversationId) },
-			});
+			await tx
+				.update(agentConversation)
+				.set({ continuationToken: builderToken(row.conversationId) })
+				.where(
+					and(
+						whereEq(agentConversation.id, row.conversationId),
+						eq(agentConversation.kind, "BUILDER"),
+					),
+				);
 		});
 	}
 }
@@ -749,15 +953,18 @@ export type LockedBuilderConversation = {
 };
 
 export async function lockBuilderConversation(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	conversationId: string,
 ): Promise<LockedBuilderConversation | null> {
-	const [conversation] = await tx.$queryRaw<LockedBuilderConversation[]>`
+	const [conversation] = await queryRows<LockedBuilderConversation>(
+		tx,
+		sql`
 		SELECT id, kind, "sessionId", "continuationToken", "streamIndex"
 		FROM "agentConversation"
 		WHERE id = ${conversationId}
 		FOR UPDATE
-	`;
+	`,
+	);
 	return conversation ?? null;
 }
 
@@ -765,16 +972,18 @@ export const RUN_TIMED_OUT = "RUN_TIMED_OUT";
 
 async function timeOutOverrunningRuns() {
 	const overrun = new Date(Date.now() - DISPATCH.run.executionTimeoutMs);
-	const rows = await db.agentRun.findMany({
-		where: {
-			status: "RUNNING",
-			sessionId: { not: null },
-			startedAt: { lt: overrun },
-		},
-		orderBy: [{ startedAt: "asc" }, { id: "asc" }],
-		take: RUN_BATCH * 3,
-		select: { id: true },
-	});
+	const rows = await db
+		.select({ id: agentRun.id })
+		.from(agentRun)
+		.where(
+			and(
+				eq(agentRun.status, "RUNNING"),
+				isNotNull(agentRun.sessionId),
+				lt(agentRun.startedAt, overrun),
+			),
+		)
+		.orderBy(asc(agentRun.startedAt), asc(agentRun.id))
+		.limit(RUN_BATCH * 3);
 
 	const minutes = Math.round(DISPATCH.run.executionTimeoutMs / 60_000);
 	for (const row of rows) {
@@ -790,25 +999,30 @@ async function recoverAgentRuns() {
 	await timeOutOverrunningRuns();
 
 	const stale = new Date(Date.now() - RUN_DELIVERY_LEASE_MS);
-	const rows = await db.agentRun.findMany({
-		where: {
-			status: "RUNNING",
-			sessionId: null,
-			startedAt: { lt: stale },
-		},
-		orderBy: [{ startedAt: "asc" }, { id: "asc" }],
-		take: RUN_BATCH * 3,
-		select: { id: true, agentId: true },
-	});
+	const rows = await db
+		.select({ id: agentRun.id, agentId: agentRun.agentId })
+		.from(agentRun)
+		.where(
+			and(
+				eq(agentRun.status, "RUNNING"),
+				isNull(agentRun.sessionId),
+				lt(agentRun.startedAt, stale),
+			),
+		)
+		.orderBy(asc(agentRun.startedAt), asc(agentRun.id))
+		.limit(RUN_BATCH * 3);
 
 	for (const row of rows) {
-		await db.$transaction(async (tx) => {
-			const [agent] = await tx.$queryRaw<Array<{ status: string }>>`
+		await db.transaction(async (tx) => {
+			const [agent] = await queryRows<{ status: string }>(
+				tx,
+				sql`
 				SELECT status
 				FROM "agentDefinition"
 				WHERE id = ${row.agentId}
 				FOR UPDATE
-			`;
+			`,
+			);
 			const run = await lockAgentRun(tx, row.id);
 			if (
 				run.status !== "RUNNING" ||
@@ -821,42 +1035,50 @@ async function recoverAgentRuns() {
 
 			const sequence = run.nextEventSequence + 1;
 			const cancelled = agent?.status !== "LIVE" && agent?.status !== "PAUSED";
-			await tx.agentRun.update({
-				where: { id: run.id },
-				data: cancelled
-					? {
-							status: "CANCELLED",
-							errorCode: "AGENT_UNAVAILABLE",
-							errorMessage:
-								"The agent was unavailable when delivery recovery ran.",
-							finishedAt: new Date(),
-							nextEventSequence: sequence,
-						}
-					: {
-							status: "QUEUED",
-							startedAt: null,
-							errorCode: null,
-							errorMessage: null,
-							finishedAt: null,
-							nextEventSequence: sequence,
-						},
-			});
-			await tx.agentRunEvent.create({
-				data: {
-					id: `run-delivery-${cancelled ? "cancelled" : "recovered"}:${run.id}:${run.startedAt.toISOString()}`,
-					runId: run.id,
-					sequence,
-					type: cancelled ? "run.cancelled" : "run.delivery_recovered",
-					data: cancelled ? { reason: "agent.unavailable" } : {},
-				},
-			});
+			await requireRow(
+				tx
+					.update(agentRun)
+					.set(
+						cancelled
+							? {
+									status: "CANCELLED",
+									errorCode: "AGENT_UNAVAILABLE",
+									errorMessage:
+										"The agent was unavailable when delivery recovery ran.",
+									finishedAt: new Date(),
+									nextEventSequence: sequence,
+								}
+							: {
+									status: "QUEUED",
+									startedAt: null,
+									errorCode: null,
+									errorMessage: null,
+									finishedAt: null,
+									nextEventSequence: sequence,
+								},
+					)
+					.where(whereEq(agentRun.id, run.id))
+					.returning(),
+			);
+			await requireRow(
+				tx
+					.insert(agentRunEvent)
+					.values({
+						id: `run-delivery-${cancelled ? "cancelled" : "recovered"}:${run.id}:${run.startedAt.toISOString()}`,
+						runId: run.id,
+						sequence,
+						type: cancelled ? "run.cancelled" : "run.delivery_recovered",
+						data: cancelled ? { reason: "agent.unavailable" } : {},
+					})
+					.returning(),
+			);
 		});
 	}
 }
 
 export function builderDeliveryMessage(
 	submissionId: string,
-	value: Prisma.JsonValue,
+	value: JsonValue,
 	attachments: readonly BuilderDeliveryAttachment[] = [],
 ): Parameters<SendFn>[0] {
 	const message = builderSubmissionMessage.parse(value);
@@ -901,7 +1123,7 @@ export function builderDeliveryMessage(
 
 export function builderCommandType(
 	commandType: string,
-	value: Prisma.JsonValue,
+	value: JsonValue,
 ): string {
 	const { requestId, optionId, text } =
 		builderSubmissionMessage.parse(value).inputResponse;
@@ -935,4 +1157,20 @@ function permissionModeAttribute(mode: string): string {
 	if (mode === "AUTO") return "auto";
 	if (mode === "BYPASS") return "bypass";
 	return "manual";
+}
+
+async function queueRun(
+	tx: Executor,
+	run: NewAgentRun,
+	data: JsonObject,
+): Promise<void> {
+	const [created] = await tx
+		.insert(agentRun)
+		.values(run)
+		.onConflictDoNothing({ target: agentRun.idempotencyKey })
+		.returning({ id: agentRun.id });
+	if (!created) return;
+	await tx
+		.insert(agentRunEvent)
+		.values({ runId: created.id, sequence: 0, type: "run.queued", data });
 }

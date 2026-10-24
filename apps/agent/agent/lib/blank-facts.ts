@@ -1,4 +1,16 @@
-import { db, FactStatus } from "@crm/db";
+import {
+	and,
+	contactFact,
+	contact as contactTable,
+	db,
+	desc,
+	eq,
+	FactStatus,
+	inArray,
+	ne,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import {
 	canonicalValue,
 	type FactField,
@@ -47,19 +59,19 @@ export async function sweepBlankFacts(
 	options: { dry?: boolean } = {},
 ): Promise<BlankFactSweep> {
 	const [pending, proposals] = await Promise.all([
-		db.contactFact.count({ where: { status: FactStatus.PROPOSED } }),
-		db.contactFact.findMany({
-			where: { status: FactStatus.PROPOSED },
-			select: {
+		db.$count(contactFact, eq(contactFact.status, FactStatus.PROPOSED)),
+		db.query.contactFact.findMany({
+			where: eq(contactFact.status, FactStatus.PROPOSED),
+			columns: {
 				id: true,
 				contactId: true,
 				field: true,
 				value: true,
 				score: true,
-				contact: { select: CONTACT_SELECT },
 			},
-			orderBy: [{ score: "desc" }, { observedAt: "desc" }],
-			take: SCAN,
+			with: { contact: { columns: CONTACT_SELECT } },
+			orderBy: [desc(contactFact.score), desc(contactFact.observedAt)],
+			limit: SCAN,
 		}),
 	]);
 
@@ -93,10 +105,15 @@ export async function sweepBlankFacts(
 			if (stale.length === 0) continue;
 
 			if (!options.dry) {
-				await db.contactFact.updateMany({
-					where: { id: { in: stale.map((row) => row.id) } },
-					data: { status: FactStatus.SUPERSEDED, supersededAt: new Date() },
-				});
+				await db
+					.update(contactFact)
+					.set({ status: FactStatus.SUPERSEDED, supersededAt: new Date() })
+					.where(
+						inArray(
+							contactFact.id,
+							stale.map((row) => row.id),
+						),
+					);
 			}
 
 			sweep.settled += stale.length;
@@ -153,13 +170,19 @@ async function appliedValues(
 	const values = new Map<string, string>();
 
 	for (let start = 0; start < contactIds.length; start += 1000) {
-		const rows = await db.contactFact.findMany({
-			where: {
-				status: FactStatus.APPLIED,
-				contactId: { in: contactIds.slice(start, start + 1000) },
-			},
-			select: { contactId: true, field: true, value: true },
-		});
+		const rows = await db
+			.select({
+				contactId: contactFact.contactId,
+				field: contactFact.field,
+				value: contactFact.value,
+			})
+			.from(contactFact)
+			.where(
+				and(
+					eq(contactFact.status, FactStatus.APPLIED),
+					inArray(contactFact.contactId, contactIds.slice(start, start + 1000)),
+				),
+			);
 
 		for (const row of rows)
 			values.set(key(row.contactId, row.field), row.value);
@@ -202,36 +225,50 @@ async function fill(
 	value: string,
 	column: string | null,
 ): Promise<void> {
-	await db.$transaction(async (tx) => {
-		await tx.contactFact.updateMany({
-			where: {
-				contactId,
-				field,
-				id: { not: factId },
-				status: { in: [FactStatus.APPLIED, FactStatus.PROPOSED] },
-			},
-			data: { status: FactStatus.SUPERSEDED, supersededAt: new Date() },
-		});
+	await db.transaction(async (tx) => {
+		await tx
+			.update(contactFact)
+			.set({ status: FactStatus.SUPERSEDED, supersededAt: new Date() })
+			.where(
+				and(
+					whereEq(contactFact.contactId, contactId),
+					whereEq(contactFact.field, field),
+					ne(contactFact.id, factId),
+					inArray(contactFact.status, [
+						FactStatus.APPLIED,
+						FactStatus.PROPOSED,
+					]),
+				),
+			);
 
-		await tx.contactFact.update({
-			where: { id: factId },
-			data: { status: FactStatus.APPLIED },
-		});
+		await requireRow(
+			tx
+				.update(contactFact)
+				.set({ status: FactStatus.APPLIED })
+				.where(whereEq(contactFact.id, factId))
+				.returning(),
+		);
 
 		if (column) {
-			await tx.contact.update({
-				where: { id: contactId },
-				data: { [column]: value },
-			});
+			await requireRow(
+				tx
+					.update(contactTable)
+					.set({ [column]: value })
+					.where(whereEq(contactTable.id, contactId))
+					.returning(),
+			);
 		}
 
 		if (field === "name") {
 			const split = splitName(value);
 			if (split) {
-				await tx.contact.update({
-					where: { id: contactId },
-					data: { firstName: split.firstName, lastName: split.lastName },
-				});
+				await requireRow(
+					tx
+						.update(contactTable)
+						.set({ firstName: split.firstName, lastName: split.lastName })
+						.where(whereEq(contactTable.id, contactId))
+						.returning(),
+				);
 			}
 		}
 	});

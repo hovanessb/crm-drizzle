@@ -1,4 +1,4 @@
-import type { Prisma } from "@crm/db";
+import { type Executor, queryRows, sql } from "@crm/db";
 import type { AgentRunStatus } from "@crm/db/enums";
 
 export type LockedAgentRun = {
@@ -12,15 +12,18 @@ export type LockedAgentRun = {
 };
 
 export async function lockAgentRun(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	runId: string,
 ): Promise<LockedAgentRun> {
-	const [run] = await tx.$queryRaw<LockedAgentRun[]>`
+	const [run] = await queryRows<LockedAgentRun>(
+		tx,
+		sql`
 		SELECT id, "agentId", "versionId", status, "sessionId", "startedAt", "nextEventSequence"
 		FROM "agentRun"
 		WHERE id = ${runId}
 		FOR UPDATE
-	`;
+	`,
+	);
 	if (!run) throw new Error("This agent run is unavailable.");
 	return run;
 }

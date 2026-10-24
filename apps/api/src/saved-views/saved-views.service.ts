@@ -1,4 +1,14 @@
-import { type Db, type FieldEntity, Prisma as PrismaNamespace } from "@crm/db";
+import {
+	and,
+	asc,
+	type Db,
+	eq,
+	type FieldEntity,
+	hasValues,
+	isUniqueViolation,
+	or,
+	savedView,
+} from "@crm/db";
 import { parseSavedViewFilters } from "@crm/validation/saved-view";
 import {
 	ConflictException,
@@ -17,10 +27,16 @@ export class SavedViewsService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async list(entity: FieldEntity, userId: string): Promise<SavedView[]> {
-		const rows = await this.db.savedView.findMany({
-			where: { entity, OR: [{ shared: true }, { ownerId: userId }] },
-			orderBy: { name: "asc" },
-		});
+		const rows = await this.db
+			.select()
+			.from(savedView)
+			.where(
+				and(
+					eq(savedView.entity, entity),
+					or(eq(savedView.shared, true), eq(savedView.ownerId, userId)),
+				),
+			)
+			.orderBy(asc(savedView.name));
 
 		return rows.map((row) => this.serialize(row, userId));
 	}
@@ -30,15 +46,17 @@ export class SavedViewsService {
 		userId: string,
 	): Promise<SavedView> {
 		try {
-			const row = await this.db.savedView.create({
-				data: {
+			const [row] = await this.db
+				.insert(savedView)
+				.values({
 					entity: input.entity,
 					name: input.name,
 					shared: input.shared,
 					filters: input.filters,
 					ownerId: userId,
-				},
-			});
+				})
+				.returning();
+			if (!row) throw new Error("The saved view insert returned no row.");
 
 			return this.serialize(row, userId);
 		} catch (error) {
@@ -51,20 +69,28 @@ export class SavedViewsService {
 		data: SavedViewUpdateData,
 		userId: string,
 	): Promise<SavedView> {
-		const existing = await this.db.savedView.findUnique({ where: { id } });
+		const [existing] = await this.db
+			.select()
+			.from(savedView)
+			.where(eq(savedView.id, id));
 		if (!existing || existing.ownerId !== userId) {
 			throw new NotFoundException(`No saved view with id ${id}.`);
 		}
 
 		try {
-			const row = await this.db.savedView.update({
-				where: { id },
-				data: {
-					name: data.name,
-					shared: data.shared,
-					filters: data.filters,
-				},
-			});
+			const changes = {
+				name: data.name,
+				shared: data.shared,
+				filters: data.filters,
+			};
+			const [row] = hasValues(changes)
+				? await this.db
+						.update(savedView)
+						.set(changes)
+						.where(eq(savedView.id, id))
+						.returning()
+				: [existing];
+			if (!row) throw new NotFoundException(`No saved view with id ${id}.`);
 
 			return this.serialize(row, userId);
 		} catch (error) {
@@ -73,16 +99,20 @@ export class SavedViewsService {
 	}
 
 	async delete(id: string, userId: string): Promise<{ id: string }> {
-		const existing = await this.db.savedView.findUnique({ where: { id } });
+		const [existing] = await this.db
+			.select()
+			.from(savedView)
+			.where(eq(savedView.id, id));
 		if (!existing || existing.ownerId !== userId) {
 			throw new NotFoundException(`No saved view with id ${id}.`);
 		}
 
-		try {
-			await this.db.savedView.delete({ where: { id } });
-		} catch (error) {
-			throw this.translate(error, id);
-		}
+		const removed = await this.db
+			.delete(savedView)
+			.where(eq(savedView.id, id))
+			.returning({ id: savedView.id });
+		if (removed.length === 0)
+			throw new NotFoundException(`No saved view with id ${id}.`);
 
 		return { id };
 	}
@@ -112,14 +142,9 @@ export class SavedViewsService {
 		};
 	}
 
-	private translate(cause: unknown, id?: string): never {
-		if (cause instanceof PrismaNamespace.PrismaClientKnownRequestError) {
-			if (cause.code === "P2002") {
-				throw new ConflictException("You already have a view with that name.");
-			}
-			if (cause.code === "P2025") {
-				throw new NotFoundException(`No saved view with id ${id}.`);
-			}
+	private translate(cause: unknown, _id?: string): never {
+		if (isUniqueViolation(cause)) {
+			throw new ConflictException("You already have a view with that name.");
 		}
 		throw cause;
 	}

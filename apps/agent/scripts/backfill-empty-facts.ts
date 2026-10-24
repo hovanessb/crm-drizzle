@@ -26,7 +26,7 @@ if (sweep.unscanned > 0) {
 	);
 }
 
-await db.$disconnect();
+await db.$client.end();
 
 function count(n: number, noun: string): string {
 	return `${n} ${noun}${n === 1 ? "" : "s"}`;

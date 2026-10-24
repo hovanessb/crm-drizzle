@@ -1,4 +1,4 @@
-import { type Db, db } from "@crm/db";
+import { type Db, db, sql } from "@crm/db";
 import {
 	Global,
 	Logger,
@@ -20,7 +20,7 @@ export class DatabaseModule implements OnModuleInit, OnApplicationShutdown {
 
 	async onModuleInit(): Promise<void> {
 		try {
-			await this.db.$connect();
+			await this.db.execute(sql`SELECT 1`);
 			this.logger.log({ message: "Database connected" });
 		} catch (error) {
 			this.logger.fatal(
@@ -32,7 +32,7 @@ export class DatabaseModule implements OnModuleInit, OnApplicationShutdown {
 	}
 
 	async onApplicationShutdown(signal?: string): Promise<void> {
-		await this.db.$disconnect();
+		await this.db.$client.end();
 		this.logger.log({ message: "Database disconnected", signal });
 	}
 }

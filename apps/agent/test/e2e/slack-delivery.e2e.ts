@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { db, isNotNull, slackChannel, slackMemberMatch } from "@crm/db";
 import { sendSlackMessage } from "../../agent/lib/run-runtime";
 import { slackAccessToken } from "../../agent/lib/slack-connection";
 
@@ -17,13 +17,16 @@ async function main() {
 		process.exit(1);
 	}
 
-	const channels = await db.slackChannel.findMany({
-		select: { id: true, name: true },
-	});
-	const people = await db.slackMemberMatch.findMany({
-		where: { slackUserId: { not: null } },
-		select: { slackUserId: true, slackHandle: true },
-	});
+	const channels = await db
+		.select({ id: slackChannel.id, name: slackChannel.name })
+		.from(slackChannel);
+	const people = await db
+		.select({
+			slackUserId: slackMemberMatch.slackUserId,
+			slackHandle: slackMemberMatch.slackHandle,
+		})
+		.from(slackMemberMatch)
+		.where(isNotNull(slackMemberMatch.slackUserId));
 
 	const testChannel = channels.find((row) => row.name === "test");
 	const person = people[0];

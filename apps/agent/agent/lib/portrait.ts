@@ -1,4 +1,11 @@
-import { db } from "@crm/db";
+import {
+	contact as contactTable,
+	db,
+	firstRow,
+	orNull,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { blobEnabled, isMirrored, mirror } from "@crm/db/blob";
 import { CONTEXT_DEV_PEOPLE, enabled } from "./capabilities";
 import { findPortrait, type PortraitSource } from "./portrait-sources";
@@ -48,10 +55,13 @@ export async function storePortrait({
 		};
 	}
 
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: { imageUrl: true },
-	});
+	const contact = await firstRow(
+		db
+			.select({ imageUrl: contactTable.imageUrl })
+			.from(contactTable)
+			.where(whereEq(contactTable.id, contactId))
+			.limit(1),
+	);
 
 	if (!contact) {
 		return { stored: false, imageUrl: null, reason: "No such contact." };
@@ -79,10 +89,13 @@ export async function storePortrait({
 		return { stored: false, imageUrl: stored, reason: "Unchanged." };
 	}
 
-	await db.contact.update({
-		where: { id: contactId },
-		data: { imageUrl: stored },
-	});
+	await requireRow(
+		db
+			.update(contactTable)
+			.set({ imageUrl: stored })
+			.where(whereEq(contactTable.id, contactId))
+			.returning(),
+	);
 
 	return { stored: true, imageUrl: stored };
 }
@@ -105,18 +118,20 @@ export async function runPortrait({
 		};
 	}
 
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: {
-			id: true,
-			firstName: true,
-			lastName: true,
-			imageUrl: true,
-			linkedinUrl: true,
-			githubUrl: true,
-			company: { select: { name: true, domain: true } },
-		},
-	});
+	const contact = await db.query.contact
+		.findFirst({
+			where: whereEq(contactTable.id, contactId),
+			columns: {
+				id: true,
+				firstName: true,
+				lastName: true,
+				imageUrl: true,
+				linkedinUrl: true,
+				githubUrl: true,
+			},
+			with: { company: { columns: { name: true, domain: true } } },
+		})
+		.then(orNull);
 
 	if (!contact) {
 		return { stored: false, imageUrl: null, reason: "No such contact." };

@@ -1,9 +1,26 @@
 import {
+	activity,
+	agentTask,
+	and,
+	asc,
+	company,
+	contact,
+	contains,
 	type Db,
+	deal,
+	desc,
 	EnrichmentStatus,
-	type Prisma,
-	Prisma as PrismaNamespace,
+	eq,
+	hasValues,
+	inArray,
+	isNull,
+	isUniqueViolation,
+	lte,
+	type NewCompany,
+	or,
 	RecordSource,
+	type SQL,
+	user,
 } from "@crm/db";
 import { OPEN_DEAL_STAGES } from "@crm/db/deal-stage";
 import type { FieldDefinitionWithOptions } from "@crm/db/fields";
@@ -37,11 +54,14 @@ import {
 	archivedFilter,
 	countsByKey,
 	FACET_UNASSIGNED,
+	groupCounts,
 	type ListResult,
 	type OrderByColumns,
 	ownerFilter,
 	paginate,
 	resolveOrderBy,
+	sortBy,
+	sortNullsLast,
 } from "../trpc/list-input";
 import type {
 	CompanyBulkOwnerInput,
@@ -53,28 +73,62 @@ import type {
 import { normalizeDomain } from "./domain";
 import { FaviconService } from "./favicon.service";
 
-const OWNER_SELECT = {
+const OWNER_COLUMNS = {
 	id: true,
 	name: true,
 	email: true,
 	image: true,
 } as const;
 
-const SORTABLE: OrderByColumns<Prisma.CompanyOrderByWithRelationInput> = {
-	name: (dir) => ({ name: dir }),
-	domain: (dir) => ({ domain: dir }),
-	industry: (dir) => ({ industry: dir }),
-	createdAt: (dir) => ({ createdAt: dir }),
-	contacts: (dir) => ({ contacts: { _count: dir } }),
-	deals: (dir) => ({ deals: { _count: dir } }),
-	owner: (dir) => ({ owner: { name: dir } }),
-	lastActivity: (dir) => ({ lastActivityAt: { sort: dir, nulls: "last" } }),
-	archivedAt: (dir) => ({ archivedAt: { sort: dir, nulls: "last" } }),
+const OWNER_FIELDS = {
+	id: user.id,
+	name: user.name,
+	email: user.email,
+	image: user.image,
 };
+
+@Injectable()
+class CompanyCounts {
+	constructor(@InjectDatabase() private readonly db: Db) {}
+
+	contacts() {
+		return this.db.$count(contact, eq(contact.companyId, company.id));
+	}
+
+	deals() {
+		return this.db.$count(deal, eq(deal.companyId, company.id));
+	}
+
+	openDeals() {
+		return this.db.$count(
+			deal,
+			and(
+				eq(deal.companyId, company.id),
+				inArray(deal.stage, [...OPEN_DEAL_STAGES]),
+			),
+		);
+	}
+}
+
+function sortable(counts: CompanyCounts): OrderByColumns<SQL> {
+	return {
+		name: (dir) => sortBy(company.name, dir),
+		domain: (dir) => sortBy(company.domain, dir),
+		industry: (dir) => sortBy(company.industry, dir),
+		createdAt: (dir) => sortBy(company.createdAt, dir),
+		contacts: (dir) => sortBy(counts.contacts(), dir),
+		deals: (dir) => sortBy(counts.deals(), dir),
+		owner: (dir) => sortBy(user.name, dir),
+		lastActivity: (dir) => sortNullsLast(company.lastActivityAt, dir),
+		archivedAt: (dir) => sortNullsLast(company.archivedAt, dir),
+	};
+}
 
 @Injectable()
 export class CompaniesService {
 	private readonly logger = new Logger(CompaniesService.name);
+
+	private readonly counts: CompanyCounts;
 
 	constructor(
 		@InjectDatabase() private readonly db: Db,
@@ -84,7 +138,9 @@ export class CompaniesService {
 		private readonly stamp: ActivityStampService,
 		private readonly conversion: ConversionService,
 		private readonly fields: FieldsService,
-	) {}
+	) {
+		this.counts = new CompanyCounts(db);
+	}
 
 	async list(input: CompanyListInput): Promise<ListResult<CompanyRow>> {
 		const filterableFields = await this.fields.filterableFieldsFor("COMPANY");
@@ -92,38 +148,35 @@ export class CompaniesService {
 		const { skip, take } = paginate(input);
 
 		const [rows, total, facetCounts] = await Promise.all([
-			this.db.company.findMany({
-				where,
-				skip,
-				take,
-				orderBy: resolveOrderBy(input, SORTABLE, {
-					createdAt: "desc",
-				}),
-				select: {
-					id: true,
-					name: true,
-					domain: true,
-					iconUrl: true,
-					iconDarkUrl: true,
-					iconTone: true,
-					logoUrl: true,
-					brandColor: true,
-					industry: true,
-					enrichmentStatus: true,
-					source: true,
-					owner: { select: OWNER_SELECT },
-					_count: {
-						select: {
-							contacts: true,
-							deals: { where: { stage: { in: [...OPEN_DEAL_STAGES] } } },
-						},
-					},
-					lastActivityAt: true,
-					createdAt: true,
-					archivedAt: true,
-				},
-			}),
-			this.db.company.count({ where }),
+			this.db
+				.select({
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					iconUrl: company.iconUrl,
+					iconDarkUrl: company.iconDarkUrl,
+					iconTone: company.iconTone,
+					logoUrl: company.logoUrl,
+					brandColor: company.brandColor,
+					industry: company.industry,
+					enrichmentStatus: company.enrichmentStatus,
+					source: company.source,
+					owner: OWNER_FIELDS,
+					contactCount: this.counts.contacts(),
+					openDealCount: this.counts.openDeals(),
+					lastActivityAt: company.lastActivityAt,
+					createdAt: company.createdAt,
+					archivedAt: company.archivedAt,
+				})
+				.from(company)
+				.leftJoin(user, eq(user.id, company.ownerId))
+				.where(where)
+				.orderBy(
+					resolveOrderBy(input, sortable(this.counts), desc(company.createdAt)),
+				)
+				.limit(take)
+				.offset(skip),
+			this.db.$count(company, where),
 			this.facetCounts(input, filterableFields),
 		]);
 
@@ -148,8 +201,8 @@ export class CompaniesService {
 				queued: queued.has(row.id),
 				source: row.source,
 				owner: row.owner,
-				contactCount: row._count.contacts,
-				openDealCount: row._count.deals,
+				contactCount: row.contactCount,
+				openDealCount: row.openDealCount,
 				lastActivityAt: row.lastActivityAt?.toISOString() ?? null,
 				createdAt: row.createdAt.toISOString(),
 				archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -161,9 +214,9 @@ export class CompaniesService {
 	}
 
 	async byId(id: string) {
-		const company = await this.db.company.findUnique({
-			where: { id },
-			select: {
+		const record = await this.db.query.company.findFirst({
+			where: eq(company.id, id),
+			columns: {
 				id: true,
 				name: true,
 				domain: true,
@@ -194,9 +247,11 @@ export class CompaniesService {
 				source: true,
 				createdAt: true,
 				archivedAt: true,
-				owner: { select: OWNER_SELECT },
+			},
+			with: {
+				owner: { columns: OWNER_COLUMNS },
 				primaryContact: {
-					select: {
+					columns: {
 						id: true,
 						firstName: true,
 						lastName: true,
@@ -206,20 +261,20 @@ export class CompaniesService {
 					},
 				},
 				contacts: {
-					orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
-					select: {
+					orderBy: [asc(contact.lastName), asc(contact.firstName)],
+					columns: {
 						id: true,
 						firstName: true,
 						lastName: true,
 						email: true,
 						title: true,
 						imageUrl: true,
-						owner: { select: OWNER_SELECT },
 					},
+					with: { owner: { columns: OWNER_COLUMNS } },
 				},
 				deals: {
-					orderBy: [{ stage: "asc" }, { expectedCloseDate: "asc" }],
-					select: {
+					orderBy: [asc(deal.stage), asc(deal.expectedCloseDate)],
+					columns: {
 						id: true,
 						name: true,
 						stage: true,
@@ -227,13 +282,13 @@ export class CompaniesService {
 						currency: true,
 						baseAmount: true,
 						expectedCloseDate: true,
-						owner: { select: OWNER_SELECT },
 					},
+					with: { owner: { columns: OWNER_COLUMNS } },
 				},
 			},
 		});
 
-		if (!company) {
+		if (!record) {
 			throw new NotFoundException(`No company with id ${id}.`);
 		}
 
@@ -244,7 +299,7 @@ export class CompaniesService {
 			createdAt,
 			archivedAt,
 			...rest
-		} = company;
+		} = record;
 
 		return {
 			...rest,
@@ -268,24 +323,30 @@ export class CompaniesService {
 	}
 
 	async options(q: string) {
-		return this.db.company.findMany({
-			where: this.searchFilter(q),
-			select: { id: true, name: true, domain: true, iconUrl: true },
-			orderBy: { name: "asc" },
-			take: 100,
-		});
+		return this.db
+			.select({
+				id: company.id,
+				name: company.name,
+				domain: company.domain,
+				iconUrl: company.iconUrl,
+			})
+			.from(company)
+			.where(this.searchFilter(q))
+			.orderBy(asc(company.name))
+			.limit(100);
 	}
 
 	async create(input: CompanyCreateInput) {
 		const domain = normalizeDomain(input.domain);
 
-		const company = await this.agent.withCrmEvents(async (tx, emit) => {
+		const created = await this.agent.withCrmEvents(async (tx, emit) => {
 			if (domain) {
 				await lockIdempotencyKey(tx, `company-directory:${domain}`);
-				const existing = await tx.company.findFirst({
-					where: { domain, archivedAt: null },
-					select: { name: true },
-				});
+				const [existing] = await tx
+					.select({ name: company.name })
+					.from(company)
+					.where(and(eq(company.domain, domain), isNull(company.archivedAt)))
+					.limit(1);
 				if (existing) {
 					throw new ConflictException(
 						`${existing.name} already uses the domain ${domain}.`,
@@ -293,15 +354,22 @@ export class CompaniesService {
 				}
 			}
 
-			const created = await tx.company.create({
-				data: {
+			const [inserted] = await tx
+				.insert(company)
+				.values({
 					name: input.name.trim(),
 					domain,
 					website: domain ? `https://${domain}` : null,
 					ownerId: input.ownerId ?? null,
-				},
-				select: { id: true, name: true, domain: true, createdAt: true },
-			});
+				})
+				.returning({
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					createdAt: company.createdAt,
+				});
+			if (!inserted) throw new Error("The company insert returned no row.");
+			const created = inserted;
 			await emit({
 				type: "company.created",
 				record: { kind: "company", id: created.id },
@@ -313,16 +381,16 @@ export class CompaniesService {
 
 		this.logger.log({
 			message: "Company created",
-			companyId: company.id,
-			domain: company.domain,
+			companyId: created.id,
+			domain: created.domain,
 		});
 
-		await this.agent.companyCreated(company.id);
+		await this.agent.companyCreated(created.id);
 
-		void this.favicon.backfill(company.id, company.domain);
-		void this.fields.queueBackfillForNewRecord("COMPANY", company.id);
+		void this.favicon.backfill(created.id, created.domain);
+		void this.fields.queueBackfillForNewRecord("COMPANY", created.id);
 
-		return { id: company.id, name: company.name, domain: company.domain };
+		return { id: created.id, name: created.name, domain: created.domain };
 	}
 
 	async import(input: CompanyImportInput) {
@@ -374,14 +442,20 @@ export class CompaniesService {
 			);
 
 			const existing = new Set(
-				(
-					await tx.company.findMany({
-						where: { domain: { in: domains }, archivedAt: null },
-						select: { domain: true },
-					})
-				).flatMap((company) => (company.domain ? [company.domain] : [])),
+				(domains.length > 0
+					? await tx
+							.select({ domain: company.domain })
+							.from(company)
+							.where(
+								and(
+									inArray(company.domain, domains),
+									isNull(company.archivedAt),
+								),
+							)
+					: ([] as { domain: string | null }[])
+				).flatMap((row) => (row.domain ? [row.domain] : [])),
 			);
-			const accepted = [];
+			const accepted: typeof candidates = [];
 			const seen = new Set<string>();
 			for (const candidate of candidates) {
 				if (candidate.domain && existing.has(candidate.domain)) {
@@ -403,22 +477,29 @@ export class CompaniesService {
 			}
 
 			if (accepted.length === 0) return [];
-			const rows = await tx.company.createManyAndReturn({
-				data: accepted.map(({ row: _row, ...company }) => ({
-					...company,
-					website: company.domain ? `https://${company.domain}` : null,
-					source: RecordSource.IMPORT,
-					enrichmentStatus: EnrichmentStatus.PENDING,
-				})),
-				select: { id: true, name: true, domain: true, createdAt: true },
-			});
+			const rows = await tx
+				.insert(company)
+				.values(
+					accepted.map(({ row: _row, ...candidate }) => ({
+						...candidate,
+						website: candidate.domain ? `https://${candidate.domain}` : null,
+						source: RecordSource.IMPORT,
+						enrichmentStatus: EnrichmentStatus.PENDING,
+					})),
+				)
+				.returning({
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					createdAt: company.createdAt,
+				});
 
-			for (const company of rows) {
+			for (const row of rows) {
 				await emit({
 					type: "company.created",
-					record: { kind: "company", id: company.id },
-					occurredAt: company.createdAt,
-					data: { name: company.name, domain: company.domain },
+					record: { kind: "company", id: row.id },
+					occurredAt: row.createdAt,
+					data: { name: row.name, domain: row.domain },
 				});
 			}
 			return rows;
@@ -445,7 +526,7 @@ export class CompaniesService {
 	}
 
 	async update(id: string, input: CompanyUpdateInput) {
-		const data: Prisma.CompanyUpdateInput = {};
+		const data: Partial<NewCompany> = {};
 
 		if (input.name !== undefined) data.name = input.name.trim();
 		if (input.website !== undefined) data.website = blankToNull(input.website);
@@ -464,11 +545,7 @@ export class CompaniesService {
 		if (input.linkedinUrl !== undefined) {
 			data.linkedinUrl = blankToNull(input.linkedinUrl);
 		}
-		if (input.ownerId !== undefined) {
-			data.owner = input.ownerId
-				? { connect: { id: input.ownerId } }
-				: { disconnect: true };
-		}
+		if (input.ownerId !== undefined) data.ownerId = input.ownerId || null;
 
 		if (input.domain !== undefined) {
 			const domain = normalizeDomain(input.domain);
@@ -478,10 +555,11 @@ export class CompaniesService {
 				);
 			}
 			data.domain = domain;
-			const current = await this.db.company.findUnique({
-				where: { id },
-				select: { domain: true },
-			});
+			const [current] = await this.db
+				.select({ domain: company.domain })
+				.from(company)
+				.where(eq(company.id, id))
+				.limit(1);
 			if (current && current.domain !== domain) {
 				data.enrichmentStatus = "PENDING";
 				data.enrichmentError = null;
@@ -492,16 +570,29 @@ export class CompaniesService {
 		}
 
 		try {
-			const updated = await this.db.$transaction(async (tx) => {
+			const updated = await this.db.transaction(async (tx) => {
 				if (input.fields) {
 					await this.fields.applyValues(tx, "COMPANY", id, input.fields);
 				}
 
-				return tx.company.update({
-					where: { id },
-					data,
-					select: { id: true, name: true, domain: true },
-				});
+				const fields = {
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+				};
+				const [row] = hasValues(data)
+					? await tx
+							.update(company)
+							.set(data)
+							.where(eq(company.id, id))
+							.returning(fields)
+					: await tx
+							.select(fields)
+							.from(company)
+							.where(eq(company.id, id))
+							.limit(1);
+				if (!row) throw new NotFoundException(`No company with id ${id}.`);
+				return row;
 			});
 
 			if (data.enrichmentStatus === "PENDING") {
@@ -519,35 +610,31 @@ export class CompaniesService {
 	}
 
 	async archive(id: string): Promise<{ id: string; name: string }> {
-		try {
-			const company = await this.db.company.update({
-				where: { id },
-				data: { archivedAt: new Date() },
-				select: { name: true },
-			});
-
-			this.logger.log({ message: "Company archived", companyId: id });
-
-			return { id, name: company.name };
-		} catch (error) {
-			throw this.translate(error, id);
-		}
+		const name = await this.setArchivedAt(id, new Date());
+		this.logger.log({ message: "Company archived", companyId: id });
+		return { id, name };
 	}
 
 	async restore(id: string): Promise<{ id: string; name: string }> {
-		try {
-			const company = await this.db.company.update({
-				where: { id },
-				data: { archivedAt: null },
-				select: { name: true },
-			});
+		const name = await this.setArchivedAt(id, null);
+		this.logger.log({ message: "Company restored", companyId: id });
+		return { id, name };
+	}
 
-			this.logger.log({ message: "Company restored", companyId: id });
+	private async setArchivedAt(
+		id: string,
+		archivedAt: Date | null,
+	): Promise<string> {
+		const [row] = await this.db
+			.update(company)
+			.set({ archivedAt })
+			.where(eq(company.id, id))
+			.returning({ name: company.name })
+			.catch((cause: unknown) => this.translate(cause, id));
 
-			return { id, name: company.name };
-		} catch (error) {
-			throw this.translate(error, id);
-		}
+		if (!row) throw new NotFoundException(`No company with id ${id}.`);
+
+		return row.name;
 	}
 
 	async purge(id: string): Promise<{ id: string; name: string }>;
@@ -562,10 +649,12 @@ export class CompaniesService {
 		let deleted: { targets: StampTargets; name: string } | null;
 
 		try {
-			deleted = await this.db.$transaction(async (tx) => {
-				const [row] = await tx.$queryRaw<Array<{ archivedAt: Date | null }>>`
-					SELECT "archivedAt" FROM company WHERE id = ${id} FOR UPDATE
-				`;
+			deleted = await this.db.transaction(async (tx) => {
+				const [row] = await tx
+					.select({ archivedAt: company.archivedAt })
+					.from(company)
+					.where(eq(company.id, id))
+					.for("update");
 
 				if (!row) {
 					if (guard) return null;
@@ -578,31 +667,29 @@ export class CompaniesService {
 					return null;
 				}
 
+				const dealIds = tx
+					.select({ id: deal.id })
+					.from(deal)
+					.where(eq(deal.companyId, id));
+
 				const targets = await this.stamp.targetsOf(
-					{ OR: [{ companyId: id }, { deal: { companyId: id } }] },
+					or(eq(activity.companyId, id), inArray(activity.dealId, dealIds)),
 					tx,
 				);
 
-				const deals = await tx.deal.findMany({
-					where: { companyId: id },
-					select: { id: true },
-				});
+				await tx
+					.delete(agentTask)
+					.where(
+						or(eq(agentTask.companyId, id), inArray(agentTask.dealId, dealIds)),
+					);
 
-				await tx.agentTask.deleteMany({
-					where: {
-						OR: [
-							{ companyId: id },
-							{ dealId: { in: deals.map((deal) => deal.id) } },
-						],
-					},
-				});
+				const [removed] = await tx
+					.delete(company)
+					.where(eq(company.id, id))
+					.returning({ name: company.name });
+				if (!removed) throw new NotFoundException(`No company with id ${id}.`);
 
-				const company = await tx.company.delete({
-					where: { id },
-					select: { name: true },
-				});
-
-				return { targets, name: company.name };
+				return { targets, name: removed.name };
 			});
 		} catch (error) {
 			throw this.translate(error, id);
@@ -622,11 +709,11 @@ export class CompaniesService {
 	}
 
 	async purgeExpired(before: Date): Promise<BulkResult> {
-		const expired = await this.db.company.findMany({
-			where: { archivedAt: { lte: before } },
-			select: { id: true },
-			take: ARCHIVE.prune.maxBatch,
-		});
+		const expired = await this.db
+			.select({ id: company.id })
+			.from(company)
+			.where(lte(company.archivedAt, before))
+			.limit(ARCHIVE.prune.maxBatch);
 
 		return runBulk(
 			expired.map((row) => row.id),
@@ -640,10 +727,13 @@ export class CompaniesService {
 		await requireOwner(this.db, ownerId);
 
 		const ids = [...new Set(input.ids)];
-		const { count } = await this.db.company.updateMany({
-			where: { id: { in: ids } },
-			data: { ownerId },
-		});
+		const count = (
+			await this.db
+				.update(company)
+				.set({ ownerId })
+				.where(inArray(company.id, ids))
+				.returning({ id: company.id })
+		).length;
 
 		this.logger.log({
 			message: "Companies reassigned",
@@ -677,12 +767,13 @@ export class CompaniesService {
 	}
 
 	async enrich(id: string): Promise<{ id: string; queued: boolean }> {
-		const company = await this.db.company.findUnique({
-			where: { id },
-			select: { id: true, updatedAt: true },
-		});
+		const [record] = await this.db
+			.select({ id: company.id, updatedAt: company.updatedAt })
+			.from(company)
+			.where(eq(company.id, id))
+			.limit(1);
 
-		if (!company) {
+		if (!record) {
 			throw new NotFoundException(`No company with id ${id}.`);
 		}
 
@@ -692,26 +783,29 @@ export class CompaniesService {
 		);
 
 		if (queued) {
-			await this.db.company.updateMany({
-				where: { id, updatedAt: company.updatedAt },
-				data: { enrichmentStatus: "PENDING", enrichmentError: null },
-			});
+			await this.db
+				.update(company)
+				.set({ enrichmentStatus: "PENDING", enrichmentError: null })
+				.where(
+					and(eq(company.id, id), eq(company.updatedAt, record.updatedAt)),
+				);
 		}
 
 		return { id, queued };
 	}
 
 	async research(id: string, actingUserId: string) {
-		const company = await this.db.company.findUnique({
-			where: { id },
-			select: { id: true, domain: true },
-		});
+		const [record] = await this.db
+			.select({ id: company.id, domain: company.domain })
+			.from(company)
+			.where(eq(company.id, id))
+			.limit(1);
 
-		if (!company) {
+		if (!record) {
 			throw new NotFoundException(`No company with id ${id}.`);
 		}
 
-		if (!company.domain) {
+		if (!record.domain) {
 			throw new BadRequestException(
 				"There is nothing to read without a domain — add one first.",
 			);
@@ -727,114 +821,100 @@ export class CompaniesService {
 
 	async setPrimaryContact(companyId: string, contactId: string | null) {
 		if (contactId) {
-			const contact = await this.db.contact.findUnique({
-				where: { id: contactId },
-				select: { companyId: true },
-			});
-			if (!contact) {
+			const [person] = await this.db
+				.select({ companyId: contact.companyId })
+				.from(contact)
+				.where(eq(contact.id, contactId))
+				.limit(1);
+			if (!person) {
 				throw new NotFoundException(`No contact with id ${contactId}.`);
 			}
-			if (contact.companyId !== companyId) {
+			if (person.companyId !== companyId) {
 				throw new BadRequestException(
 					"That contact does not work at this company.",
 				);
 			}
 		}
 
-		try {
-			return await this.db.company.update({
-				where: { id: companyId },
-				data: { primaryContactId: contactId },
-				select: { id: true, primaryContactId: true },
-			});
-		} catch (error) {
-			throw this.translate(error, companyId);
-		}
+		const [row] = await this.db
+			.update(company)
+			.set({ primaryContactId: contactId })
+			.where(eq(company.id, companyId))
+			.returning({ id: company.id, primaryContactId: company.primaryContactId })
+			.catch((cause: unknown) => this.translate(cause, companyId));
+
+		if (!row) throw new NotFoundException(`No company with id ${companyId}.`);
+
+		return row;
 	}
 
-	private searchFilter(q: string): Prisma.CompanyWhereInput {
+	private searchFilter(q: string): SQL | undefined {
 		const term = q.trim();
-		if (!term) return {};
+		if (!term) return undefined;
 
-		return {
-			OR: [
-				{ name: { contains: term, mode: "insensitive" } },
-				{ domain: { contains: term, mode: "insensitive" } },
-			],
-		};
+		return or(
+			contains(company.name, term, { insensitive: true }),
+			contains(company.domain, term, { insensitive: true }),
+		);
 	}
 
 	private buildWhere(
 		input: CompanyListInput,
 		filterableFields: FieldDefinitionWithOptions[],
-	): Prisma.CompanyWhereInput {
-		const and: Prisma.CompanyWhereInput[] = [
+	): SQL | undefined {
+		const conditions: (SQL | undefined)[] = [
 			this.searchFilter(input.q),
-			archivedFilter(input.archived),
-			...this.fields.fieldFilters(filterableFields, input.fields),
+			archivedFilter(company.archivedAt, input.archived),
+			...this.fields.fieldFilters("COMPANY", filterableFields, input.fields),
+			ownerFilter(company.ownerId, input.owner),
 		];
 
-		const owner = ownerFilter<Prisma.CompanyWhereInput>(input.owner);
-		if (owner) and.push(owner);
-
-		if (input.industry.length > 0)
-			and.push({ industry: { in: input.industry } });
+		if (input.industry.length > 0) {
+			conditions.push(inArray(company.industry, input.industry));
+		}
 		if (input.enrichment.length > 0) {
-			and.push({
-				enrichmentStatus: { in: input.enrichment as EnrichmentStatus[] },
-			});
+			conditions.push(
+				inArray(
+					company.enrichmentStatus,
+					input.enrichment as EnrichmentStatus[],
+				),
+			);
 		}
 		if (input.source.length > 0) {
-			and.push({ source: { in: input.source as RecordSource[] } });
+			conditions.push(inArray(company.source, input.source as RecordSource[]));
 		}
 
-		const activity = activityFilter(input.activity);
-		if (activity) and.push(activity);
+		conditions.push(activityFilter(company.lastActivityAt, input.activity));
 
-		return { AND: and };
+		return and(...conditions);
 	}
 
 	private async facetCounts(
 		input: CompanyListInput,
 		filterableFields: FieldDefinitionWithOptions[],
 	) {
-		const where = {
-			AND: [this.searchFilter(input.q), archivedFilter(input.archived)],
-		};
+		const where = and(
+			this.searchFilter(input.q),
+			archivedFilter(company.archivedAt, input.archived),
+		);
 
 		const [owners, industries, enrichment, sources, activity, fieldFacets] =
 			await Promise.all([
-				this.db.company.groupBy({
-					by: ["ownerId"],
-					where,
-					_count: { _all: true },
-				}),
-				this.db.company.groupBy({
-					by: ["industry"],
-					where,
-					_count: { _all: true },
-				}),
-				this.db.company.groupBy({
-					by: ["enrichmentStatus"],
-					where,
-					_count: { _all: true },
-				}),
-				this.db.company.groupBy({
-					by: ["source"],
-					where,
-					_count: { _all: true },
-				}),
-				activityFacetCounts((activityWhere) =>
-					this.db.company.count({ where: { AND: [where, activityWhere] } }),
+				groupCounts(this.db, company, company.ownerId, where),
+				groupCounts(this.db, company, company.industry, where),
+				groupCounts(this.db, company, company.enrichmentStatus, where),
+				groupCounts(this.db, company, company.source, where),
+				activityFacetCounts(company.lastActivityAt, (activityWhere) =>
+					this.db.$count(company, and(where, activityWhere)),
 				),
 				this.fields.filterFacetCounts("COMPANY", where, filterableFields),
 			]);
 
 		return {
-			owner: countsByKey(owners, "ownerId", FACET_UNASSIGNED),
-			industry: countsByKey(industries, "industry"),
-			enrichment: countsByKey(enrichment, "enrichmentStatus"),
-			source: countsByKey(sources, "source"),
+			owner: countsByKey(owners, "value", FACET_UNASSIGNED),
+			industry: countsByKey(industries, "value"),
+			enrichment: countsByKey(enrichment, "value"),
+			source: countsByKey(sources, "value"),
 			activity,
 			...Object.fromEntries(
 				Object.entries(fieldFacets).map(([key, counts]) => [
@@ -845,16 +925,9 @@ export class CompaniesService {
 		};
 	}
 
-	private translate(cause: unknown, id: string): never {
-		if (cause instanceof PrismaNamespace.PrismaClientKnownRequestError) {
-			if (cause.code === "P2025") {
-				throw new NotFoundException(`No company with id ${id}.`);
-			}
-			if (cause.code === "P2002") {
-				throw new ConflictException(
-					"Another company already uses that domain.",
-				);
-			}
+	private translate(cause: unknown, _id: string): never {
+		if (isUniqueViolation(cause)) {
+			throw new ConflictException("Another company already uses that domain.");
 		}
 		throw cause;
 	}

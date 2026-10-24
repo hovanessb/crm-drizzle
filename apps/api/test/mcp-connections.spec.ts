@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { createMcpSecretBox } from "@crm/auth/mcp-crypto";
 import { type AuthorizationServer, McpOAuthClient } from "@crm/auth/mcp-oauth";
-import type { Db } from "@crm/db";
 import type { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import {
 	assertGrantedScopeBounds,
 	McpConnectionsService,
 } from "../src/mcp/mcp-connections.service";
+import { type FakeCall, fakeDb, type Row } from "./fake-db";
 
 const userId = "mcp-service-user";
 const encryptionKey = Buffer.alloc(32, 7).toString("base64");
@@ -15,63 +15,58 @@ let previousKey: string | undefined;
 
 function serviceFor(input: {
 	role?: string | null;
-	connections?: unknown[];
-	agents?: unknown[];
-	oauthState?: unknown;
-	connection?: unknown;
-	registration?: unknown;
+	connections?: Row[];
+	agents?: Row[];
+	oauthState?: Row;
+	connection?: Row;
+	registration?: Row;
 	consumeCount?: number;
 	oauth?: McpOAuthClient;
-	callbackTransaction?: boolean;
 }) {
-	type ConnectionUpdate = Parameters<Db["mcpConnection"]["update"]>[0];
-	type ConnectionUpsert = Parameters<Db["mcpConnection"]["upsert"]>[0];
-	type AgentTaskCreate = Parameters<Db["agentTask"]["create"]>[0];
-	type RegistrationUpsert = Parameters<
-		Db["mcpClientRegistration"]["upsert"]
-	>[0];
-	type OauthStateCreate = Parameters<Db["mcpOauthState"]["create"]>[0];
-	const updates: ConnectionUpdate[] = [];
-	const registrationUpserts: RegistrationUpsert[] = [];
-	let db: Db;
-	const transaction = input.callbackTransaction
-		? async (operation: (tx: Db) => Promise<object>) => operation(db)
-		: async (operations: Promise<object>[]) => Promise.all(operations);
-	db = {
-		member: {
-			findUnique: async () =>
-				input.role === null ? null : { role: input.role ?? "owner" },
+	const updates: FakeCall[] = [];
+	const registrationUpserts: FakeCall[] = [];
+	const { db } = fakeDb({
+		select: (table) => {
+			if (table === "member")
+				return input.role === null ? [] : [{ role: input.role ?? "owner" }];
+			if (table === "mcpConnection")
+				return (
+					input.connections ?? (input.connection ? [input.connection] : [])
+				);
+			if (table === "mcpClientRegistration")
+				return input.registration ? [input.registration] : [];
+			return [];
 		},
-		mcpConnection: {
-			findMany: async () => input.connections ?? [],
-			findUnique: async () => input.connection ?? null,
-			findUniqueOrThrow: async () => input.connection,
-			upsert: async (value: ConnectionUpsert) => value,
-			update: async (value: ConnectionUpdate) => {
-				updates.push(value);
-				return value;
+		insert: (call) => {
+			if (call.table === "mcpClientRegistration") {
+				registrationUpserts.push(call);
+				return [
+					{
+						id: "registration-1",
+						clientId: "refreshed-client",
+						...call.conflict?.set,
+					},
+				];
+			}
+			if (Array.isArray(call.values)) return call.values;
+			return call.values ? [call.values] : [];
+		},
+		update: (call) => {
+			if (call.table === "mcpOauthState")
+				return Array.from({ length: input.consumeCount ?? 0 }, () => ({
+					id: "state-1",
+				}));
+			if (call.table === "mcpConnection") updates.push(call);
+			return [{ id: "connection-1" }];
+		},
+		query: {
+			mcpConnection: { findFirst: () => input.connection },
+			mcpOauthState: { findFirst: () => input.oauthState },
+			agentDefinition: {
+				findMany: () => input.agents ?? [],
 			},
 		},
-		agentTask: { create: async (value: AgentTaskCreate) => value },
-		agentDefinition: { findMany: async () => input.agents ?? [] },
-		mcpClientRegistration: {
-			findUnique: async () => input.registration ?? null,
-			upsert: async (value: RegistrationUpsert) => {
-				registrationUpserts.push(value);
-				return {
-					id: "registration-1",
-					clientId: "refreshed-client",
-					...(value as { update?: object }).update,
-				};
-			},
-		},
-		mcpOauthState: {
-			findUnique: async () => input.oauthState ?? null,
-			updateMany: async () => ({ count: input.consumeCount ?? 0 }),
-			create: async (value: OauthStateCreate) => value,
-		},
-		$transaction: transaction,
-	} as unknown as Db;
+	});
 	const oauth = input.oauth ?? ({} as McpOAuthClient);
 	const discoveries: boolean[] = [];
 	const agent = {
@@ -207,7 +202,6 @@ describe("MCP connections", () => {
 			.digest("hex");
 		const { service, registrationUpserts } = serviceFor({
 			oauth,
-			callbackTransaction: true,
 			registration: {
 				id: "registration-1",
 				clientId: "stale-client",

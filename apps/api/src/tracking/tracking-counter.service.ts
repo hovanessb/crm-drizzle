@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { type Db, lt, sql, trackingCounter } from "@crm/db";
 import { windowExpiry } from "@crm/db/tracking";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
@@ -14,16 +14,16 @@ export class TrackingCounterService {
 		if (amount > limit) return false;
 
 		try {
-			const charged = await this.db.$queryRaw<{ value: number }[]>`
+			const charged = await this.db.execute<{ value: number }>(sql`
 				INSERT INTO "trackingCounter" ("key", "value", "expiresAt")
 				VALUES (${key}, ${amount}, ${windowExpiry(key)})
 				ON CONFLICT ("key") DO UPDATE
 					SET "value" = "trackingCounter"."value" + ${amount}
 					WHERE "trackingCounter"."value" + ${amount} <= ${limit}
 				RETURNING "value";
-			`;
+			`);
 
-			return charged.length > 0;
+			return charged.rows.length > 0;
 		} catch (error) {
 			this.logger.error(
 				{ message: "Tracking counter could not be read — refusing the write" },
@@ -36,11 +36,11 @@ export class TrackingCounterService {
 
 	async release(key: string, amount = 1): Promise<void> {
 		try {
-			await this.db.$executeRaw`
+			await this.db.execute(sql`
 				UPDATE "trackingCounter"
 				SET "value" = GREATEST("value" - ${amount}, 0)
 				WHERE "key" = ${key};
-			`;
+			`);
 		} catch (error) {
 			this.logger.error(
 				{ message: "Tracking counter could not be released" },
@@ -50,10 +50,11 @@ export class TrackingCounterService {
 	}
 
 	async sweep(): Promise<number> {
-		const removed = await this.db.trackingCounter.deleteMany({
-			where: { expiresAt: { lt: new Date() } },
-		});
+		const removed = await this.db
+			.delete(trackingCounter)
+			.where(lt(trackingCounter.expiresAt, new Date()))
+			.returning({ key: trackingCounter.key });
 
-		return removed.count;
+		return removed.length;
 	}
 }

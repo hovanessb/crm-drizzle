@@ -1,6 +1,23 @@
 import { randomBytes } from "node:crypto";
 import { WORKSPACE_ID } from "@crm/auth/organization";
-import type { Db, Prisma } from "@crm/db";
+import {
+	agentBuilderArtifact,
+	agentConversation,
+	agentConversationAttachment,
+	agentConversationShare,
+	agentConversationSubmission,
+	agentEvent,
+	and,
+	asc,
+	type Db,
+	desc,
+	type Executor,
+	eq,
+	gt,
+	isNull,
+	member,
+	or,
+} from "@crm/db";
 import {
 	ForbiddenException,
 	Injectable,
@@ -18,17 +35,26 @@ export class ConversationSharingService {
 	async status(conversationId: string, userId: string) {
 		await this.ownedBuilder(conversationId, userId);
 
-		const share = await this.db.agentConversationShare.findFirst({
-			where: {
-				conversationId,
-				revokedAt: null,
-				OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-			},
-			select: { createdAt: true, expiresAt: true },
-		});
+		const [share] = await this.db
+			.select({
+				createdAt: agentConversationShare.createdAt,
+				expiresAt: agentConversationShare.expiresAt,
+			})
+			.from(agentConversationShare)
+			.where(
+				and(
+					eq(agentConversationShare.conversationId, conversationId),
+					isNull(agentConversationShare.revokedAt),
+					or(
+						isNull(agentConversationShare.expiresAt),
+						gt(agentConversationShare.expiresAt, new Date()),
+					),
+				),
+			)
+			.limit(1);
 
 		return {
-			enabled: share !== null,
+			enabled: share !== undefined,
 			createdAt: share?.createdAt.toISOString() ?? null,
 			expiresAt: share?.expiresAt?.toISOString() ?? null,
 		};
@@ -38,19 +64,16 @@ export class ConversationSharingService {
 		const token = randomBytes(32).toString("base64url");
 		const tokenHash = conversationShareTokenHash(token);
 
-		const created = await this.db.$transaction(async (tx) => {
+		const created = await this.db.transaction(async (tx) => {
 			if (!(await this.lockOwnedBuilder(tx, conversationId, userId))) {
 				return false;
 			}
 
-			await tx.agentConversationShare.updateMany({
-				where: { conversationId, revokedAt: null },
-				data: { revokedAt: new Date() },
-			});
+			await this.revokeActive(tx, conversationId);
 
-			await tx.agentConversationShare.create({
-				data: { conversationId, createdById: userId, tokenHash },
-			});
+			await tx
+				.insert(agentConversationShare)
+				.values({ conversationId, createdById: userId, tokenHash });
 
 			return true;
 		});
@@ -60,15 +83,12 @@ export class ConversationSharingService {
 	}
 
 	async revoke(conversationId: string, userId: string) {
-		const revoked = await this.db.$transaction(async (tx) => {
+		const revoked = await this.db.transaction(async (tx) => {
 			if (!(await this.lockOwnedBuilder(tx, conversationId, userId))) {
 				return false;
 			}
 
-			await tx.agentConversationShare.updateMany({
-				where: { conversationId, revokedAt: null },
-				data: { revokedAt: new Date() },
-			});
+			await this.revokeActive(tx, conversationId);
 
 			return true;
 		});
@@ -80,26 +100,48 @@ export class ConversationSharingService {
 	async resolve(token: string, userId: string) {
 		await this.assertWorkspaceMember(userId);
 
-		const share = await this.db.agentConversationShare.findFirst({
-			where: {
-				tokenHash: conversationShareTokenHash(token),
-				revokedAt: null,
-				OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-				conversation: { kind: "BUILDER" },
-			},
-			select: {
-				conversation: {
-					select: {
+		const [shared] = await this.db
+			.select({ conversationId: agentConversationShare.conversationId })
+			.from(agentConversationShare)
+			.innerJoin(
+				agentConversation,
+				eq(agentConversation.id, agentConversationShare.conversationId),
+			)
+			.where(
+				and(
+					eq(
+						agentConversationShare.tokenHash,
+						conversationShareTokenHash(token),
+					),
+					isNull(agentConversationShare.revokedAt),
+					or(
+						isNull(agentConversationShare.expiresAt),
+						gt(agentConversationShare.expiresAt, new Date()),
+					),
+					eq(agentConversation.kind, "BUILDER"),
+				),
+			)
+			.limit(1);
+
+		const conversationRow = shared
+			? await this.db.query.agentConversation.findFirst({
+					where: eq(agentConversation.id, shared.conversationId),
+					columns: {
 						id: true,
 						title: true,
 						sessionId: true,
 						lastMessageAt: true,
-						user: { select: { name: true } },
-						agent: { select: { id: true, name: true, status: true } },
+					},
+					with: {
+						user: { columns: { name: true } },
+						agent: { columns: { id: true, name: true, status: true } },
 						builderArtifacts: {
-							orderBy: [{ createdAt: "desc" }, { revision: "desc" }],
-							take: 100,
-							select: {
+							orderBy: [
+								desc(agentBuilderArtifact.createdAt),
+								desc(agentBuilderArtifact.revision),
+							],
+							limit: 100,
+							columns: {
 								id: true,
 								versionId: true,
 								path: true,
@@ -112,17 +154,19 @@ export class ConversationSharingService {
 							},
 						},
 						submissions: {
-							orderBy: { createdAt: "asc" },
-							select: {
+							orderBy: [asc(agentConversationSubmission.createdAt)],
+							columns: {
 								id: true,
 								commandType: true,
 								message: true,
 								status: true,
 								errorMessage: true,
 								createdAt: true,
+							},
+							with: {
 								attachments: {
-									orderBy: { position: "asc" },
-									select: {
+									orderBy: [asc(agentConversationAttachment.position)],
+									columns: {
 										id: true,
 										name: true,
 										mediaType: true,
@@ -132,37 +176,36 @@ export class ConversationSharingService {
 							},
 						},
 					},
-				},
-			},
-		});
+				})
+			: undefined;
 
-		if (!share) {
+		if (!conversationRow) {
 			throw new NotFoundException("That shared conversation is unavailable.");
 		}
 
-		const { conversation } = share;
-		const events = await this.db.agentEvent.findMany({
-			where: {
-				OR: [
-					{ conversationId: conversation.id },
-					...(conversation.sessionId
-						? [{ sessionId: conversation.sessionId }]
-						: []),
-				],
-			},
-			orderBy: [{ emittedAt: "desc" }, { id: "desc" }],
-			take: 5000,
-			select: {
-				id: true,
-				type: true,
-				data: true,
-				encryptedData: true,
-				conversationId: true,
-				emittedAt: true,
-				streamIndex: true,
-				deliveryIds: true,
-			},
-		});
+		const conversation = conversationRow;
+		const events = await this.db
+			.select({
+				id: agentEvent.id,
+				type: agentEvent.type,
+				data: agentEvent.data,
+				encryptedData: agentEvent.encryptedData,
+				conversationId: agentEvent.conversationId,
+				emittedAt: agentEvent.emittedAt,
+				streamIndex: agentEvent.streamIndex,
+				deliveryIds: agentEvent.deliveryIds,
+			})
+			.from(agentEvent)
+			.where(
+				or(
+					eq(agentEvent.conversationId, conversation.id),
+					conversation.sessionId
+						? eq(agentEvent.sessionId, conversation.sessionId)
+						: undefined,
+				),
+			)
+			.orderBy(desc(agentEvent.emittedAt), desc(agentEvent.id))
+			.limit(5000);
 
 		return {
 			id: conversation.id,
@@ -190,10 +233,17 @@ export class ConversationSharingService {
 	}
 
 	private async ownedBuilder(conversationId: string, userId: string) {
-		const conversation = await this.db.agentConversation.findFirst({
-			where: { id: conversationId, userId, kind: "BUILDER" },
-			select: { id: true },
-		});
+		const [conversation] = await this.db
+			.select({ id: agentConversation.id })
+			.from(agentConversation)
+			.where(
+				and(
+					eq(agentConversation.id, conversationId),
+					eq(agentConversation.userId, userId),
+					eq(agentConversation.kind, "BUILDER"),
+				),
+			)
+			.limit(1);
 
 		if (!conversation) {
 			this.missingBuilder(conversationId);
@@ -203,23 +253,42 @@ export class ConversationSharingService {
 	}
 
 	private async lockOwnedBuilder(
-		tx: Prisma.TransactionClient,
+		tx: Executor,
 		conversationId: string,
 		userId: string,
 	): Promise<boolean> {
-		const rows = await tx.$queryRaw<Array<{ id: string }>>`
-			SELECT id
-			FROM "agentConversation"
-			WHERE id = ${conversationId}
-			FOR UPDATE
-		`;
+		const rows = await tx
+			.select({ id: agentConversation.id })
+			.from(agentConversation)
+			.where(eq(agentConversation.id, conversationId))
+			.for("update");
 		if (rows.length === 0) return false;
 
 		return (
-			(await tx.agentConversation.count({
-				where: { id: conversationId, userId, kind: "BUILDER" },
-			})) === 1
+			(await tx.$count(
+				agentConversation,
+				and(
+					eq(agentConversation.id, conversationId),
+					eq(agentConversation.userId, userId),
+					eq(agentConversation.kind, "BUILDER"),
+				),
+			)) === 1
 		);
+	}
+
+	private async revokeActive(
+		tx: Executor,
+		conversationId: string,
+	): Promise<void> {
+		await tx
+			.update(agentConversationShare)
+			.set({ revokedAt: new Date() })
+			.where(
+				and(
+					eq(agentConversationShare.conversationId, conversationId),
+					isNull(agentConversationShare.revokedAt),
+				),
+			);
 	}
 
 	private missingBuilder(conversationId: string): never {
@@ -229,14 +298,15 @@ export class ConversationSharingService {
 	}
 
 	private async assertWorkspaceMember(userId: string): Promise<void> {
-		const member = await this.db.member.findUnique({
-			where: {
-				organizationId_userId: { organizationId: WORKSPACE_ID, userId },
-			},
-			select: { id: true },
-		});
+		const [membership] = await this.db
+			.select({ id: member.id })
+			.from(member)
+			.where(
+				and(eq(member.organizationId, WORKSPACE_ID), eq(member.userId, userId)),
+			)
+			.limit(1);
 
-		if (!member) {
+		if (!membership) {
 			throw new ForbiddenException(
 				"This conversation belongs to another team.",
 			);

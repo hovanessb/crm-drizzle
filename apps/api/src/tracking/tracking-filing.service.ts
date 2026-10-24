@@ -1,5 +1,21 @@
 import { workspaceDomains } from "@crm/auth/workspace";
-import { ActivityType, type Db, Prisma, RecordSource } from "@crm/db";
+import {
+	ActivityType,
+	activity as activityTable,
+	and,
+	contact as contactTable,
+	type Db,
+	eq,
+	equalsInsensitive,
+	formSubmission,
+	isNull,
+	isUniqueViolation,
+	RecordSource,
+	suppressedContact,
+	suppressedDomain,
+	trackedVisitor,
+	user,
+} from "@crm/db";
 import type { Touch } from "@crm/db/attribution";
 import {
 	CONTACT_CAP_REASON,
@@ -86,10 +102,7 @@ export class TrackingFilingService {
 		const suppressed = await this.suppressed(email, domain);
 		if (suppressed) return this.skip(submission.id, suppressed);
 
-		const existing = await this.db.contact.findFirst({
-			where: { email, archivedAt: null },
-			select: { id: true },
-		});
+		const existing = await this.activeContact(email);
 
 		if (existing) {
 			await this.attach(submission.id, existing.id, submission);
@@ -107,17 +120,19 @@ export class TrackingFilingService {
 
 		let contact: { id: string };
 		try {
-			contact = await this.db.contact.create({
-				data: {
+			const [inserted] = await this.db
+				.insert(contactTable)
+				.values({
 					firstName,
 					lastName,
 					email,
 					companyId,
 					source: RecordSource.TRACKING,
 					lastActivityAt: new Date(),
-				},
-				select: { id: true },
-			});
+				})
+				.returning({ id: contactTable.id });
+			if (!inserted) throw new Error("The contact insert returned no row.");
+			contact = inserted;
 		} catch (error) {
 			await this.counters.release(window);
 
@@ -149,17 +164,20 @@ export class TrackingFilingService {
 		cause: unknown,
 		email: string,
 	): Promise<{ id: string } | null> {
-		if (
-			!(cause instanceof Prisma.PrismaClientKnownRequestError) ||
-			cause.code !== "P2002"
-		) {
-			return null;
-		}
+		if (!isUniqueViolation(cause)) return null;
 
-		return this.db.contact.findFirst({
-			where: { email, archivedAt: null },
-			select: { id: true },
-		});
+		return this.activeContact(email);
+	}
+
+	private async activeContact(email: string): Promise<{ id: string } | null> {
+		const [row] = await this.db
+			.select({ id: contactTable.id })
+			.from(contactTable)
+			.where(
+				and(eq(contactTable.email, email), isNull(contactTable.archivedAt)),
+			)
+			.limit(1);
+		return row ?? null;
 	}
 
 	private async attach(
@@ -172,23 +190,25 @@ export class TrackingFilingService {
 		},
 	): Promise<void> {
 		const { visitorId } = context;
-		const claimed = await this.db.formSubmission.updateMany({
-			where: { id: submissionId, filedAt: null },
-			data: { contactId, filedAt: new Date(), skipReason: null },
-		});
+		const [submission] = await this.db
+			.update(formSubmission)
+			.set({ contactId, filedAt: new Date(), skipReason: null })
+			.where(
+				and(
+					eq(formSubmission.id, submissionId),
+					isNull(formSubmission.filedAt),
+				),
+			)
+			.returning({ host: formSubmission.host, path: formSubmission.path });
 
-		if (claimed.count === 0) return;
-
-		const submission = await this.db.formSubmission.findUniqueOrThrow({
-			where: { id: submissionId },
-			select: { host: true, path: true },
-		});
+		if (!submission) return;
 
 		const author = await this.author(contactId);
 
 		if (author) {
-			const activity = await this.db.activity.create({
-				data: {
+			const [activity] = await this.db
+				.insert(activityTable)
+				.values({
 					type: ActivityType.NOTE,
 					subject: `Submitted a form on ${submission.host}`,
 					body: `${submission.host}${submission.path}`,
@@ -196,11 +216,10 @@ export class TrackingFilingService {
 					occurredAt: new Date(),
 					createdById: author,
 					meta: { automated: true, source: "tracking" },
-				},
-				select: { createdAt: true },
-			});
+				})
+				.returning({ createdAt: activityTable.createdAt });
 
-			await this.stamp.touch({ contactId }, activity.createdAt);
+			if (activity) await this.stamp.touch({ contactId }, activity.createdAt);
 		}
 
 		if (!visitorId) return;
@@ -208,22 +227,25 @@ export class TrackingFilingService {
 		const first = columns(context.firstTouch, "first");
 		const last = columns(context.lastTouch, "last");
 
-		await this.db.trackedVisitor.upsert({
-			where: { id: visitorId },
-			create: { id: visitorId, contactId, ...first, ...last },
-			update: { contactId, ...last },
-		});
+		await this.db
+			.insert(trackedVisitor)
+			.values({ id: visitorId, contactId, ...first, ...last })
+			.onConflictDoUpdate({
+				target: trackedVisitor.id,
+				set: { contactId, ...last },
+			});
 	}
 
 	private async author(contactId: string): Promise<string | null> {
-		const contact = await this.db.contact.findUnique({
-			where: { id: contactId },
-			select: { ownerId: true },
-		});
+		const [contact] = await this.db
+			.select({ ownerId: contactTable.ownerId })
+			.from(contactTable)
+			.where(eq(contactTable.id, contactId))
+			.limit(1);
 
 		if (contact?.ownerId) return contact.ownerId;
 
-		const anyUser = await this.db.user.findFirst({ select: { id: true } });
+		const [anyUser] = await this.db.select({ id: user.id }).from(user).limit(1);
 
 		return anyUser?.id ?? null;
 	}
@@ -232,10 +254,10 @@ export class TrackingFilingService {
 		submissionId: string,
 		reason: string,
 	): Promise<FilingOutcome> {
-		await this.db.formSubmission.update({
-			where: { id: submissionId },
-			data: { skipReason: reason },
-		});
+		await this.db
+			.update(formSubmission)
+			.set({ skipReason: reason })
+			.where(eq(formSubmission.id, submissionId));
 
 		return { filed: false, reason };
 	}
@@ -245,14 +267,18 @@ export class TrackingFilingService {
 		domain: string,
 	): Promise<string | null> {
 		const [contact, host] = await Promise.all([
-			this.db.suppressedContact.findFirst({
-				where: { email: { equals: email, mode: "insensitive" } },
-				select: { email: true },
-			}),
-			this.db.suppressedDomain.findUnique({
-				where: { domain },
-				select: { domain: true },
-			}),
+			this.db
+				.select({ email: suppressedContact.email })
+				.from(suppressedContact)
+				.where(equalsInsensitive(suppressedContact.email, email))
+				.limit(1)
+				.then((rows) => rows[0]),
+			this.db
+				.select({ domain: suppressedDomain.domain })
+				.from(suppressedDomain)
+				.where(eq(suppressedDomain.domain, domain))
+				.limit(1)
+				.then((rows) => rows[0]),
 		]);
 
 		if (contact) return "This address was deleted by a rep";

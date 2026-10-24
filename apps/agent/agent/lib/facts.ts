@@ -1,4 +1,19 @@
-import { db, FactBand, FactStatus, type Prisma } from "@crm/db";
+import {
+	and,
+	contactBrief,
+	contactFact,
+	contact as contactTable,
+	db,
+	desc,
+	eq,
+	FactBand,
+	FactStatus,
+	firstRow,
+	inArray,
+	type JsonValue,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { type Evidence, scoreEvidence } from "./evidence";
 import { currentFocus } from "./focus";
 import { isDerivedName, splitName } from "./names";
@@ -88,21 +103,24 @@ export async function recordFact(
 		};
 	}
 
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: {
-			id: true,
-			email: true,
-			firstName: true,
-			lastName: true,
-			title: true,
-			seniority: true,
-			function: true,
-			linkedinUrl: true,
-			twitterUrl: true,
-			githubUrl: true,
-		},
-	});
+	const contact = await firstRow(
+		db
+			.select({
+				id: contactTable.id,
+				email: contactTable.email,
+				firstName: contactTable.firstName,
+				lastName: contactTable.lastName,
+				title: contactTable.title,
+				seniority: contactTable.seniority,
+				function: contactTable.function,
+				linkedinUrl: contactTable.linkedinUrl,
+				twitterUrl: contactTable.twitterUrl,
+				githubUrl: contactTable.githubUrl,
+			})
+			.from(contactTable)
+			.where(whereEq(contactTable.id, contactId))
+			.limit(1),
+	);
 
 	if (!contact) {
 		return {
@@ -113,10 +131,19 @@ export async function recordFact(
 		};
 	}
 
-	const existing = await db.contactFact.findMany({
-		where: { contactId, field },
-		select: { id: true, value: true, status: true },
-	});
+	const existing = await db
+		.select({
+			id: contactFact.id,
+			value: contactFact.value,
+			status: contactFact.status,
+		})
+		.from(contactFact)
+		.where(
+			and(
+				whereEq(contactFact.contactId, contactId),
+				whereEq(contactFact.field, field),
+			),
+		);
 
 	if (
 		existing.some(
@@ -180,49 +207,63 @@ export async function recordFact(
 
 	const sessionId = currentFocus().sessionId;
 
-	await db.$transaction(async (tx) => {
+	await db.transaction(async (tx) => {
 		if (applies) {
-			await tx.contactFact.updateMany({
-				where: {
-					contactId,
-					field,
-					status: { in: [FactStatus.APPLIED, FactStatus.PROPOSED] },
-				},
-				data: { status: FactStatus.SUPERSEDED, supersededAt: new Date() },
-			});
+			await tx
+				.update(contactFact)
+				.set({ status: FactStatus.SUPERSEDED, supersededAt: new Date() })
+				.where(
+					and(
+						whereEq(contactFact.contactId, contactId),
+						whereEq(contactFact.field, field),
+						inArray(contactFact.status, [
+							FactStatus.APPLIED,
+							FactStatus.PROPOSED,
+						]),
+					),
+				);
 		}
 
-		await tx.contactFact.create({
-			data: {
-				contactId,
-				field,
-				value: trimmed,
-				score: scored.score,
-				band: scored.band as FactBand,
-				evidence: input.evidence as Prisma.InputJsonValue,
-				method: input.method,
-				sourceUrl: input.sourceUrl ?? null,
-				sessionId,
-				status: applies ? FactStatus.APPLIED : FactStatus.PROPOSED,
-			},
-		});
+		await requireRow(
+			tx
+				.insert(contactFact)
+				.values({
+					contactId,
+					field,
+					value: trimmed,
+					score: scored.score,
+					band: scored.band as FactBand,
+					evidence: input.evidence as JsonValue,
+					method: input.method,
+					sourceUrl: input.sourceUrl ?? null,
+					sessionId,
+					status: applies ? FactStatus.APPLIED : FactStatus.PROPOSED,
+				})
+				.returning(),
+		);
 
 		if (!applies) return;
 
 		if (column) {
-			await tx.contact.update({
-				where: { id: contactId },
-				data: { [column]: trimmed },
-			});
+			await requireRow(
+				tx
+					.update(contactTable)
+					.set({ [column]: trimmed })
+					.where(whereEq(contactTable.id, contactId))
+					.returning(),
+			);
 		}
 
 		if (field === "name") {
 			const split = splitName(trimmed);
 			if (split) {
-				await tx.contact.update({
-					where: { id: contactId },
-					data: { firstName: split.firstName, lastName: split.lastName },
-				});
+				await requireRow(
+					tx
+						.update(contactTable)
+						.set({ firstName: split.firstName, lastName: split.lastName })
+						.where(whereEq(contactTable.id, contactId))
+						.returning(),
+				);
 			}
 		}
 	});
@@ -239,16 +280,41 @@ export async function recordFact(
 
 export async function lastEmployerChange(contactId: string) {
 	const [previous, current] = await Promise.all([
-		db.contactFact.findFirst({
-			where: { contactId, field: "employer", status: FactStatus.SUPERSEDED },
-			orderBy: { supersededAt: "desc" },
-			select: { value: true, supersededAt: true },
-		}),
-		db.contactFact.findFirst({
-			where: { contactId, field: "employer", status: FactStatus.APPLIED },
-			orderBy: { observedAt: "desc" },
-			select: { value: true, observedAt: true, sourceUrl: true },
-		}),
+		firstRow(
+			db
+				.select({
+					value: contactFact.value,
+					supersededAt: contactFact.supersededAt,
+				})
+				.from(contactFact)
+				.where(
+					and(
+						whereEq(contactFact.contactId, contactId),
+						eq(contactFact.field, "employer"),
+						eq(contactFact.status, FactStatus.SUPERSEDED),
+					),
+				)
+				.orderBy(desc(contactFact.supersededAt))
+				.limit(1),
+		),
+		firstRow(
+			db
+				.select({
+					value: contactFact.value,
+					observedAt: contactFact.observedAt,
+					sourceUrl: contactFact.sourceUrl,
+				})
+				.from(contactFact)
+				.where(
+					and(
+						whereEq(contactFact.contactId, contactId),
+						eq(contactFact.field, "employer"),
+						eq(contactFact.status, FactStatus.APPLIED),
+					),
+				)
+				.orderBy(desc(contactFact.observedAt))
+				.limit(1),
+		),
 	]);
 
 	if (!previous || !current || sameValue(previous.value, current.value)) {
@@ -291,18 +357,20 @@ export async function writeBrief(input: {
 
 	const data = {
 		narrative: input.narrative.trim(),
-		sections: input.sections as Prisma.InputJsonValue,
+		sections: input.sections as JsonValue,
 		score: scored.score,
 		sourceUrl: input.sourceUrl ?? null,
 		sessionId: currentFocus().sessionId,
 		refreshedAt: new Date(),
 	};
 
-	await db.contactBrief.upsert({
-		where: { contactId: input.contactId },
-		create: { contactId: input.contactId, ...data },
-		update: data,
-	});
+	await requireRow(
+		db
+			.insert(contactBrief)
+			.values({ contactId: input.contactId, ...data })
+			.onConflictDoUpdate({ target: contactBrief.contactId, set: data })
+			.returning(),
+	);
 
 	return { written: true, score: scored.score };
 }

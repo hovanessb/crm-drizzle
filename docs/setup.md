@@ -13,16 +13,20 @@ bun run db:migrate && bun run db:seed
 bun run dev                 # app :3000, api :3001, agent :2000
 ```
 
-Prisma from the repo root: `db:generate`, `db:migrate`, `db:push`, `db:reset`,
-`db:seed`, `db:studio`, `db:deploy`.
+Drizzle from the repo root: `db:generate`, `db:migrate`, `db:check`, `db:push`,
+`db:reset`, `db:seed`, `db:studio`, `db:deploy`.
 
-`dev` depends on `^dev:prepare`, so every start applies pending migrations and
-regenerates the Prisma client before a single server boots. That is why the first
-run needs `db:migrate` only for the seed that follows it. When the database and
-`schema.prisma` have diverged past what `migrate deploy` can reconcile,
-`dev:prepare` stops the whole run rather than starting servers against a schema
-they do not match — reconcile with `db:migrate`, or `db:reset` when the divergence
-is an edited migration that has already been applied.
+`dev` depends on `^dev:prepare`, so every start applies pending migrations before a
+single server boots. That is why the first run needs `db:migrate` only for the seed
+that follows it. When `src/schema/schema.ts` has changes that no migration in
+`packages/db/drizzle` covers, `dev:prepare` stops the whole run rather than
+starting servers against a schema the database does not have — create the
+migration with `db:migrate`, or `db:reset` when the divergence is an edited
+migration that has already been applied.
+
+A database that the Prisma releases migrated needs no manual step. `db:deploy`
+adopts it when every Prisma migration is recorded, and refuses it otherwise.
+`packages/db/README.md` says how.
 
 ## Google Cloud
 
@@ -95,12 +99,12 @@ the live database. On 2026-08-01 eleven migrations landed on Neon from a laptop.
 2. **`packages/db/scripts/require-local-db.ts` guards `db:migrate`, `db:push`,
    `db:reset`, `db:seed`** and takes `ALLOW_REMOTE_DB=1`. `db:deploy` is unguarded on
    purpose. It reads the root files directly rather than `process.env`, because Bun
-   auto-loads the working directory's `.env` while Prisma's CLI only sees
-   `@crm/env/load`.
+   auto-loads the working directory's `.env` while drizzle-kit only sees
+   `loadRootEnv()`.
 
 ## Migrations run on the production deploy, and nowhere else
 
-`apps/api/scripts/build-func.mjs` runs `prisma migrate deploy` during the crm-api
+`apps/api/scripts/build-func.mjs` runs `bun scripts/migrate.ts` in `packages/db` during the crm-api
 build, gated on `VERCEL_ENV === "production"`. The schema therefore moves when the
 release pull request merges and `release` deploys — with the code that needs it,
 and once rather than once per branch.
@@ -113,14 +117,15 @@ builds, and the pages that touch them fail. Test schema changes locally, where
 worse: every preview applied its own migrations to the production database, so on
 2026-08-07 the live schema ran six migrations ahead of the live code all day.
 
-### `migrate deploy` is not proof the schema is right
+### Applied migrations are not proof the schema is right
 
-The build follows the deploy with `prisma migrate diff --exit-code` against
-`schema.prisma` and shouts in the build log when they disagree. **`No pending
-migrations to apply` only means `_prisma_migrations` has a row for every file** —
-it says nothing about what the tables actually look like.
+The build follows the deploy with `scripts/check-drift.ts`, which fails when
+`src/schema/schema.ts` has changes that no migration covers, and shouts in the build
+log when it does. **It does not compare the live tables.** A row in
+`drizzle.__drizzle_migrations` for every file says nothing about what the tables
+actually look like.
 
-They came apart once. A `prisma db push` shaped production from a laptop, the
+They came apart once, under Prisma. A `prisma db push` shaped production from a laptop, the
 migration rows were recorded as applied without their SQL ever running, and
 `agentConversationAttachment` went live without its `position` column. Every deploy
 reported nothing pending, for days, while `conversations.builderById` returned 500.
@@ -128,11 +133,12 @@ The tell is an object in the database that no migration defines — there was an
 `agentConversationAttachment_submissionId_createdAt_idx` that appears in no
 migration file, only in a `db push` of an older schema.
 
-Reconciling is one command, and it is worth reading before running:
+To see what the live database lacks, introspect it and read the result before
+running anything:
 
 ```sh
-DATABASE_URL="…" bunx prisma migrate diff \
-  --from-config-datasource --to-schema prisma/schema.prisma --script
+cd packages/db
+bunx drizzle-kit pull --dialect postgresql --url "…" --out /tmp/live
 ```
 
 ## Secrets hygiene
@@ -151,11 +157,11 @@ bun run --filter=agent test    # integration specs need DATABASE_URL + real Post
 
 ### The test database rebuilds itself when it drifts
 
-`bun run db:test` creates `crm_test` and runs `migrate deploy` on it. The database
+`bun run db:test` creates `crm_test` and applies the migrations to it. The database
 name must end in `_test`; the suite deletes rows it expects to put back, so it
 refuses anything else.
 
-**`migrate deploy` only applies migrations that are missing. It never removes a
+**Migrating only applies migrations that are missing. It never removes a
 table, a column or a constraint the database has and the schema does not.** A
 `crm_test` built on a branch that was later abandoned therefore keeps that branch's
 objects forever, and `db:test` used to report `already exists` and move on. The
@@ -168,8 +174,8 @@ So `db:test` now checks the database it found and rebuilds it when either is tru
 
 - **It holds a migration this branch does not have.** The database came from
   another branch. The name of the first one is printed.
-- **It no longer matches `schema.prisma`**, by `prisma migrate diff`. Something
-  was pushed or altered by hand.
+- **It was migrated from different migration files.** A migration file changed
+  after the database applied it.
 
 A rebuild drops the database and re-runs every migration, and it says which of the
 two reasons fired. Force one with `bun run db:test --reset`. Nothing else in the

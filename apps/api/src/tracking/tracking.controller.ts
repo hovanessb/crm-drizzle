@@ -1,5 +1,5 @@
 import type { IncomingMessage } from "node:http";
-import type { Db } from "@crm/db";
+import { type Db, sql } from "@crm/db";
 import {
 	EVENT_RETENTION_DAYS,
 	isSiteId,
@@ -220,14 +220,15 @@ export class TrackingRetentionController {
 		let removed = 0;
 
 		for (let pass = 0; pass < MAX_SWEEP_PASSES; pass += 1) {
-			const deleted = await this.db.$executeRaw`
+			const result = await this.db.execute(sql`
 				DELETE FROM "trackedEvent"
 				WHERE "id" IN (
 					SELECT "id" FROM "trackedEvent"
 					WHERE "occurredAt" < ${before}
 					LIMIT ${SWEEP_BATCH}
 				);
-			`;
+			`);
+			const deleted = result.rowCount ?? 0;
 
 			removed += deleted;
 			if (deleted < SWEEP_BATCH) return { removed, complete: true };
@@ -237,7 +238,7 @@ export class TrackingRetentionController {
 	}
 
 	private async sweepVisitors(before: Date): Promise<number> {
-		const orphaned = await this.db.$executeRaw`
+		const orphaned = await this.db.execute(sql`
 			DELETE FROM "trackedVisitor"
 			WHERE "contactId" IS NULL
 				AND "lastSeen" < ${before}
@@ -245,9 +246,9 @@ export class TrackingRetentionController {
 					SELECT 1 FROM "trackedEvent"
 					WHERE "trackedEvent"."visitorId" = "trackedVisitor"."id"
 				);
-		`;
+		`);
 
-		return orphaned;
+		return orphaned.rowCount ?? 0;
 	}
 }
 

@@ -1,5 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db, type MailboxSyncModel as MailboxSync } from "@crm/db";
+import {
+	activity,
+	company as companyTable,
+	contact,
+	db,
+	emailMessage,
+	emailThread,
+	eq,
+	inArray,
+	type MailboxSync,
+	mailboxSync,
+	user,
+} from "@crm/db";
 import type { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import { CompanyDirectoryService } from "../src/companies/company-directory.service";
 import { ActivityStampService } from "../src/crm/activity-stamp.service";
@@ -10,6 +22,7 @@ import {
 	ThreadWriterService,
 } from "../src/mailbox/thread-writer.service";
 import { withDiscardedCrmEvents } from "./agent-trigger.stub";
+import { first, one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "thread-writer-spec";
 const domain = `threads-${suffix}.test`;
@@ -50,37 +63,48 @@ function message(id: string, sentAt: Date, root = rootId): IncomingMessage {
 }
 
 async function clean() {
-	await db.emailThread.deleteMany({
-		where: { rootMessageId: { in: [rootId, movedRoot] } },
-	});
-	await db.contact.deleteMany({ where: { email: person } });
-	await db.company.deleteMany({ where: { domain } });
-	await db.mailboxSync.deleteMany({ where: { userId } });
-	await db.user.deleteMany({ where: { id: userId } });
+	await db
+		.delete(emailThread)
+		.where(inArray(emailThread.rootMessageId, [rootId, movedRoot]));
+	await db.delete(contact).where(eq(contact.email, person));
+	await db.delete(companyTable).where(eq(companyTable.domain, domain));
+	await db.delete(mailboxSync).where(eq(mailboxSync.userId, userId));
+	await db.delete(user).where(eq(user.id, userId));
 }
 
 beforeAll(async () => {
 	await clean();
 
-	await db.user.create({
-		data: { id: userId, name: "Test Rep", email: mailbox },
-	});
-	row = await db.mailboxSync.create({
-		data: { userId, source: "gmail", autoCreate: false },
-	});
+	await one(
+		db
+			.insert(user)
+			.values({ id: userId, name: "Test Rep", email: mailbox })
+			.returning(),
+	);
+	row = await one(
+		db
+			.insert(mailboxSync)
+			.values({ userId, source: "gmail", autoCreate: false })
+			.returning(),
+	);
 
-	const company = await db.company.create({
-		data: { name: "Buyer Co", domain },
-		select: { id: true },
-	});
-	await db.contact.create({
-		data: {
-			firstName: "A",
-			lastName: "Buyer",
-			email: person,
-			companyId: company.id,
-		},
-	});
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: "Buyer Co", domain })
+			.returning({ id: companyTable.id }),
+	);
+	await one(
+		db
+			.insert(contact)
+			.values({
+				firstName: "A",
+				lastName: "Buyer",
+				email: person,
+				companyId: company.id,
+			})
+			.returning(),
+	);
 });
 
 afterAll(clean);
@@ -96,13 +120,10 @@ describe("storing a synced email", () => {
 
 		expect(stored).toBe(true);
 
-		const thread = await db.emailThread.findUnique({
-			where: { rootMessageId: rootId },
-			select: {
-				id: true,
-				messageCount: true,
-				activity: { select: { id: true } },
-			},
+		const thread = await db.query.emailThread.findFirst({
+			where: eq(emailThread.rootMessageId, rootId),
+			columns: { id: true, messageCount: true },
+			with: { activity: { columns: { id: true } } },
 		});
 
 		expect(thread?.messageCount).toBe(1);
@@ -110,17 +131,23 @@ describe("storing a synced email", () => {
 	});
 
 	it("repairs a thread whose projection was lost rather than skipping it forever", async () => {
-		const thread = await db.emailThread.findUnique({
-			where: { rootMessageId: rootId },
-			select: { id: true },
-		});
+		const thread = await first(
+			db
+				.select({ id: emailThread.id })
+				.from(emailThread)
+				.where(eq(emailThread.rootMessageId, rootId))
+				.limit(1),
+		);
 		if (!thread) throw new Error("the first message was not stored");
 
-		await db.activity.deleteMany({ where: { emailThreadId: thread.id } });
-		await db.emailThread.update({
-			where: { id: thread.id },
-			data: { messageCount: 0 },
-		});
+		await db.delete(activity).where(eq(activity.emailThreadId, thread.id));
+		await one(
+			db
+				.update(emailThread)
+				.set({ messageCount: 0 })
+				.where(eq(emailThread.id, thread.id))
+				.returning(),
+		);
 
 		const stored = await threads.store(
 			row,
@@ -131,9 +158,10 @@ describe("storing a synced email", () => {
 
 		expect(stored).toBe(false);
 
-		const repaired = await db.emailThread.findUnique({
-			where: { id: thread.id },
-			select: { messageCount: true, activity: { select: { id: true } } },
+		const repaired = await db.query.emailThread.findFirst({
+			where: eq(emailThread.id, thread.id),
+			columns: { messageCount: true },
+			with: { activity: { columns: { id: true } } },
 		});
 
 		expect(repaired?.messageCount).toBe(1);
@@ -154,14 +182,16 @@ describe("storing a synced email", () => {
 
 		expect(results.filter(Boolean)).toHaveLength(1);
 		expect(
-			await db.emailMessage.count({
-				where: { rfcMessageId: parsed.rfcMessageId },
-			}),
+			await db.$count(
+				emailMessage,
+				eq(emailMessage.rfcMessageId, parsed.rfcMessageId),
+			),
 		).toBe(1);
 
-		const thread = await db.emailThread.findUnique({
-			where: { rootMessageId: rootId },
-			select: { messageCount: true, activity: { select: { id: true } } },
+		const thread = await db.query.emailThread.findFirst({
+			where: eq(emailThread.rootMessageId, rootId),
+			columns: { messageCount: true },
+			with: { activity: { columns: { id: true } } },
 		});
 
 		expect(thread?.messageCount).toBe(2);
@@ -169,17 +199,23 @@ describe("storing a synced email", () => {
 	});
 
 	it("repairs the thread the message is already on when the root id has moved", async () => {
-		const thread = await db.emailThread.findUnique({
-			where: { rootMessageId: rootId },
-			select: { id: true },
-		});
+		const thread = await first(
+			db
+				.select({ id: emailThread.id })
+				.from(emailThread)
+				.where(eq(emailThread.rootMessageId, rootId))
+				.limit(1),
+		);
 		if (!thread) throw new Error("the first message was not stored");
 
-		await db.activity.deleteMany({ where: { emailThreadId: thread.id } });
-		await db.emailThread.update({
-			where: { id: thread.id },
-			data: { messageCount: 0 },
-		});
+		await db.delete(activity).where(eq(activity.emailThreadId, thread.id));
+		await one(
+			db
+				.update(emailThread)
+				.set({ messageCount: 0 })
+				.where(eq(emailThread.id, thread.id))
+				.returning(),
+		);
 
 		const stored = await threads.store(
 			row,
@@ -194,12 +230,13 @@ describe("storing a synced email", () => {
 
 		expect(stored).toBe(false);
 		expect(
-			await db.emailThread.count({ where: { rootMessageId: movedRoot } }),
+			await db.$count(emailThread, eq(emailThread.rootMessageId, movedRoot)),
 		).toBe(0);
 
-		const repaired = await db.emailThread.findUnique({
-			where: { id: thread.id },
-			select: { messageCount: true, activity: { select: { id: true } } },
+		const repaired = await db.query.emailThread.findFirst({
+			where: eq(emailThread.id, thread.id),
+			columns: { messageCount: true },
+			with: { activity: { columns: { id: true } } },
 		});
 
 		expect(repaired?.messageCount).toBe(2);

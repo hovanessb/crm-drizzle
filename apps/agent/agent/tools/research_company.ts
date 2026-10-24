@@ -1,4 +1,13 @@
-import { ActivityType, db } from "@crm/db";
+import {
+	ActivityType,
+	activity as activityTable,
+	company as companyTable,
+	db,
+	firstRow,
+	requireRow,
+	user,
+	whereEq,
+} from "@crm/db";
 import { defineTool } from "eve/tools";
 import { z } from "zod";
 import { extract, type JsonSchema } from "../lib/context-dev";
@@ -75,16 +84,19 @@ export default defineTool({
 		companyId: z.string(),
 	}),
 	async execute({ companyId }) {
-		const company = await db.company.findUnique({
-			where: { id: companyId },
-			select: {
-				id: true,
-				name: true,
-				domain: true,
-				website: true,
-				ownerId: true,
-			},
-		});
+		const company = await firstRow(
+			db
+				.select({
+					id: companyTable.id,
+					name: companyTable.name,
+					domain: companyTable.domain,
+					website: companyTable.website,
+					ownerId: companyTable.ownerId,
+				})
+				.from(companyTable)
+				.where(whereEq(companyTable.id, companyId))
+				.limit(1),
+		);
 
 		if (!company)
 			return { written: false as const, reason: "No such company." };
@@ -110,38 +122,43 @@ export default defineTool({
 
 		const author =
 			company.ownerId ??
-			(await db.user.findFirst({ select: { id: true } }))?.id ??
+			(await firstRow(db.select({ id: user.id }).from(user).limit(1)))?.id ??
 			null;
 
 		if (!author)
 			return { written: false as const, reason: "No user to attribute to." };
 
 		const scalar = briefScalar.parse(result.data);
-		const activity = await db.activity.create({
-			data: {
-				type: ActivityType.ENRICHMENT,
-				subject: `Research brief — ${company.name}`,
-				body:
-					scalar === null
-						? formatBrief(researchBrief.parse(result.data))
-						: String(scalar),
-				occurredAt: new Date(),
-				companyId: company.id,
-				createdById: author,
-				meta: {
-					source: "context.dev",
-					endpoint: "web/extract",
-					creditCost: 10,
-					agent: "people-research",
-				},
-			},
-			select: { id: true },
-		});
+		const activity = await requireRow(
+			db
+				.insert(activityTable)
+				.values({
+					type: ActivityType.ENRICHMENT,
+					subject: `Research brief — ${company.name}`,
+					body:
+						scalar === null
+							? formatBrief(researchBrief.parse(result.data))
+							: String(scalar),
+					occurredAt: new Date(),
+					companyId: company.id,
+					createdById: author,
+					meta: {
+						source: "context.dev",
+						endpoint: "web/extract",
+						creditCost: 10,
+						agent: "people-research",
+					},
+				})
+				.returning({ id: activityTable.id }),
+		);
 
-		await db.company.update({
-			where: { id: companyId },
-			data: { lastActivityAt: new Date() },
-		});
+		await requireRow(
+			db
+				.update(companyTable)
+				.set({ lastActivityAt: new Date() })
+				.where(whereEq(companyTable.id, companyId))
+				.returning(),
+		);
 
 		return { written: true as const, activityId: activity.id };
 	},

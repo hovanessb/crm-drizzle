@@ -1,5 +1,24 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	agentAuditEvent,
+	agentBuilderArtifact,
+	agentConversation,
+	agentDefinition,
+	agentEvent,
+	agentTrigger,
+	agentVersion,
+	and,
+	asc,
+	db,
+	desc,
+	eq,
+	firstRow,
+	inArray,
+	or,
+	requireRow,
+	user,
+	whereEq,
+} from "@crm/db";
 import { persistBuilderInputRequest } from "../agent/lib/builder-input";
 import {
 	saveBuilderDraft,
@@ -15,62 +34,73 @@ let agentId = "";
 const conversationIds: string[] = [];
 
 beforeAll(async () => {
-	await db.user.create({
-		data: {
-			id: userId,
-			name: "Builder Runtime Test",
-			email: `${userId}@example.test`,
-		},
-	});
-	const conversation = await db.agentConversation.create({
-		data: {
-			kind: "BUILDER",
-			userId,
-			sessionId: `builder-question-session-${suffix}`,
-		},
-		select: { id: true },
-	});
+	await requireRow(
+		db
+			.insert(user)
+			.values({
+				id: userId,
+				name: "Builder Runtime Test",
+				email: `${userId}@example.test`,
+			})
+			.returning(),
+	);
+	const conversation = await requireRow(
+		db
+			.insert(agentConversation)
+			.values({
+				kind: "BUILDER",
+				userId,
+				sessionId: `builder-question-session-${suffix}`,
+			})
+			.returning({ id: agentConversation.id }),
+	);
 	conversationId = conversation.id;
 	conversationIds.push(conversation.id);
 });
 
 afterAll(async () => {
 	const agentIds = (
-		await db.agentDefinition.findMany({
-			where: { createdById: userId },
-			select: { id: true },
-		})
+		await db
+			.select({ id: agentDefinition.id })
+			.from(agentDefinition)
+			.where(whereEq(agentDefinition.createdById, userId))
 	).map((agent) => agent.id);
 	if (agentIds.length > 0) {
-		await db.agentBuilderArtifact.deleteMany({
-			where: {
-				OR: [
-					{ conversationId: { in: conversationIds } },
-					{ version: { agentId: { in: agentIds } } },
-				],
-			},
-		});
-		await db.agentAuditEvent.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentTrigger.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentDefinition.updateMany({
-			where: { id: { in: agentIds } },
-			data: { currentVersionId: null },
-		});
-		await db.agentVersion.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentDefinition.deleteMany({
-			where: { id: { in: agentIds } },
-		});
+		await db
+			.delete(agentBuilderArtifact)
+			.where(
+				or(
+					inArray(agentBuilderArtifact.conversationId, conversationIds),
+					inArray(
+						agentBuilderArtifact.versionId,
+						db
+							.select({ id: agentVersion.id })
+							.from(agentVersion)
+							.where(inArray(agentVersion.agentId, agentIds)),
+					),
+				),
+			);
+		await db
+			.delete(agentAuditEvent)
+			.where(inArray(agentAuditEvent.agentId, agentIds));
+		await db
+			.delete(agentTrigger)
+			.where(inArray(agentTrigger.agentId, agentIds));
+		await db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(inArray(agentDefinition.id, agentIds));
+		await db
+			.delete(agentVersion)
+			.where(inArray(agentVersion.agentId, agentIds));
+		await db
+			.delete(agentDefinition)
+			.where(inArray(agentDefinition.id, agentIds));
 	}
-	await db.agentConversation.deleteMany({
-		where: { id: { in: conversationIds } },
-	});
-	await db.user.deleteMany({ where: { id: userId } });
+	await db
+		.delete(agentConversation)
+		.where(inArray(agentConversation.id, conversationIds));
+	await db.delete(user).where(whereEq(user.id, userId));
 });
 
 describe("builder persistence", () => {
@@ -99,21 +129,37 @@ describe("builder persistence", () => {
 			await persistBuilderInputRequest(event, undefined, conversationId),
 		).toBe(true);
 		expect(
-			await db.agentConversation.findUnique({
-				where: { id: conversationId },
-				select: { continuationToken: true, pendingInputRequests: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						continuationToken: agentConversation.continuationToken,
+						pendingInputRequests: agentConversation.pendingInputRequests,
+					})
+					.from(agentConversation)
+					.where(whereEq(agentConversation.id, conversationId))
+					.limit(1),
+			),
 		).toEqual({
 			continuationToken: builderToken(conversationId),
 			pendingInputRequests: [request],
 		});
 		expect(
-			await db.agentEvent.findUnique({
-				where: {
-					id: `builder-input:${conversationId}:${event.turnId}:${event.sequence}:${event.stepIndex}`,
-				},
-				select: { conversationId: true, type: true, data: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						conversationId: agentEvent.conversationId,
+						type: agentEvent.type,
+						data: agentEvent.data,
+					})
+					.from(agentEvent)
+					.where(
+						whereEq(
+							agentEvent.id,
+							`builder-input:${conversationId}:${event.turnId}:${event.sequence}:${event.stepIndex}`,
+						),
+					)
+					.limit(1),
+			),
 		).toEqual({
 			conversationId,
 			type: "input.requested",
@@ -151,29 +197,38 @@ describe("builder persistence", () => {
 		).toBe(false);
 
 		expect(
-			await db.agentConversation.findUnique({
-				where: { id: conversationId },
-				select: { pendingInputRequests: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						pendingInputRequests: agentConversation.pendingInputRequests,
+					})
+					.from(agentConversation)
+					.where(whereEq(agentConversation.id, conversationId))
+					.limit(1),
+			),
 		).toEqual({ pendingInputRequests: newer.requests });
 		expect(
-			await db.agentEvent.count({
-				where: {
-					id: `builder-input:${conversationId}:${event.turnId}:2:${event.stepIndex}`,
-				},
-			}),
+			await db.$count(
+				agentEvent,
+				whereEq(
+					agentEvent.id,
+					`builder-input:${conversationId}:${event.turnId}:2:${event.stepIndex}`,
+				),
+			),
 		).toBe(0);
 	});
 
 	it("persists every request from the same event", async () => {
-		const conversation = await db.agentConversation.create({
-			data: {
-				kind: "BUILDER",
-				userId,
-				sessionId: `builder-approval-session-${suffix}`,
-			},
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({
+					kind: "BUILDER",
+					userId,
+					sessionId: `builder-approval-session-${suffix}`,
+				})
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 		const approval = {
 			kind: "tool-approval" as const,
@@ -230,22 +285,29 @@ describe("builder persistence", () => {
 			),
 		).toBe(true);
 		expect(
-			await db.agentConversation.findUnique({
-				where: { id: conversation.id },
-				select: { pendingInputRequests: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						pendingInputRequests: agentConversation.pendingInputRequests,
+					})
+					.from(agentConversation)
+					.where(whereEq(agentConversation.id, conversation.id))
+					.limit(1),
+			),
 		).toEqual({ pendingInputRequests: [question, approval, sessionLimit] });
 	});
 
 	it("ignores a delayed question from a turn the session has already left", async () => {
-		const conversation = await db.agentConversation.create({
-			data: {
-				kind: "BUILDER",
-				userId,
-				sessionId: `builder-stale-turn-session-${suffix}`,
-			},
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({
+					kind: "BUILDER",
+					userId,
+					sessionId: `builder-stale-turn-session-${suffix}`,
+				})
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 
 		const question = (requestId: string, prompt: string) => ({
@@ -289,25 +351,31 @@ describe("builder persistence", () => {
 		).toBe(false);
 
 		expect(
-			await db.agentConversation.findUnique({
-				where: { id: conversation.id },
-				select: { pendingInputRequests: true },
-			}),
+			await firstRow(
+				db
+					.select({
+						pendingInputRequests: agentConversation.pendingInputRequests,
+					})
+					.from(agentConversation)
+					.where(whereEq(agentConversation.id, conversation.id))
+					.limit(1),
+			),
 		).toEqual({ pendingInputRequests: [current] });
 		expect(
-			await db.agentEvent.count({
-				where: {
-					id: `builder-input:${conversation.id}:turn_3:3:7`,
-				},
-			}),
+			await db.$count(
+				agentEvent,
+				whereEq(agentEvent.id, `builder-input:${conversation.id}:turn_3:3:7`),
+			),
 		).toBe(0);
 	});
 
 	it("sets a concise model-authored title only once", async () => {
-		const conversation = await db.agentConversation.create({
-			data: { kind: "BUILDER", userId },
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({ kind: "BUILDER", userId })
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 
 		expect(
@@ -378,14 +446,30 @@ describe("builder persistence", () => {
 		expect(new Set(saved.map((save) => save.agentId)).size).toBe(1);
 		expect(new Set(saved.map((save) => save.versionId)).size).toBe(1);
 		agentId = saved[0]?.agentId ?? "";
-		expect(await db.agentDefinition.count({ where: { id: agentId } })).toBe(1);
-		expect(await db.agentVersion.count({ where: { agentId } })).toBe(1);
+		expect(
+			await db.$count(agentDefinition, whereEq(agentDefinition.id, agentId)),
+		).toBe(1);
+		expect(
+			await db.$count(agentVersion, whereEq(agentVersion.agentId, agentId)),
+		).toBe(1);
 
-		const artifact = await db.agentBuilderArtifact.findFirstOrThrow({
-			where: { conversationId, path: "agent/instructions.md" },
-			orderBy: { revision: "desc" },
-			select: { revision: true, status: true, versionId: true },
-		});
+		const artifact = await requireRow(
+			db
+				.select({
+					revision: agentBuilderArtifact.revision,
+					status: agentBuilderArtifact.status,
+					versionId: agentBuilderArtifact.versionId,
+				})
+				.from(agentBuilderArtifact)
+				.where(
+					and(
+						whereEq(agentBuilderArtifact.conversationId, conversationId),
+						eq(agentBuilderArtifact.path, "agent/instructions.md"),
+					),
+				)
+				.orderBy(desc(agentBuilderArtifact.revision))
+				.limit(1),
+		);
 		expect(artifact).toEqual({
 			revision: 1,
 			status: "READY",
@@ -394,10 +478,12 @@ describe("builder persistence", () => {
 	});
 
 	it("assigns consecutive versions to distinct concurrent drafts", async () => {
-		const conversation = await db.agentConversation.create({
-			data: { kind: "BUILDER", userId },
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({ kind: "BUILDER", userId })
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 		const base = {
 			description: "Prepare a distinct CRM run summary.",
@@ -436,17 +522,20 @@ describe("builder persistence", () => {
 			1, 2, 3, 4,
 		]);
 		expect(
-			await db.agentVersion.count({
-				where: { agentId: saved[0]?.agentId },
-			}),
+			await db.$count(
+				agentVersion,
+				whereEq(agentVersion.agentId, saved[0]?.agentId),
+			),
 		).toBe(4);
 	});
 
 	it("persists every event trigger on one agent version", async () => {
-		const conversation = await db.agentConversation.create({
-			data: { kind: "BUILDER", userId },
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({ kind: "BUILDER", userId })
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 
 		const saved = await saveBuilderDraft(conversation.id, userId, {
@@ -488,21 +577,24 @@ describe("builder persistence", () => {
 		if (!saved.saved) throw new Error("Lifecycle draft was not saved");
 
 		expect(
-			await db.agentTrigger.findMany({
-				where: { versionId: saved.versionId },
-				orderBy: { createdAt: "asc" },
-				select: { type: true, config: true },
-			}),
+			await db
+				.select({ type: agentTrigger.type, config: agentTrigger.config })
+				.from(agentTrigger)
+				.where(whereEq(agentTrigger.versionId, saved.versionId))
+				.orderBy(asc(agentTrigger.createdAt)),
 		).toEqual([
 			{ type: "EVENT", config: { event: "deal.created" } },
 			{ type: "EVENT", config: { event: "deal.opened" } },
 			{ type: "EVENT", config: { event: "deal.closed" } },
 		]);
 
-		const version = await db.agentVersion.findUniqueOrThrow({
-			where: { id: saved.versionId },
-			select: { manifest: true },
-		});
+		const version = await requireRow(
+			db
+				.select({ manifest: agentVersion.manifest })
+				.from(agentVersion)
+				.where(whereEq(agentVersion.id, saved.versionId))
+				.limit(1),
+		);
 		expect(version.manifest).toMatchObject({
 			triggers: [
 				{ config: { event: "deal.created" } },
@@ -513,10 +605,12 @@ describe("builder persistence", () => {
 	});
 
 	it("fails closed on unsupported integrations and ambiguous record scope", async () => {
-		const conversation = await db.agentConversation.create({
-			data: { kind: "BUILDER", userId },
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({ kind: "BUILDER", userId })
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 		const base = {
 			name: "Safe scope",
@@ -593,10 +687,12 @@ describe("builder persistence", () => {
 	});
 
 	it("keeps a live definition unchanged until a revised version is deployed", async () => {
-		const conversation = await db.agentConversation.create({
-			data: { kind: "BUILDER", userId },
-			select: { id: true },
-		});
+		const conversation = await requireRow(
+			db
+				.insert(agentConversation)
+				.values({ kind: "BUILDER", userId })
+				.returning({ id: agentConversation.id }),
+		);
 		conversationIds.push(conversation.id);
 
 		const original = {
@@ -625,21 +721,27 @@ describe("builder persistence", () => {
 		const first = await saveBuilderDraft(conversation.id, userId, original);
 		if (!first.saved) throw new Error("Initial draft was not saved");
 
-		await db.$transaction([
-			db.agentVersion.update({
-				where: { id: first.versionId },
-				data: { status: "DEPLOYED" },
-			}),
-			db.agentDefinition.update({
-				where: { id: first.agentId },
-				data: {
-					name: "Workspace pulse",
-					description: "Team-visible description",
-					status: "LIVE",
-					currentVersionId: first.versionId,
-				},
-			}),
-		]);
+		await db.transaction(async (tx) => {
+			await requireRow(
+				tx
+					.update(agentVersion)
+					.set({ status: "DEPLOYED" })
+					.where(eq(agentVersion.id, first.versionId))
+					.returning(),
+			);
+			await requireRow(
+				tx
+					.update(agentDefinition)
+					.set({
+						name: "Workspace pulse",
+						description: "Team-visible description",
+						status: "LIVE",
+						currentVersionId: first.versionId,
+					})
+					.where(eq(agentDefinition.id, first.agentId))
+					.returning(),
+			);
+		});
 
 		const revised = {
 			...original,
@@ -656,23 +758,41 @@ describe("builder persistence", () => {
 		if (!second.saved) throw new Error("Revised draft was not saved");
 
 		const [definition, version, artifacts] = await Promise.all([
-			db.agentDefinition.findUniqueOrThrow({
-				where: { id: first.agentId },
-				select: {
-					name: true,
-					description: true,
-					status: true,
-					currentVersionId: true,
-				},
-			}),
-			db.agentVersion.findUniqueOrThrow({
-				where: { id: second.versionId },
-				select: { number: true, status: true, manifest: true },
-			}),
-			db.agentBuilderArtifact.findMany({
-				where: { conversationId: conversation.id, versionId: second.versionId },
-				select: { path: true, status: true },
-			}),
+			requireRow(
+				db
+					.select({
+						name: agentDefinition.name,
+						description: agentDefinition.description,
+						status: agentDefinition.status,
+						currentVersionId: agentDefinition.currentVersionId,
+					})
+					.from(agentDefinition)
+					.where(whereEq(agentDefinition.id, first.agentId))
+					.limit(1),
+			),
+			requireRow(
+				db
+					.select({
+						number: agentVersion.number,
+						status: agentVersion.status,
+						manifest: agentVersion.manifest,
+					})
+					.from(agentVersion)
+					.where(whereEq(agentVersion.id, second.versionId))
+					.limit(1),
+			),
+			db
+				.select({
+					path: agentBuilderArtifact.path,
+					status: agentBuilderArtifact.status,
+				})
+				.from(agentBuilderArtifact)
+				.where(
+					and(
+						whereEq(agentBuilderArtifact.conversationId, conversation.id),
+						whereEq(agentBuilderArtifact.versionId, second.versionId),
+					),
+				),
 		]);
 
 		expect(second.versionId).not.toBe(first.versionId);
@@ -695,9 +815,13 @@ describe("builder persistence", () => {
 			true,
 		);
 		expect(
-			await db.agentBuilderArtifact.count({
-				where: { conversationId: conversation.id, status: "WRITING" },
-			}),
+			await db.$count(
+				agentBuilderArtifact,
+				and(
+					whereEq(agentBuilderArtifact.conversationId, conversation.id),
+					eq(agentBuilderArtifact.status, "WRITING"),
+				),
+			),
 		).toBe(0);
 	});
 });

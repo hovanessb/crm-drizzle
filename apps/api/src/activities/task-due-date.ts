@@ -1,4 +1,4 @@
-import type { Prisma } from "@crm/db";
+import { activity, and, gte, isNull, lt, type SQL } from "@crm/db";
 import { BadRequestException } from "@nestjs/common";
 import { z } from "zod";
 import { TASKS } from "./activities-config";
@@ -65,20 +65,26 @@ export function serializeTaskDueDay(value: Date | null): string | null {
 export function taskWindowFilter(
 	window: TaskWindow,
 	reference: Date,
-): Prisma.ActivityWhereInput {
+): SQL | undefined {
 	const { startOfToday, startOfTomorrow, startOfNextWeek } =
 		taskDayBoundaries(reference);
 
 	switch (window) {
 		case "overdue":
-			return { dueAt: { lt: startOfToday } };
+			return lt(activity.dueAt, startOfToday);
 		case "today":
-			return { dueAt: { gte: startOfToday, lt: startOfTomorrow } };
+			return and(
+				gte(activity.dueAt, startOfToday),
+				lt(activity.dueAt, startOfTomorrow),
+			);
 		case "week":
-			return { dueAt: { gte: startOfTomorrow, lt: startOfNextWeek } };
+			return and(
+				gte(activity.dueAt, startOfTomorrow),
+				lt(activity.dueAt, startOfNextWeek),
+			);
 		case "later":
-			return { dueAt: { gte: startOfNextWeek } };
+			return gte(activity.dueAt, startOfNextWeek);
 		case "none":
-			return { dueAt: null };
+			return isNull(activity.dueAt);
 	}
 }

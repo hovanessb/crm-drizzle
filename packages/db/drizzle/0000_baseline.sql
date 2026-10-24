@@ -1441,3 +1441,5 @@ ALTER TABLE "slackMemberMatch" ADD CONSTRAINT "slackMemberMatch_crmUserId_fkey" 
 ALTER TABLE "ssoProvider" ADD CONSTRAINT "ssoProvider_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE cascade;
 --> statement-breakpoint
 ALTER TABLE "trackedVisitor" ADD CONSTRAINT "trackedVisitor_contactId_fkey" FOREIGN KEY ("contactId") REFERENCES "public"."contact"("id") ON DELETE set null ON UPDATE cascade;
+--> statement-breakpoint
+INSERT INTO "install" ("id", "uuid", "version", "updatedAt") VALUES ('install', gen_random_uuid()::text, 'unknown', CURRENT_TIMESTAMP) ON CONFLICT ("id") DO NOTHING;

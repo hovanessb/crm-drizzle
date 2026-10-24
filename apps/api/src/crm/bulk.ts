@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { type Executor, eq, user } from "@crm/db";
 import { BadRequestException } from "@nestjs/common";
 import { z } from "zod";
 
@@ -20,15 +20,16 @@ export type BulkResult = {
 };
 
 export async function requireOwner(
-	db: Db,
+	db: Executor,
 	ownerId: string | null,
 ): Promise<void> {
 	if (!ownerId) return;
 
-	const owner = await db.user.findUnique({
-		where: { id: ownerId },
-		select: { id: true },
-	});
+	const [owner] = await db
+		.select({ id: user.id })
+		.from(user)
+		.where(eq(user.id, ownerId))
+		.limit(1);
 
 	if (!owner) {
 		throw new BadRequestException("That owner does not work here any more.");

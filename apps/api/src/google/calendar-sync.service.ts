@@ -1,8 +1,18 @@
 import {
 	ActivityType,
+	activity as activityTable,
+	and,
+	calendarAttendee,
+	calendarEvent,
+	contact,
+	contactBrief,
 	type Db,
+	eq,
 	GoogleSyncStatus,
-	type MailboxSyncModel as MailboxSync,
+	inArray,
+	isNotNull,
+	type MailboxSync,
+	notExists,
 	RecordSource,
 } from "@crm/db";
 import { Injectable, Logger } from "@nestjs/common";
@@ -201,21 +211,17 @@ export class CalendarSyncService {
 
 		if (!originalStart) return "ignored";
 
-		const key = {
-			iCalUid_originalStartTime: {
-				iCalUid,
-				originalStartTime: originalStart.at,
-			},
-		};
-
 		if (event.status === "cancelled") {
-			const deleted = await this.db.calendarEvent.deleteMany({
-				where: {
-					iCalUid,
-					originalStartTime: originalStart.at,
-				},
-			});
-			return deleted.count > 0 ? "removed" : "ignored";
+			const deleted = await this.db
+				.delete(calendarEvent)
+				.where(
+					and(
+						eq(calendarEvent.iCalUid, iCalUid),
+						eq(calendarEvent.originalStartTime, originalStart.at),
+					),
+				)
+				.returning({ id: calendarEvent.id });
+			return deleted.length > 0 ? "removed" : "ignored";
 		}
 
 		const end = eventTime(event.end);
@@ -243,9 +249,9 @@ export class CalendarSyncService {
 
 		const organizer = event.organizer?.email?.toLowerCase() ?? null;
 
-		const record = await this.db.calendarEvent.upsert({
-			where: key,
-			create: {
+		const [record] = await this.db
+			.insert(calendarEvent)
+			.values({
 				iCalUid,
 				originalStartTime: originalStart.at,
 				recurringEventId: event.recurringEventId ?? null,
@@ -262,22 +268,25 @@ export class CalendarSyncService {
 				contactId: match.contactId,
 				syncedByUserId: row.userId,
 				googleEventId: event.id ?? null,
-			},
-			update: {
-				title: event.summary ?? null,
-				description: event.description ?? null,
-				location: event.location ?? null,
-				conferenceUrl: conferenceUrl(event),
-				startsAt: start.at,
-				endsAt: end.at,
-				isAllDay: start.isAllDay,
-				status: event.status ?? "confirmed",
-				organizerEmail: organizer,
-				companyId: match.companyId,
-				contactId: match.contactId,
-			},
-			select: { id: true },
-		});
+			})
+			.onConflictDoUpdate({
+				target: [calendarEvent.iCalUid, calendarEvent.originalStartTime],
+				set: {
+					title: event.summary ?? null,
+					description: event.description ?? null,
+					location: event.location ?? null,
+					conferenceUrl: conferenceUrl(event),
+					startsAt: start.at,
+					endsAt: end.at,
+					isAllDay: start.isAllDay,
+					status: event.status ?? "confirmed",
+					organizerEmail: organizer,
+					companyId: match.companyId,
+					contactId: match.contactId,
+				},
+			})
+			.returning({ id: calendarEvent.id });
+		if (!record) return "ignored";
 
 		await this.syncAttendees(record.id, event);
 		await this.prepareForMeeting(record.id, start.at);
@@ -309,10 +318,13 @@ export class CalendarSyncService {
 			(attendee.email as string).toLowerCase(),
 		);
 
-		const contacts = await this.db.contact.findMany({
-			where: { email: { in: emails } },
-			select: { id: true, email: true },
-		});
+		const contacts =
+			emails.length > 0
+				? await this.db
+						.select({ id: contact.id, email: contact.email })
+						.from(contact)
+						.where(inArray(contact.email, emails))
+				: [];
 
 		const contactByEmail = new Map(
 			contacts.map((contact) => [contact.email as string, contact.id]),
@@ -321,23 +333,20 @@ export class CalendarSyncService {
 		for (const attendee of attendees) {
 			const email = (attendee.email as string).toLowerCase();
 
-			await this.db.calendarAttendee.upsert({
-				where: { eventId_email: { eventId, email } },
-				create: {
-					eventId,
-					email,
-					name: attendee.displayName ?? null,
-					responseStatus: attendee.responseStatus ?? null,
-					isOrganizer: attendee.organizer ?? false,
-					contactId: contactByEmail.get(email) ?? null,
-				},
-				update: {
-					name: attendee.displayName ?? null,
-					responseStatus: attendee.responseStatus ?? null,
-					isOrganizer: attendee.organizer ?? false,
-					contactId: contactByEmail.get(email) ?? null,
-				},
-			});
+			const fields = {
+				name: attendee.displayName ?? null,
+				responseStatus: attendee.responseStatus ?? null,
+				isOrganizer: attendee.organizer ?? false,
+				contactId: contactByEmail.get(email) ?? null,
+			};
+
+			await this.db
+				.insert(calendarAttendee)
+				.values({ eventId, email, ...fields })
+				.onConflictDoUpdate({
+					target: [calendarAttendee.eventId, calendarAttendee.email],
+					set: fields,
+				});
 		}
 	}
 
@@ -348,14 +357,21 @@ export class CalendarSyncService {
 		const soon = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 		if (startsAt <= new Date() || startsAt > soon) return;
 
-		const attendees = await this.db.calendarAttendee.findMany({
-			where: {
-				eventId,
-				contactId: { not: null },
-				contact: { brief: { is: null } },
-			},
-			select: { contactId: true },
-		});
+		const attendees = await this.db
+			.select({ contactId: calendarAttendee.contactId })
+			.from(calendarAttendee)
+			.where(
+				and(
+					eq(calendarAttendee.eventId, eventId),
+					isNotNull(calendarAttendee.contactId),
+					notExists(
+						this.db
+							.select({ contactId: contactBrief.contactId })
+							.from(contactBrief)
+							.where(eq(contactBrief.contactId, calendarAttendee.contactId)),
+					),
+				),
+			);
 
 		for (const attendee of attendees) {
 			if (attendee.contactId) {
@@ -377,9 +393,9 @@ export class CalendarSyncService {
 	): Promise<void> {
 		const body = summary.location ? `Location: ${summary.location}` : null;
 
-		const activity = await this.db.activity.upsert({
-			where: { calendarEventId },
-			create: {
+		const [activity] = await this.db
+			.insert(activityTable)
+			.values({
 				type: ActivityType.MEETING,
 				subject: summary.title,
 				body,
@@ -389,16 +405,19 @@ export class CalendarSyncService {
 				createdById: userId,
 				calendarEventId,
 				meta: { synced: true, source: "calendar" },
-			},
-			update: {
-				subject: summary.title,
-				body,
-				occurredAt: summary.startsAt,
-				companyId: summary.companyId,
-				contactId: summary.contactId,
-			},
-			select: { createdAt: true },
-		});
+			})
+			.onConflictDoUpdate({
+				target: activityTable.calendarEventId,
+				set: {
+					subject: summary.title,
+					body,
+					occurredAt: summary.startsAt,
+					companyId: summary.companyId,
+					contactId: summary.contactId,
+				},
+			})
+			.returning({ createdAt: activityTable.createdAt });
+		if (!activity) return;
 
 		await this.stamp.touch(
 			{ companyId: summary.companyId, contactId: summary.contactId },

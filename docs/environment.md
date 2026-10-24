@@ -89,7 +89,7 @@ list fails closed.** Parsed on demand. `packages/auth/src/workspace.ts`.
 `"true"` serves `app/(landing)` at `/`; anything else sends a signed-out visitor to
 `/sign-in`, because the page markets *this* product.
 
-- **Only the literal `true`** (same shape as `PRISMA_LOG_QUERIES`).
+- **Only the literal `true`** (same shape as `DB_LOG_QUERIES`).
 - **It decides one thing**: what a stranger at `/` sees.
 - **`isMarketing()` (`apps/app/lib/env.ts`) reads per request**, so a config change
   needs no rebuild. Declared in `apps/app/turbo.json` `passThroughEnv`.

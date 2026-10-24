@@ -1,4 +1,4 @@
-import { db } from "@crm/db";
+import { db, eq, firstRow, requireRow, slackChannel, whereEq } from "@crm/db";
 import { schemas } from "@crm/validation";
 import { z } from "zod";
 import { SLACK } from "./slack-config";
@@ -113,11 +113,10 @@ async function classifyChannel(
 		return live;
 	}
 
-	await db.slackChannel
-		.update({
-			where: { id: channelId },
-			data: { ...live, classifiedAt: new Date() },
-		})
+	await db
+		.update(slackChannel)
+		.set({ ...live, classifiedAt: new Date() })
+		.where(eq(slackChannel.id, channelId))
 		.catch(() => null);
 	await requestSlackInventorySync();
 
@@ -127,10 +126,17 @@ async function classifyChannel(
 export async function joinSlackChannel(
 	channelId: string,
 ): Promise<JoinOutcome> {
-	const channel = await db.slackChannel.findUnique({
-		where: { id: channelId },
-		select: { id: true, isPrivate: true, isMember: true },
-	});
+	const channel = await firstRow(
+		db
+			.select({
+				id: slackChannel.id,
+				isPrivate: slackChannel.isPrivate,
+				isMember: slackChannel.isMember,
+			})
+			.from(slackChannel)
+			.where(whereEq(slackChannel.id, channelId))
+			.limit(1),
+	);
 
 	if (!channel) {
 		return { joined: false, reason: "No such channel.", needsHuman: false };
@@ -164,15 +170,18 @@ export async function joinSlackChannel(
 		};
 	}
 
-	await db.slackChannel.update({
-		where: { id: channelId },
-		data: {
-			isMember: true,
-			available: true,
-			inviteRequestedAt: null,
-			classifiedAt: new Date(),
-		},
-	});
+	await requireRow(
+		db
+			.update(slackChannel)
+			.set({
+				isMember: true,
+				available: true,
+				inviteRequestedAt: null,
+				classifiedAt: new Date(),
+			})
+			.where(whereEq(slackChannel.id, channelId))
+			.returning(),
+	);
 
 	return { joined: true, already: outcome.error === ALREADY_IN_CHANNEL };
 }
@@ -258,23 +267,31 @@ export async function createSlackChannel(
 
 	const channel = parsed.data.channel;
 
-	await db.slackChannel.upsert({
-		where: { id: channel.id },
-		create: {
-			id: channel.id,
-			name: channel.name,
-			isPrivate,
-			isMember: !isPrivate && token === bot,
-			available: true,
-			classifiedAt: new Date(),
-		},
-		update: {
-			name: channel.name,
-			isPrivate,
-			available: true,
-			classifiedAt: new Date(),
-		},
-	});
+	await requireRow(
+		db
+			.insert(slackChannel)
+			.values({
+				id: channel.id,
+				name: channel.name,
+				isPrivate,
+				isMember: !isPrivate && token === bot,
+				available: true,
+				classifiedAt: new Date(),
+			})
+			.onConflictDoUpdate({
+				target: slackChannel.id,
+				set: {
+					...{
+						name: channel.name,
+						isPrivate,
+						available: true,
+						classifiedAt: new Date(),
+					},
+					updatedAt: new Date(),
+				},
+			})
+			.returning(),
+	);
 
 	if (token === user) await joinSlackChannel(channel.id);
 

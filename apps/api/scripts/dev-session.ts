@@ -1,6 +1,6 @@
 import { AUTH_COOKIE_PREFIX } from "@crm/auth/cookies";
 import { ensureWorkspaceMembership } from "@crm/auth/organization";
-import { db } from "@crm/db";
+import { db, eq, session, user as userTable } from "@crm/db";
 import { DEV_SESSION } from "./dev-session-config";
 import {
 	createDevSessionResponse,
@@ -43,17 +43,22 @@ async function signCookieValue(value: string): Promise<string> {
 	return encodeURIComponent(`${value}.${base64}`);
 }
 
-const user = await db.user.upsert({
-	where: { email },
-	create: {
+await db
+	.insert(userTable)
+	.values({
 		id: `dev-${Buffer.from(email).toString("hex").slice(0, 20)}`,
 		email,
 		name,
 		emailVerified: true,
 		updatedAt: new Date(),
-	},
-	update: {},
-});
+	})
+	.onConflictDoNothing({ target: userTable.email });
+
+const [user] = await db
+	.select({ id: userTable.id })
+	.from(userTable)
+	.where(eq(userTable.email, email));
+if (!user) throw new Error(`Could not find or create ${email}.`);
 
 const workspaceId = await ensureWorkspaceMembership(user.id);
 if (!workspaceId) {
@@ -65,18 +70,20 @@ const expiresAt = new Date(
 	Date.now() + DEV_SESSION.cookie.days * 24 * 60 * 60 * 1000,
 );
 
-await db.session.upsert({
-	where: { token },
-	create: {
+await db
+	.insert(session)
+	.values({
 		id: token,
 		token,
 		userId: user.id,
 		expiresAt,
 		updatedAt: new Date(),
 		activeOrganizationId: workspaceId,
-	},
-	update: { expiresAt, activeOrganizationId: workspaceId },
-});
+	})
+	.onConflictDoUpdate({
+		target: session.token,
+		set: { expiresAt, activeOrganizationId: workspaceId },
+	});
 
 const cookieValue = await signCookieValue(token);
 const loginPath = `/login/${crypto.randomUUID()}`;
@@ -117,4 +124,4 @@ await new Promise<void>((resolve) => {
 	console.log("The link expires in 10 minutes.");
 });
 
-await db.$disconnect();
+await db.$client.end();

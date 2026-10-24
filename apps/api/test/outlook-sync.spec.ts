@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { MailboxSyncModel as MailboxSync } from "@crm/db";
+import type { MailboxSync } from "@crm/db";
 import type { SyncSource } from "../src/mailbox/mailbox.constants";
 import type { MailboxTokenService } from "../src/mailbox/mailbox-token.service";
 import type { SyncStateService } from "../src/mailbox/sync-state.service";

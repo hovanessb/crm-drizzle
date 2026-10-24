@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db, EnrichmentStatus } from "@crm/db";
+import {
+	agentTask,
+	contact as contactTable,
+	db,
+	EnrichmentStatus,
+	firstRow,
+	inArray,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { closeTask, taskToken } from "../agent/channels/crm";
 
 const kind = "identify";
@@ -9,36 +18,40 @@ const taskIds: string[] = [];
 
 async function clear() {
 	if (taskIds.length > 0) {
-		await db.agentTask.deleteMany({ where: { id: { in: taskIds.splice(0) } } });
+		await db.delete(agentTask).where(inArray(agentTask.id, taskIds.splice(0)));
 	}
-	await db.contact.deleteMany({ where: { email } });
+	await db.delete(contactTable).where(whereEq(contactTable.email, email));
 }
 
 beforeEach(clear);
 afterEach(clear);
 
 async function running() {
-	const contact = await db.contact.create({
-		data: {
-			firstName: "Close",
-			email,
-			enrichmentStatus: EnrichmentStatus.RUNNING,
-		},
-		select: { id: true },
-	});
+	const contact = await requireRow(
+		db
+			.insert(contactTable)
+			.values({
+				firstName: "Close",
+				email,
+				enrichmentStatus: EnrichmentStatus.RUNNING,
+			})
+			.returning({ id: contactTable.id }),
+	);
 
-	const task = await db.agentTask.create({
-		data: {
-			kind,
-			reason: "test",
-			dueAt: new Date(Date.now() - 1000),
-			budget: 4,
-			contactId: contact.id,
-			startedAt: new Date(),
-			attempts: 1,
-		},
-		select: { id: true },
-	});
+	const task = await requireRow(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: "test",
+				dueAt: new Date(Date.now() - 1000),
+				budget: 4,
+				contactId: contact.id,
+				startedAt: new Date(),
+				attempts: 1,
+			})
+			.returning({ id: agentTask.id }),
+	);
 
 	taskIds.push(task.id);
 
@@ -51,11 +64,19 @@ describe("closeTask", () => {
 
 		expect(await closeTask(taskToken(taskId), "ran")).toBe(true);
 
-		const task = await db.agentTask.findUnique({ where: { id: taskId } });
+		const task = await firstRow(
+			db.select().from(agentTask).where(whereEq(agentTask.id, taskId)).limit(1),
+		);
 		expect(task?.finishedAt).not.toBeNull();
 		expect(task?.outcome).toBe("ran");
 
-		const contact = await db.contact.findUnique({ where: { id: contactId } });
+		const contact = await firstRow(
+			db
+				.select()
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.enrichmentStatus).toBe(EnrichmentStatus.COMPLETE);
 		expect(contact?.enrichedAt).not.toBeNull();
 	});
@@ -67,7 +88,13 @@ describe("closeTask", () => {
 			await closeTask(taskToken(taskId), "stopped", EnrichmentStatus.SKIPPED),
 		).toBe(true);
 
-		const contact = await db.contact.findUnique({ where: { id: contactId } });
+		const contact = await firstRow(
+			db
+				.select()
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.enrichmentStatus).toBe(EnrichmentStatus.SKIPPED);
 	});
 
@@ -77,7 +104,9 @@ describe("closeTask", () => {
 		await closeTask(taskToken(taskId), "ran");
 		expect(await closeTask(taskToken(taskId), "ran again")).toBe(true);
 
-		const task = await db.agentTask.findUnique({ where: { id: taskId } });
+		const task = await firstRow(
+			db.select().from(agentTask).where(whereEq(agentTask.id, taskId)).limit(1),
+		);
 		expect(task?.outcome).toBe("ran");
 	});
 

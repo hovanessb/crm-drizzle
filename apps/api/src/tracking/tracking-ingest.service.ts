@@ -1,4 +1,11 @@
-import type { Db } from "@crm/db";
+import {
+	type Db,
+	eq,
+	formSubmission,
+	sql,
+	trackedDomain,
+	trackedEvent,
+} from "@crm/db";
 import { classifyTouch, type RawTouch, type Touch } from "@crm/db/attribution";
 import {
 	dedupeKey,
@@ -156,7 +163,7 @@ export class TrackingIngestService {
 			};
 		});
 
-		await this.db.trackedEvent.createMany({ data: rows });
+		if (rows.length > 0) await this.db.insert(trackedEvent).values(rows);
 
 		await this.countViews(rows, config);
 	}
@@ -179,10 +186,13 @@ export class TrackingIngestService {
 
 		await Promise.all(
 			[...tallies].map(([host, views]) =>
-				this.db.trackedDomain.updateMany({
-					where: { host },
-					data: { pageViews: { increment: views }, lastSeenAt },
-				}),
+				this.db
+					.update(trackedDomain)
+					.set({
+						pageViews: sql`${trackedDomain.pageViews} + ${views}`,
+						lastSeenAt,
+					})
+					.where(eq(trackedDomain.host, host)),
 			),
 		);
 	}
@@ -203,29 +213,33 @@ export class TrackingIngestService {
 
 		const key = dedupeKey({ host, path, email, at });
 
-		const created = await this.db.formSubmission.createMany({
-			data: [
-				{
-					visitorId,
-					host,
-					path,
-					email,
-					fields,
-					firstTouch: stored(firstTouch),
-					lastTouch: stored(lastTouch),
-					dedupeKey: key,
-				},
-			],
-			skipDuplicates: true,
-		});
+		const created = await this.db
+			.insert(formSubmission)
+			.values({
+				visitorId,
+				host,
+				path,
+				email,
+				fields,
+				firstTouch: stored(firstTouch),
+				lastTouch: stored(lastTouch),
+				dedupeKey: key,
+			})
+			.onConflictDoNothing()
+			.returning({ id: formSubmission.id });
 
-		const submission = await this.db.formSubmission.findUnique({
-			where: { dedupeKey: key },
-			select: { id: true, filedAt: true, skipReason: true },
-		});
+		const [submission] = await this.db
+			.select({
+				id: formSubmission.id,
+				filedAt: formSubmission.filedAt,
+				skipReason: formSubmission.skipReason,
+			})
+			.from(formSubmission)
+			.where(eq(formSubmission.dedupeKey, key))
+			.limit(1);
 
 		if (!submission) return;
-		if (created.count === 0 && !unfiled(submission)) return;
+		if (created.length === 0 && !unfiled(submission)) return;
 
 		const outcome = await this.filing.file({
 			id: submission.id,

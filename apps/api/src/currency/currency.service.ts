@@ -1,6 +1,15 @@
 import { canManageCurrency, workspaceRoleOf } from "@crm/auth/organization";
 import type { Db } from "@crm/db";
-import { Prisma, RateSource } from "@crm/db";
+import {
+	and,
+	count,
+	Decimal,
+	deal,
+	eq,
+	exchangeRate,
+	isNotNull,
+	RateSource,
+} from "@crm/db";
 import { CURRENCIES, currencyName, normalizeCurrency } from "@crm/db/currency";
 import { writeReportingCurrency } from "@crm/db/settings";
 import {
@@ -28,23 +37,23 @@ export class CurrencyService {
 		const reportingCurrency = await this.conversion.reportingCurrency();
 
 		const [rows, refreshedAt, unconverted, usage] = await Promise.all([
-			this.db.exchangeRate.findMany({
-				where: { baseCurrency: reportingCurrency },
-				select: {
-					quoteCurrency: true,
-					rate: true,
-					asOf: true,
-					source: true,
-					provider: true,
-				},
-			}),
+			this.db
+				.select({
+					quoteCurrency: exchangeRate.quoteCurrency,
+					rate: exchangeRate.rate,
+					asOf: exchangeRate.asOf,
+					source: exchangeRate.source,
+					provider: exchangeRate.provider,
+				})
+				.from(exchangeRate)
+				.where(eq(exchangeRate.baseCurrency, reportingCurrency)),
 			this.rates.refreshedAt(),
 			this.conversion.unconverted(),
-			this.db.deal.groupBy({
-				by: ["currency"],
-				where: { amount: { not: null } },
-				_count: { _all: true },
-			}),
+			this.db
+				.select({ currency: deal.currency, count: count() })
+				.from(deal)
+				.where(isNotNull(deal.amount))
+				.groupBy(deal.currency),
 		]);
 
 		const manual = new Set(
@@ -88,7 +97,7 @@ export class CurrencyService {
 					return {
 						currency,
 						name: currencyName(currency),
-						deals: row._count._all,
+						deals: row.count,
 						convertible: convertible.has(currency),
 					};
 				})
@@ -156,23 +165,23 @@ export class CurrencyService {
 
 		const asOf = new Date();
 
-		await this.db.exchangeRate.upsert({
-			where: {
-				baseCurrency_quoteCurrency_source: {
-					baseCurrency,
-					quoteCurrency,
-					source: RateSource.MANUAL,
-				},
-			},
-			create: {
+		await this.db
+			.insert(exchangeRate)
+			.values({
 				baseCurrency,
 				quoteCurrency,
-				rate: new Prisma.Decimal(rate),
+				rate: new Decimal(rate),
 				asOf,
 				source: RateSource.MANUAL,
-			},
-			update: { rate: new Prisma.Decimal(rate), asOf },
-		});
+			})
+			.onConflictDoUpdate({
+				target: [
+					exchangeRate.baseCurrency,
+					exchangeRate.quoteCurrency,
+					exchangeRate.source,
+				],
+				set: { rate: new Decimal(rate), asOf },
+			});
 
 		const filled = await this.conversion.fillMissing();
 
@@ -195,9 +204,15 @@ export class CurrencyService {
 		const quoteCurrency = normalizeCurrency(code);
 		const baseCurrency = await this.conversion.reportingCurrency();
 
-		await this.db.exchangeRate.deleteMany({
-			where: { baseCurrency, quoteCurrency, source: RateSource.MANUAL },
-		});
+		await this.db
+			.delete(exchangeRate)
+			.where(
+				and(
+					eq(exchangeRate.baseCurrency, baseCurrency),
+					eq(exchangeRate.quoteCurrency, quoteCurrency),
+					eq(exchangeRate.source, RateSource.MANUAL),
+				),
+			);
 
 		this.logger.log({
 			message: "Manual exchange rate removed",

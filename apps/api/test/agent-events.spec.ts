@@ -1,10 +1,23 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	activity,
+	agentTask,
+	and,
+	company as companyTable,
+	db,
+	deal as dealTable,
+	eq,
+	inArray,
+	or,
+	sql,
+	user,
+} from "@crm/db";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
 import { ActivityStampService } from "../src/crm/activity-stamp.service";
 import { ConversionService } from "../src/currency/conversion.service";
 import { DealsService } from "../src/deals/deals.service";
 import { FieldsService } from "../src/fields/fields.service";
+import { first, one } from "./rows";
 
 const suffix = crypto.randomUUID();
 const dealId = `event-deal-${suffix}`;
@@ -25,46 +38,57 @@ let previousBridgeSecret: string | undefined;
 beforeAll(async () => {
 	previousBridgeSecret = process.env.AGENT_BRIDGE_SECRET;
 	delete process.env.AGENT_BRIDGE_SECRET;
-	await db.agentTask.deleteMany({
-		where: { OR: [{ dealId }, { contactId }] },
-	});
-	await db.user.create({
-		data: {
-			id: ownerId,
-			name: "Event Test Owner",
-			email: `${ownerId}@example.test`,
-		},
-	});
-	const company = await db.company.create({
-		data: { name: "Event Test Company", domain },
-		select: { id: true },
-	});
+	await db
+		.delete(agentTask)
+		.where(
+			or(eq(agentTask.dealId, dealId), eq(agentTask.contactId, contactId)),
+		);
+	await one(
+		db
+			.insert(user)
+			.values({
+				id: ownerId,
+				name: "Event Test Owner",
+				email: `${ownerId}@example.test`,
+			})
+			.returning(),
+	);
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: "Event Test Company", domain })
+			.returning({ id: companyTable.id }),
+	);
 	persistedCompanyId = company.id;
 });
 
 afterAll(async () => {
-	await db.agentTask.deleteMany({
-		where: {
-			OR: [
-				{ dealId: { in: [dealId, persistedDealId].filter(Boolean) } },
-				{ contactId },
-			],
-		},
-	});
-	await db.agentTask.deleteMany({
-		where: {
-			kind: "slack-channel-join",
-			payload: { path: ["channelId"], equals: channelId },
-		},
-	});
+	await db
+		.delete(agentTask)
+		.where(
+			or(
+				inArray(agentTask.dealId, [dealId, persistedDealId].filter(Boolean)),
+				eq(agentTask.contactId, contactId),
+			),
+		);
+	await db
+		.delete(agentTask)
+		.where(
+			and(
+				eq(agentTask.kind, "slack-channel-join"),
+				sql`${agentTask.payload} #>> '{channelId}' = ${channelId}`,
+			),
+		);
 	if (persistedDealId) {
-		await db.activity.deleteMany({ where: { dealId: persistedDealId } });
-		await db.deal.deleteMany({ where: { id: persistedDealId } });
+		await db.delete(activity).where(eq(activity.dealId, persistedDealId));
+		await db.delete(dealTable).where(eq(dealTable.id, persistedDealId));
 	}
 	if (persistedCompanyId) {
-		await db.company.deleteMany({ where: { id: persistedCompanyId } });
+		await db
+			.delete(companyTable)
+			.where(eq(companyTable.id, persistedCompanyId));
 	}
-	await db.user.deleteMany({ where: { id: ownerId } });
+	await db.delete(user).where(eq(user.id, ownerId));
 	if (previousBridgeSecret === undefined) {
 		delete process.env.AGENT_BRIDGE_SECRET;
 	} else {
@@ -85,15 +109,23 @@ describe("CRM agent events", () => {
 		});
 
 		expect(
-			await db.agentTask.findFirstOrThrow({
-				where: { contactId, kind: "agent-event" },
-				select: {
-					contactId: true,
-					companyId: true,
-					dealId: true,
-					payload: true,
-				},
-			}),
+			await one(
+				db
+					.select({
+						contactId: agentTask.contactId,
+						companyId: agentTask.companyId,
+						dealId: agentTask.dealId,
+						payload: agentTask.payload,
+					})
+					.from(agentTask)
+					.where(
+						and(
+							eq(agentTask.contactId, contactId),
+							eq(agentTask.kind, "agent-event"),
+						),
+					)
+					.limit(1),
+			),
 		).toEqual({
 			contactId,
 			companyId: null,
@@ -126,15 +158,17 @@ describe("CRM agent events", () => {
 			});
 		});
 
-		const tasks = await db.agentTask.findMany({
-			where: { dealId, kind: "agent-event" },
-			select: {
-				dealId: true,
-				reason: true,
-				payload: true,
-				finishedAt: true,
-			},
-		});
+		const tasks = await db
+			.select({
+				dealId: agentTask.dealId,
+				reason: agentTask.reason,
+				payload: agentTask.payload,
+				finishedAt: agentTask.finishedAt,
+			})
+			.from(agentTask)
+			.where(
+				and(eq(agentTask.dealId, dealId), eq(agentTask.kind, "agent-event")),
+			);
 
 		expect(tasks).toHaveLength(2);
 		expect(tasks.find((task) => task.reason === "deal.created")).toEqual({
@@ -166,13 +200,15 @@ describe("CRM agent events", () => {
 		await service.slackChannelJoinRequested(channelId, "deal-room-renamed");
 
 		expect(
-			await db.agentTask.findMany({
-				where: {
-					kind: "slack-channel-join",
-					payload: { path: ["channelId"], equals: channelId },
-				},
-				select: { reason: true },
-			}),
+			await db
+				.select({ reason: agentTask.reason })
+				.from(agentTask)
+				.where(
+					and(
+						eq(agentTask.kind, "slack-channel-join"),
+						sql`${agentTask.payload} #>> '{channelId}' = ${channelId}`,
+					),
+				),
 		).toEqual([{ reason: "Add Comp AI to #deal-room" }]);
 	});
 
@@ -182,13 +218,18 @@ describe("CRM agent events", () => {
 
 		try {
 			await service.withCrmEvents(async (tx, emit) => {
-				const company = await tx.company.create({
-					data: {
-						id: rollbackCompanyId,
-						name: "Rollback Event Company",
-					},
-					select: { id: true, createdAt: true },
-				});
+				const company = await one(
+					tx
+						.insert(companyTable)
+						.values({
+							id: rollbackCompanyId,
+							name: "Rollback Event Company",
+						})
+						.returning({
+							id: companyTable.id,
+							createdAt: companyTable.createdAt,
+						}),
+				);
 				await emit({
 					type: "company.created",
 					record: { kind: "company", id: company.id },
@@ -203,12 +244,22 @@ describe("CRM agent events", () => {
 
 		expect(error?.message).toBe("Rollback the record and outbox together.");
 		expect(
-			await db.company.findUnique({ where: { id: rollbackCompanyId } }),
+			await first(
+				db
+					.select()
+					.from(companyTable)
+					.where(eq(companyTable.id, rollbackCompanyId))
+					.limit(1),
+			),
 		).toBeNull();
 		expect(
-			await db.agentTask.count({
-				where: { companyId: rollbackCompanyId, kind: "agent-event" },
-			}),
+			await db.$count(
+				agentTask,
+				and(
+					eq(agentTask.companyId, rollbackCompanyId),
+					eq(agentTask.kind, "agent-event"),
+				),
+			),
 		).toBe(0);
 	});
 
@@ -234,10 +285,12 @@ describe("CRM agent events", () => {
 		await deals.setStage({ id: deal.id, stage: "QUALIFIED_TO_BUY" }, ownerId);
 
 		const reasons = (
-			await db.agentTask.findMany({
-				where: { dealId: deal.id, kind: "agent-event" },
-				select: { reason: true },
-			})
+			await db
+				.select({ reason: agentTask.reason })
+				.from(agentTask)
+				.where(
+					and(eq(agentTask.dealId, deal.id), eq(agentTask.kind, "agent-event")),
+				)
 		)
 			.map((task) => task.reason)
 			.sort();
@@ -249,9 +302,10 @@ describe("CRM agent events", () => {
 			"deal.stage.changed",
 		]);
 		expect(
-			await db.activity.count({
-				where: { dealId: deal.id, type: "STAGE_CHANGE" },
-			}),
+			await db.$count(
+				activity,
+				and(eq(activity.dealId, deal.id), eq(activity.type, "STAGE_CHANGE")),
+			),
 		).toBe(2);
 	});
 });

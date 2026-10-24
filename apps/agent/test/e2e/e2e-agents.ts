@@ -1,24 +1,58 @@
-import { db } from "@crm/db";
+import {
+	agentAction,
+	agentAuditEvent,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentTrigger,
+	agentVersion,
+	db,
+	inArray,
+	or,
+	requireRow,
+	startsWith,
+	whereEq,
+} from "@crm/db";
 
 export async function removeAgent(agentId: string): Promise<void> {
-	await db.agentRunEvent.deleteMany({ where: { run: { agentId } } });
-	await db.agentAction.deleteMany({ where: { agentId } });
-	await db.agentAuditEvent.deleteMany({ where: { agentId } });
-	await db.agentRun.deleteMany({ where: { agentId } });
-	await db.agentTrigger.deleteMany({ where: { agentId } });
-	await db.agentDefinition.update({
-		where: { id: agentId },
-		data: { currentVersionId: null },
-	});
-	await db.agentVersion.deleteMany({ where: { agentId } });
-	await db.agentDefinition.delete({ where: { id: agentId } });
+	await db
+		.delete(agentRunEvent)
+		.where(
+			inArray(
+				agentRunEvent.runId,
+				db
+					.select({ id: agentRun.id })
+					.from(agentRun)
+					.where(whereEq(agentRun.agentId, agentId)),
+			),
+		);
+	await db.delete(agentAction).where(whereEq(agentAction.agentId, agentId));
+	await db
+		.delete(agentAuditEvent)
+		.where(whereEq(agentAuditEvent.agentId, agentId));
+	await db.delete(agentRun).where(whereEq(agentRun.agentId, agentId));
+	await db.delete(agentTrigger).where(whereEq(agentTrigger.agentId, agentId));
+	await requireRow(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(whereEq(agentDefinition.id, agentId))
+			.returning(),
+	);
+	await db.delete(agentVersion).where(whereEq(agentVersion.agentId, agentId));
+	await requireRow(
+		db
+			.delete(agentDefinition)
+			.where(whereEq(agentDefinition.id, agentId))
+			.returning(),
+	);
 }
 
 export async function removeAgentsNamed(prefix: string): Promise<string[]> {
-	const stale = await db.agentDefinition.findMany({
-		where: { name: { startsWith: prefix } },
-		select: { id: true, name: true },
-	});
+	const stale = await db
+		.select({ id: agentDefinition.id, name: agentDefinition.name })
+		.from(agentDefinition)
+		.where(startsWith(agentDefinition.name, prefix));
 
 	for (const agent of stale) await removeAgent(agent.id);
 
@@ -30,21 +64,25 @@ export async function removeEventRuns(
 ): Promise<number> {
 	if (taskIds.length === 0) return 0;
 
-	const runs = await db.agentRun.findMany({
-		where: {
-			OR: taskIds.map((taskId) => ({
-				idempotencyKey: { startsWith: `event:${taskId}:` },
-			})),
-		},
-		select: { id: true },
-	});
+	const runs = await db
+		.select({ id: agentRun.id })
+		.from(agentRun)
+		.where(
+			or(
+				...taskIds.map((taskId) =>
+					startsWith(agentRun.idempotencyKey, `event:${taskId}:`),
+				),
+			),
+		);
 	const runIds = runs.map((run) => run.id);
 	if (runIds.length === 0) return 0;
 
-	await db.agentRunEvent.deleteMany({ where: { runId: { in: runIds } } });
-	await db.agentAction.deleteMany({ where: { runId: { in: runIds } } });
-	await db.agentAuditEvent.deleteMany({ where: { requestId: { in: runIds } } });
-	await db.agentRun.deleteMany({ where: { id: { in: runIds } } });
+	await db.delete(agentRunEvent).where(inArray(agentRunEvent.runId, runIds));
+	await db.delete(agentAction).where(inArray(agentAction.runId, runIds));
+	await db
+		.delete(agentAuditEvent)
+		.where(inArray(agentAuditEvent.requestId, runIds));
+	await db.delete(agentRun).where(inArray(agentRun.id, runIds));
 
 	return runIds.length;
 }

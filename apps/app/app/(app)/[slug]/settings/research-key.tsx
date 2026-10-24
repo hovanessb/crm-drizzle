@@ -1,6 +1,6 @@
 "use client";
 
-import { CONTEXT_DEV_SIGNUP_URL } from "@crm/db/settings";
+import { CONTEXT_DEV_SIGNUP_URL } from "@crm/db/settings-shape";
 import { Button } from "@crm/ui/components/button";
 import {
 	Card,

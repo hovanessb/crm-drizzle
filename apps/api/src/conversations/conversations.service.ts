@@ -1,9 +1,39 @@
 import { WORKSPACE_ID } from "@crm/auth/organization";
 import {
 	AgentConversationPermissionMode,
+	account,
+	agentBuilderArtifact,
+	agentConversation,
+	agentConversationAttachment,
+	agentConversationFeedback,
+	agentConversationShare,
+	agentConversationSubmission,
+	agentEvent,
+	agentTrigger,
+	agentVersion,
+	and,
+	asc,
+	company,
+	contact,
+	contains,
 	type Db,
-	type Prisma,
-	Prisma as PrismaNamespace,
+	deal,
+	desc,
+	type Executor,
+	eq,
+	exists,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	isUniqueViolation,
+	type JsonValue,
+	member,
+	or,
+	type PgColumn,
+	relatedCount,
+	type SQL,
+	sql,
 } from "@crm/db";
 import { type InputRequest, schemas } from "@crm/validation";
 import { readAgentManifestSummary } from "@crm/validation/agent-manifest";
@@ -79,25 +109,31 @@ export class ConversationsService {
 		const recordId = this.recordId(input);
 		this.logger.debug({ message: "Conversation list read", recordId });
 
-		const rows = await this.db.agentConversation.findMany({
-			where: {
-				userId,
-				contactId: input.contactId ?? undefined,
-				companyId: input.companyId ?? undefined,
-				dealId: input.dealId ?? undefined,
-			},
-			orderBy: { lastMessageAt: "desc" },
-			take: 20,
-			select: {
-				id: true,
-				sessionId: true,
-				continuationToken: true,
-				streamIndex: true,
-				title: true,
-				messageCount: true,
-				lastMessageAt: true,
-			},
-		});
+		const rows = await this.db
+			.select({
+				id: agentConversation.id,
+				sessionId: agentConversation.sessionId,
+				continuationToken: agentConversation.continuationToken,
+				streamIndex: agentConversation.streamIndex,
+				title: agentConversation.title,
+				messageCount: agentConversation.messageCount,
+				lastMessageAt: agentConversation.lastMessageAt,
+			})
+			.from(agentConversation)
+			.where(
+				and(
+					eq(agentConversation.userId, userId),
+					input.contactId
+						? eq(agentConversation.contactId, input.contactId)
+						: undefined,
+					input.companyId
+						? eq(agentConversation.companyId, input.companyId)
+						: undefined,
+					input.dealId ? eq(agentConversation.dealId, input.dealId) : undefined,
+				),
+			)
+			.orderBy(desc(agentConversation.lastMessageAt))
+			.limit(20);
 
 		const summaries = rows.flatMap((row) =>
 			row.sessionId
@@ -116,11 +152,14 @@ export class ConversationsService {
 
 	async listBuilder(userId: string): Promise<BuilderConversationSummary[]> {
 		await this.assertWorkspaceMember(userId);
-		const rows = await this.db.agentConversation.findMany({
-			where: { userId, kind: "BUILDER" },
-			orderBy: { lastMessageAt: "desc" },
-			take: 50,
-			select: {
+		const rows = await this.db.query.agentConversation.findMany({
+			where: and(
+				eq(agentConversation.userId, userId),
+				eq(agentConversation.kind, "BUILDER"),
+			),
+			orderBy: [desc(agentConversation.lastMessageAt)],
+			limit: 50,
+			columns: {
 				id: true,
 				sessionId: true,
 				continuationToken: true,
@@ -130,16 +169,29 @@ export class ConversationsService {
 				lastMessageAt: true,
 				lastAssistantAt: true,
 				lastReadAt: true,
-				agent: { select: { id: true, name: true, status: true } },
-				_count: {
-					select: {
-						submissions: { where: { commandType: "CREATE_AGENT" } },
-					},
-				},
+			},
+			extras: (conversation: { id: typeof agentConversation.id }) => ({
+				createAgentSubmissions: relatedCount(
+					agentConversationSubmission,
+					agentConversationSubmission.conversationId,
+					conversation.id,
+					[
+						{
+							column: agentConversationSubmission.commandType,
+							value: "CREATE_AGENT",
+						},
+					],
+				).as("createAgentSubmissions"),
+			}),
+			with: {
+				agent: { columns: { id: true, name: true, status: true } },
 				submissions: {
-					where: { status: { in: ["PENDING", "SENDING"] } },
-					select: { id: true },
-					take: 1,
+					where: inArray(agentConversationSubmission.status, [
+						"PENDING",
+						"SENDING",
+					]),
+					columns: { id: true },
+					limit: 1,
 				},
 			},
 		});
@@ -164,7 +216,7 @@ export class ConversationsService {
 				lastAssistantAt: row.lastAssistantAt?.toISOString() ?? null,
 				unread,
 				state:
-					row._count.submissions > 0 && row.agent?.status === "LIVE"
+					row.createAgentSubmissions > 0 && row.agent?.status === "LIVE"
 						? "deployed"
 						: working
 							? "working"
@@ -180,52 +232,61 @@ export class ConversationsService {
 		await this.assertWorkspaceMember(userId);
 
 		const search = q.trim();
-		const contains = search
-			? { contains: search, mode: "insensitive" as const }
-			: undefined;
+		const matches = (column: Parameters<typeof contains>[0]) =>
+			search ? contains(column, search, { insensitive: true }) : undefined;
 
-		const [companies, contacts, deals, slackAccount] = await Promise.all([
-			this.db.company.findMany({
-				where: contains ? { name: contains } : undefined,
-				orderBy: { lastActivityAt: { sort: "desc", nulls: "last" } },
-				take: 6,
-				select: { id: true, name: true, domain: true, logoUrl: true },
-			}),
-			this.db.contact.findMany({
-				where: contains
-					? {
-							OR: [
-								{ firstName: contains },
-								{ lastName: contains },
-								{ email: contains },
-							],
-						}
-					: undefined,
-				orderBy: { lastActivityAt: { sort: "desc", nulls: "last" } },
-				take: 6,
-				select: {
-					id: true,
-					firstName: true,
-					lastName: true,
-					email: true,
-					imageUrl: true,
-					company: { select: { name: true } },
-				},
-			}),
-			this.db.deal.findMany({
-				where: contains ? { name: contains } : undefined,
-				orderBy: { lastActivityAt: { sort: "desc", nulls: "last" } },
-				take: 6,
-				select: {
-					id: true,
-					name: true,
-					company: { select: { name: true, logoUrl: true } },
-				},
-			}),
-			this.db.account.findFirst({
-				where: { providerId: "slack", accessToken: { not: null } },
-				select: { id: true },
-			}),
+		const [companies, contacts, deals, [slackAccount]] = await Promise.all([
+			this.db
+				.select({
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					logoUrl: company.logoUrl,
+				})
+				.from(company)
+				.where(matches(company.name))
+				.orderBy(sql`${company.lastActivityAt} desc nulls last`)
+				.limit(6),
+			this.db
+				.select({
+					id: contact.id,
+					firstName: contact.firstName,
+					lastName: contact.lastName,
+					email: contact.email,
+					imageUrl: contact.imageUrl,
+					company: { name: company.name },
+				})
+				.from(contact)
+				.leftJoin(company, eq(company.id, contact.companyId))
+				.where(
+					search
+						? or(
+								matches(contact.firstName),
+								matches(contact.lastName),
+								matches(contact.email),
+							)
+						: undefined,
+				)
+				.orderBy(sql`${contact.lastActivityAt} desc nulls last`)
+				.limit(6),
+			this.db
+				.select({
+					id: deal.id,
+					name: deal.name,
+					company: { name: company.name, logoUrl: company.logoUrl },
+				})
+				.from(deal)
+				.innerJoin(company, eq(company.id, deal.companyId))
+				.where(matches(deal.name))
+				.orderBy(sql`${deal.lastActivityAt} desc nulls last`)
+				.limit(6),
+			this.db
+				.select({ id: account.id })
+				.from(account)
+				.where(
+					and(eq(account.providerId, "slack"), isNotNull(account.accessToken)),
+				)
+				.limit(1),
 		]);
 
 		return [
@@ -266,9 +327,9 @@ export class ConversationsService {
 
 	async builderById(id: string, userId: string) {
 		await this.assertWorkspaceMember(userId);
-		const row = await this.db.agentConversation.findFirst({
-			where: { id, userId, kind: "BUILDER" },
-			select: {
+		const row = await this.db.query.agentConversation.findFirst({
+			where: this.ownedBuilder(id, userId),
+			columns: {
 				id: true,
 				permissionMode: true,
 				sessionId: true,
@@ -280,15 +341,19 @@ export class ConversationsService {
 				lastMessageAt: true,
 				lastAssistantAt: true,
 				lastReadAt: true,
+			},
+			with: {
 				agent: {
-					select: {
+					columns: {
 						id: true,
 						name: true,
 						description: true,
 						status: true,
-						createdBy: { select: { id: true, name: true } },
+					},
+					with: {
+						createdBy: { columns: { id: true, name: true } },
 						currentVersion: {
-							select: {
+							columns: {
 								id: true,
 								number: true,
 								status: true,
@@ -299,8 +364,8 @@ export class ConversationsService {
 							},
 						},
 						triggers: {
-							orderBy: { createdAt: "asc" },
-							select: {
+							orderBy: [asc(agentTrigger.createdAt)],
+							columns: {
 								id: true,
 								type: true,
 								name: true,
@@ -312,9 +377,9 @@ export class ConversationsService {
 					},
 				},
 				createdVersions: {
-					orderBy: { number: "desc" },
-					take: 1,
-					select: {
+					orderBy: [desc(agentVersion.number)],
+					limit: 1,
+					columns: {
 						id: true,
 						number: true,
 						status: true,
@@ -327,9 +392,12 @@ export class ConversationsService {
 					},
 				},
 				builderArtifacts: {
-					orderBy: [{ createdAt: "desc" }, { revision: "desc" }],
-					take: 100,
-					select: {
+					orderBy: [
+						desc(agentBuilderArtifact.createdAt),
+						desc(agentBuilderArtifact.revision),
+					],
+					limit: 100,
+					columns: {
 						id: true,
 						versionId: true,
 						path: true,
@@ -342,12 +410,12 @@ export class ConversationsService {
 					},
 				},
 				feedback: {
-					where: { userId },
-					select: { messageId: true, rating: true },
+					where: eq(agentConversationFeedback.userId, userId),
+					columns: { messageId: true, rating: true },
 				},
 				submissions: {
-					orderBy: { createdAt: "asc" },
-					select: {
+					orderBy: [asc(agentConversationSubmission.createdAt)],
+					columns: {
 						id: true,
 						clientRequestId: true,
 						commandType: true,
@@ -359,9 +427,11 @@ export class ConversationsService {
 						sentAt: true,
 						acceptedAt: true,
 						inputRequestId: true,
+					},
+					with: {
 						attachments: {
-							orderBy: { position: "asc" },
-							select: {
+							orderBy: [asc(agentConversationAttachment.position)],
+							columns: {
 								id: true,
 								name: true,
 								mediaType: true,
@@ -387,24 +457,17 @@ export class ConversationsService {
 		const resume = row.sessionId
 			? conversationResumeSnapshot(
 					row.sessionId,
-					await this.db.agentEvent.findMany({
-						where: {
-							conversationId: row.id,
-							sessionId: row.sessionId,
-							streamIndex: { not: null },
-						},
-						orderBy: { streamIndex: "asc" },
-						select: {
-							id: true,
-							type: true,
-							data: true,
-							encryptedData: true,
-							conversationId: true,
-							emittedAt: true,
-							streamIndex: true,
-							deliveryIds: true,
-						},
-					}),
+					await this.db
+						.select(EVENT_FIELDS)
+						.from(agentEvent)
+						.where(
+							and(
+								eq(agentEvent.conversationId, row.id),
+								eq(agentEvent.sessionId, row.sessionId),
+								isNotNull(agentEvent.streamIndex),
+							),
+						)
+						.orderBy(asc(agentEvent.streamIndex)),
 				)
 			: null;
 
@@ -471,26 +534,33 @@ export class ConversationsService {
 
 		const now = new Date();
 		try {
-			const conversation = await this.db.agentConversation.create({
-				data: {
-					kind: "BUILDER",
-					userId,
-					title: null,
-					lastReadAt: now,
-					lastMessageAt: now,
-					submissions: {
-						create: {
-							submittedById: userId,
-							clientRequestId: input.clientRequestId,
-							commandType: input.commandType,
-							message: this.builderMessage(input),
-							attachments: {
-								create: this.attachmentWrites(input.attachments),
-							},
-						},
+			const conversation = await this.db.transaction(async (tx) => {
+				const [created] = await tx
+					.insert(agentConversation)
+					.values({
+						kind: "BUILDER",
+						userId,
+						title: null,
+						lastReadAt: now,
+						lastMessageAt: now,
+					})
+					.returning({ id: agentConversation.id });
+				if (!created)
+					throw new Error("The conversation insert returned no row.");
+
+				await this.insertSubmission(
+					tx,
+					{
+						conversationId: created.id,
+						submittedById: userId,
+						clientRequestId: input.clientRequestId,
+						commandType: input.commandType,
+						message: this.builderMessage(input),
 					},
-				},
-				select: { id: true },
+					this.attachmentWrites(input.attachments),
+				);
+
+				return created;
 			});
 
 			this.agent?.builderConversationQueued();
@@ -514,10 +584,7 @@ export class ConversationsService {
 			return this.replayBuilderSubmission(existing, input.id, userId);
 		}
 
-		const conversation = await this.db.agentConversation.findFirst({
-			where: { id: input.id, userId, kind: "BUILDER" },
-			select: { id: true },
-		});
+		const conversation = await this.builderId(input.id, userId);
 
 		if (!conversation) {
 			throw new NotFoundException(
@@ -530,25 +597,20 @@ export class ConversationsService {
 				input,
 				userId,
 			);
-			const submission = await this.db.$transaction(async (tx) => {
-				const created = await tx.agentConversationSubmission.create({
-					data: {
+			const submission = await this.db.transaction(async (tx) => {
+				const created = await this.insertSubmission(
+					tx,
+					{
 						conversationId: input.id,
 						submittedById: userId,
 						clientRequestId: input.clientRequestId,
 						commandType: input.commandType,
 						message: this.builderMessage(input),
-						attachments: {
-							create: attachmentWrites,
-						},
 					},
-					select: { id: true },
-				});
+					attachmentWrites,
+				);
 
-				await tx.agentConversation.update({
-					where: { id: input.id },
-					data: { lastMessageAt: new Date(), lastReadAt: new Date() },
-				});
+				await this.touchConversation(tx, input.id);
 
 				return created;
 			});
@@ -574,16 +636,7 @@ export class ConversationsService {
 			return this.replayBuilderSubmission(existing, input.id, userId);
 		}
 
-		const conversation = await this.db.agentConversation.findFirst({
-			where: { id: input.id, userId, kind: "BUILDER" },
-			select: {
-				id: true,
-				sessionId: true,
-				continuationToken: true,
-				pendingInputRequests: true,
-				submissions: { select: { inputRequestId: true } },
-			},
-		});
+		const conversation = await this.pendingConversation(input.id, userId);
 
 		if (!conversation) {
 			throw new NotFoundException(
@@ -644,9 +697,10 @@ export class ConversationsService {
 			? { requestId: input.requestId, optionId: input.optionId }
 			: { requestId: input.requestId, text: input.text };
 		try {
-			const submission = await this.db.$transaction(async (tx) => {
-				const created = await tx.agentConversationSubmission.create({
-					data: {
+			const submission = await this.db.transaction(async (tx) => {
+				const created = await this.insertSubmission(
+					tx,
+					{
 						conversationId: input.id,
 						submittedById: userId,
 						clientRequestId: input.clientRequestId,
@@ -659,13 +713,10 @@ export class ConversationsService {
 							inputResponse,
 						},
 					},
-					select: { id: true },
-				});
+					[],
+				);
 
-				await tx.agentConversation.update({
-					where: { id: input.id },
-					data: { lastMessageAt: new Date(), lastReadAt: new Date() },
-				});
+				await this.touchConversation(tx, input.id);
 
 				return created;
 			});
@@ -680,13 +731,16 @@ export class ConversationsService {
 				return this.replayBuilderSubmission(winner, input.id, userId);
 			}
 
-			const answered = await this.db.agentConversationSubmission.findFirst({
-				where: {
-					conversationId: input.id,
-					inputRequestId: input.requestId,
-				},
-				select: { id: true },
-			});
+			const [answered] = await this.db
+				.select({ id: agentConversationSubmission.id })
+				.from(agentConversationSubmission)
+				.where(
+					and(
+						eq(agentConversationSubmission.conversationId, input.id),
+						eq(agentConversationSubmission.inputRequestId, input.requestId),
+					),
+				)
+				.limit(1);
 			if (answered) {
 				throw new BadRequestException(
 					"That follow-up question has already been answered.",
@@ -708,16 +762,7 @@ export class ConversationsService {
 			return this.replayBuilderSubmission(existing, input.id, userId);
 		}
 
-		const conversation = await this.db.agentConversation.findFirst({
-			where: { id: input.id, userId, kind: "BUILDER" },
-			select: {
-				id: true,
-				sessionId: true,
-				continuationToken: true,
-				pendingInputRequests: true,
-				submissions: { select: { inputRequestId: true } },
-			},
-		});
+		const conversation = await this.pendingConversation(input.id, userId);
 
 		if (!conversation) {
 			throw new NotFoundException(
@@ -750,9 +795,10 @@ export class ConversationsService {
 		}
 
 		try {
-			const submission = await this.db.$transaction(async (tx) => {
-				const created = await tx.agentConversationSubmission.create({
-					data: {
+			const submission = await this.db.transaction(async (tx) => {
+				const created = await this.insertSubmission(
+					tx,
+					{
 						conversationId: input.id,
 						submittedById: userId,
 						clientRequestId: input.clientRequestId,
@@ -768,13 +814,10 @@ export class ConversationsService {
 							},
 						},
 					},
-					select: { id: true },
-				});
+					[],
+				);
 
-				await tx.agentConversation.update({
-					where: { id: input.id },
-					data: { lastMessageAt: new Date(), lastReadAt: new Date() },
-				});
+				await this.touchConversation(tx, input.id);
 
 				return created;
 			});
@@ -806,16 +849,7 @@ export class ConversationsService {
 			return this.replayBuilderSubmission(existing, input.id, userId);
 		}
 
-		const conversation = await this.db.agentConversation.findFirst({
-			where: { id: input.id, userId, kind: "BUILDER" },
-			select: {
-				id: true,
-				sessionId: true,
-				continuationToken: true,
-				pendingInputRequests: true,
-				submissions: { select: { inputRequestId: true } },
-			},
-		});
+		const conversation = await this.pendingConversation(input.id, userId);
 
 		if (!conversation) {
 			throw new NotFoundException(
@@ -851,9 +885,10 @@ export class ConversationsService {
 		}
 
 		try {
-			const submission = await this.db.$transaction(async (tx) => {
-				const created = await tx.agentConversationSubmission.create({
-					data: {
+			const submission = await this.db.transaction(async (tx) => {
+				const created = await this.insertSubmission(
+					tx,
+					{
 						conversationId: input.id,
 						submittedById: userId,
 						clientRequestId: input.clientRequestId,
@@ -869,13 +904,10 @@ export class ConversationsService {
 							},
 						},
 					},
-					select: { id: true },
-				});
+					[],
+				);
 
-				await tx.agentConversation.update({
-					where: { id: input.id },
-					data: { lastMessageAt: new Date(), lastReadAt: new Date() },
-				});
+				await this.touchConversation(tx, input.id);
 
 				return created;
 			});
@@ -901,12 +933,13 @@ export class ConversationsService {
 		userId: string,
 	): Promise<{ id: string }> {
 		await this.assertWorkspaceMember(userId);
-		const updated = await this.db.agentConversation.updateMany({
-			where: { id: input.id, userId, kind: "BUILDER" },
-			data: { permissionMode: permissionModeInput(input.permissionMode) },
-		});
+		const updated = await this.db
+			.update(agentConversation)
+			.set({ permissionMode: permissionModeInput(input.permissionMode) })
+			.where(this.ownedBuilder(input.id, userId))
+			.returning({ id: agentConversation.id });
 
-		if (updated.count !== 1) {
+		if (updated.length !== 1) {
 			throw new NotFoundException(
 				`No builder conversation with id ${input.id}.`,
 			);
@@ -917,12 +950,13 @@ export class ConversationsService {
 
 	async markRead(id: string, userId: string): Promise<{ id: string }> {
 		await this.assertWorkspaceMember(userId);
-		const updated = await this.db.agentConversation.updateMany({
-			where: { id, userId, kind: "BUILDER" },
-			data: { lastReadAt: new Date() },
-		});
+		const updated = await this.db
+			.update(agentConversation)
+			.set({ lastReadAt: new Date() })
+			.where(this.ownedBuilder(id, userId))
+			.returning({ id: agentConversation.id });
 
-		if (updated.count === 0) {
+		if (updated.length === 0) {
 			throw new NotFoundException(`No builder conversation with id ${id}.`);
 		}
 
@@ -941,36 +975,58 @@ export class ConversationsService {
 	}> {
 		await this.assertWorkspaceMember(userId);
 		const share = shareToken?.trim();
-		const row = await this.db.agentConversationAttachment.findFirst({
-			where: {
-				id,
-				submission: {
-					conversation: {
-						kind: "BUILDER",
-						OR: [
-							{ userId },
-							...(share
-								? [
-										{
-											shares: {
-												some: {
-													tokenHash: conversationShareTokenHash(share),
-													revokedAt: null,
-													OR: [
-														{ expiresAt: null },
-														{ expiresAt: { gt: new Date() } },
-													],
-												},
-											},
-										},
-									]
-								: []),
-						],
-					},
-				},
-			},
-			select: { name: true, mediaType: true, content: true },
-		});
+		const [row] = await this.db
+			.select({
+				name: agentConversationAttachment.name,
+				mediaType: agentConversationAttachment.mediaType,
+				content: agentConversationAttachment.content,
+			})
+			.from(agentConversationAttachment)
+			.innerJoin(
+				agentConversationSubmission,
+				eq(
+					agentConversationSubmission.id,
+					agentConversationAttachment.submissionId,
+				),
+			)
+			.innerJoin(
+				agentConversation,
+				eq(agentConversation.id, agentConversationSubmission.conversationId),
+			)
+			.where(
+				and(
+					eq(agentConversationAttachment.id, id),
+					eq(agentConversation.kind, "BUILDER"),
+					or(
+						eq(agentConversation.userId, userId),
+						share
+							? exists(
+									this.db
+										.select({ id: agentConversationShare.id })
+										.from(agentConversationShare)
+										.where(
+											and(
+												eq(
+													agentConversationShare.conversationId,
+													agentConversation.id,
+												),
+												eq(
+													agentConversationShare.tokenHash,
+													conversationShareTokenHash(share),
+												),
+												isNull(agentConversationShare.revokedAt),
+												or(
+													isNull(agentConversationShare.expiresAt),
+													gt(agentConversationShare.expiresAt, new Date()),
+												),
+											),
+										),
+								)
+							: undefined,
+					),
+				),
+			)
+			.limit(1);
 
 		if (!row) {
 			throw new NotFoundException("That attachment is unavailable.");
@@ -987,10 +1043,7 @@ export class ConversationsService {
 		userId: string,
 	) {
 		await this.assertWorkspaceMember(userId);
-		const conversation = await this.db.agentConversation.findFirst({
-			where: { id: input.id, userId, kind: "BUILDER" },
-			select: { id: true },
-		});
+		const conversation = await this.builderId(input.id, userId);
 
 		if (!conversation) {
 			throw new NotFoundException(
@@ -998,31 +1051,35 @@ export class ConversationsService {
 			);
 		}
 
-		const key = {
-			conversationId_userId_messageId: {
-				conversationId: input.id,
-				userId,
-				messageId: input.messageId,
-			},
-		};
-
 		if (!input.rating) {
-			await this.db.agentConversationFeedback.deleteMany({
-				where: key.conversationId_userId_messageId,
-			});
+			await this.db
+				.delete(agentConversationFeedback)
+				.where(
+					and(
+						eq(agentConversationFeedback.conversationId, input.id),
+						eq(agentConversationFeedback.userId, userId),
+						eq(agentConversationFeedback.messageId, input.messageId),
+					),
+				);
 			return { id: input.messageId, rating: null };
 		}
 
-		await this.db.agentConversationFeedback.upsert({
-			where: key,
-			create: {
+		await this.db
+			.insert(agentConversationFeedback)
+			.values({
 				conversationId: input.id,
 				userId,
 				messageId: input.messageId,
 				rating: input.rating,
-			},
-			update: { rating: input.rating },
-		});
+			})
+			.onConflictDoUpdate({
+				target: [
+					agentConversationFeedback.conversationId,
+					agentConversationFeedback.userId,
+					agentConversationFeedback.messageId,
+				],
+				set: { rating: input.rating },
+			});
 
 		return { id: input.messageId, rating: input.rating };
 	}
@@ -1054,24 +1111,29 @@ export class ConversationsService {
 				);
 			}
 
-			const updated = await this.db.agentConversation.updateMany({
-				where: {
-					id: existing.id,
-					kind: "RECORD",
-					userId,
-					contactId: input.contactId ?? null,
-					companyId: input.companyId ?? null,
-					dealId: input.dealId ?? null,
-				},
-				data: {
+			const matchesRecord = (column: PgColumn, value?: string | null) =>
+				value ? eq(column, value) : isNull(column);
+			const updated = await this.db
+				.update(agentConversation)
+				.set({
 					continuationToken: input.continuationToken ?? null,
 					streamIndex: input.streamIndex ?? 0,
 					messageCount: input.messageCount ?? 0,
 					lastMessageAt: new Date(),
-				},
-			});
+				})
+				.where(
+					and(
+						eq(agentConversation.id, existing.id),
+						eq(agentConversation.kind, "RECORD"),
+						eq(agentConversation.userId, userId),
+						matchesRecord(agentConversation.contactId, input.contactId),
+						matchesRecord(agentConversation.companyId, input.companyId),
+						matchesRecord(agentConversation.dealId, input.dealId),
+					),
+				)
+				.returning({ id: agentConversation.id });
 
-			if (updated.count !== 1) {
+			if (updated.length !== 1) {
 				throw new NotFoundException(
 					`No record conversation with session ${input.sessionId}.`,
 				);
@@ -1080,25 +1142,16 @@ export class ConversationsService {
 			return { id: existing.id };
 		};
 
-		const existing = await this.db.agentConversation.findUnique({
-			where: { sessionId: input.sessionId },
-			select: {
-				id: true,
-				kind: true,
-				userId: true,
-				contactId: true,
-				companyId: true,
-				dealId: true,
-			},
-		});
+		const existing = await this.bySession(input.sessionId);
 		let conversation: { id: string };
 
 		if (existing) {
 			conversation = await updateExisting(existing);
 		} else {
 			try {
-				conversation = await this.db.agentConversation.create({
-					data: {
+				const [created] = await this.db
+					.insert(agentConversation)
+					.values({
 						sessionId: input.sessionId,
 						continuationToken: input.continuationToken ?? null,
 						streamIndex: input.streamIndex ?? 0,
@@ -1108,22 +1161,14 @@ export class ConversationsService {
 						contactId: input.contactId ?? null,
 						companyId: input.companyId ?? null,
 						dealId: input.dealId ?? null,
-					},
-					select: { id: true },
-				});
+					})
+					.returning({ id: agentConversation.id });
+				if (!created)
+					throw new Error("The conversation insert returned no row.");
+				conversation = created;
 			} catch (error) {
 				if (!isUniqueConstraint(error)) throw error;
-				const winner = await this.db.agentConversation.findUnique({
-					where: { sessionId: input.sessionId },
-					select: {
-						id: true,
-						kind: true,
-						userId: true,
-						contactId: true,
-						companyId: true,
-						dealId: true,
-					},
-				});
+				const winner = await this.bySession(input.sessionId);
 				if (!winner) throw error;
 				conversation = await updateExisting(winner);
 			}
@@ -1133,10 +1178,15 @@ export class ConversationsService {
 	}
 
 	async events(input: ConversationEventsInput, userId: string) {
-		const conversation = await this.db.agentConversation.findUnique({
-			where: { id: input.id },
-			select: { kind: true, sessionId: true, userId: true },
-		});
+		const [conversation] = await this.db
+			.select({
+				kind: agentConversation.kind,
+				sessionId: agentConversation.sessionId,
+				userId: agentConversation.userId,
+			})
+			.from(agentConversation)
+			.where(eq(agentConversation.id, input.id))
+			.limit(1);
 
 		if (!conversation || conversation.userId !== userId) {
 			throw new NotFoundException(`No conversation with id ${input.id}.`);
@@ -1145,49 +1195,39 @@ export class ConversationsService {
 			await this.assertWorkspaceMember(userId);
 		}
 
-		const eventWhere: Prisma.AgentEventWhereInput =
+		const eventWhere: SQL | undefined =
 			conversation.kind === "BUILDER"
-				? {
-						OR: [
-							{ conversationId: input.id },
-							...(conversation.sessionId
-								? [{ sessionId: conversation.sessionId }]
-								: []),
-						],
-					}
+				? or(
+						eq(agentEvent.conversationId, input.id),
+						conversation.sessionId
+							? eq(agentEvent.sessionId, conversation.sessionId)
+							: undefined,
+					)
 				: conversation.sessionId
-					? { sessionId: conversation.sessionId }
-					: { id: { in: [] } };
+					? eq(agentEvent.sessionId, conversation.sessionId)
+					: sql`false`;
 
-		const events = await this.db.agentEvent.findMany({
-			where: eventWhere,
-			orderBy: [{ emittedAt: "desc" }, { id: "desc" }],
-			take: input.limit,
-			select: {
-				id: true,
-				type: true,
-				data: true,
-				encryptedData: true,
-				conversationId: true,
-				emittedAt: true,
-				streamIndex: true,
-				deliveryIds: true,
-			},
-		});
+		const events = await this.db
+			.select(EVENT_FIELDS)
+			.from(agentEvent)
+			.where(eventWhere)
+			.orderBy(desc(agentEvent.emittedAt), desc(agentEvent.id))
+			.limit(input.limit);
 
 		return events.reverse().map(publicConversationEvent);
 	}
 
 	async remove(id: string, userId: string): Promise<{ id: string }> {
-		const conversation = await this.db.agentConversation.findUnique({
-			where: { id },
-			select: {
-				id: true,
-				kind: true,
-				userId: true,
-				sessionId: true,
-			},
-		});
+		const [conversation] = await this.db
+			.select({
+				id: agentConversation.id,
+				kind: agentConversation.kind,
+				userId: agentConversation.userId,
+				sessionId: agentConversation.sessionId,
+			})
+			.from(agentConversation)
+			.where(eq(agentConversation.id, id))
+			.limit(1);
 
 		if (!conversation || conversation.userId !== userId) {
 			throw new NotFoundException(`No conversation with id ${id}.`);
@@ -1196,22 +1236,32 @@ export class ConversationsService {
 			await this.assertWorkspaceMember(userId);
 		}
 
-		await this.db.$transaction(async (tx) => {
-			await tx.agentBuilderArtifact.deleteMany({
-				where: { conversationId: id, versionId: null },
-			});
-			await tx.agentEvent.deleteMany({
-				where: {
-					OR: [
-						{ conversationId: id },
-						...(conversation.sessionId
-							? [{ sessionId: conversation.sessionId }]
-							: []),
-					],
-				},
-			});
+		await this.db.transaction(async (tx) => {
+			await tx
+				.delete(agentBuilderArtifact)
+				.where(
+					and(
+						eq(agentBuilderArtifact.conversationId, id),
+						isNull(agentBuilderArtifact.versionId),
+					),
+				);
+			await tx
+				.delete(agentEvent)
+				.where(
+					or(
+						eq(agentEvent.conversationId, id),
+						conversation.sessionId
+							? eq(agentEvent.sessionId, conversation.sessionId)
+							: undefined,
+					),
+				);
 
-			await tx.agentConversation.delete({ where: { id } });
+			const removed = await tx
+				.delete(agentConversation)
+				.where(eq(agentConversation.id, id))
+				.returning({ id: agentConversation.id });
+			if (removed.length === 0)
+				throw new NotFoundException(`No conversation with id ${id}.`);
 		});
 
 		this.logger.log({ message: "Conversation removed", conversationId: id });
@@ -1244,7 +1294,7 @@ export class ConversationsService {
 		attachments:
 			| BuilderConversationCreateInput["attachments"]
 			| BuilderConversationSubmitInput["attachments"];
-	}): Prisma.InputJsonValue {
+	}): JsonValue {
 		return {
 			text: input.message,
 			resources: input.resources,
@@ -1277,21 +1327,35 @@ export class ConversationsService {
 		);
 		const referenced =
 			referencedIds.length > 0
-				? await this.db.agentConversationAttachment.findMany({
-						where: {
-							id: { in: referencedIds },
-							submission: {
-								conversation: { id: input.id, userId, kind: "BUILDER" },
-							},
-						},
-						select: {
-							id: true,
-							name: true,
-							mediaType: true,
-							size: true,
-							content: true,
-						},
-					})
+				? await this.db
+						.select({
+							id: agentConversationAttachment.id,
+							name: agentConversationAttachment.name,
+							mediaType: agentConversationAttachment.mediaType,
+							size: agentConversationAttachment.size,
+							content: agentConversationAttachment.content,
+						})
+						.from(agentConversationAttachment)
+						.innerJoin(
+							agentConversationSubmission,
+							eq(
+								agentConversationSubmission.id,
+								agentConversationAttachment.submissionId,
+							),
+						)
+						.innerJoin(
+							agentConversation,
+							eq(
+								agentConversation.id,
+								agentConversationSubmission.conversationId,
+							),
+						)
+						.where(
+							and(
+								inArray(agentConversationAttachment.id, referencedIds),
+								this.ownedBuilder(input.id, userId),
+							),
+						)
 				: [];
 		const referencedById = new Map(referenced.map((row) => [row.id, row]));
 
@@ -1329,30 +1393,113 @@ export class ConversationsService {
 	}
 
 	private async assertWorkspaceMember(userId: string): Promise<void> {
-		const member = await this.db.member.findUnique({
-			where: {
-				organizationId_userId: { organizationId: WORKSPACE_ID, userId },
-			},
-			select: { id: true },
-		});
+		const [membership] = await this.db
+			.select({ id: member.id })
+			.from(member)
+			.where(
+				and(eq(member.organizationId, WORKSPACE_ID), eq(member.userId, userId)),
+			)
+			.limit(1);
 
-		if (!member) {
+		if (!membership) {
 			throw new NotFoundException("No workspace membership was found.");
 		}
 	}
 
-	private requestByClientId(
+	private async requestByClientId(
 		clientRequestId: string,
 	): Promise<ExistingBuilderRequest | null> {
-		return this.db.agentConversationSubmission.findUnique({
-			where: { clientRequestId },
-			select: {
-				id: true,
-				conversationId: true,
-				submittedById: true,
-				conversation: { select: { id: true, userId: true, kind: true } },
+		const row = await this.db.query.agentConversationSubmission.findFirst({
+			where: eq(agentConversationSubmission.clientRequestId, clientRequestId),
+			columns: { id: true, conversationId: true, submittedById: true },
+			with: {
+				conversation: { columns: { id: true, userId: true, kind: true } },
 			},
 		});
+		return row ?? null;
+	}
+
+	private ownedBuilder(id: string, userId: string): SQL | undefined {
+		return and(
+			eq(agentConversation.id, id),
+			eq(agentConversation.userId, userId),
+			eq(agentConversation.kind, "BUILDER"),
+		);
+	}
+
+	private async builderId(
+		id: string,
+		userId: string,
+	): Promise<{ id: string } | null> {
+		const [row] = await this.db
+			.select({ id: agentConversation.id })
+			.from(agentConversation)
+			.where(this.ownedBuilder(id, userId))
+			.limit(1);
+		return row ?? null;
+	}
+
+	private async pendingConversation(id: string, userId: string) {
+		const row = await this.db.query.agentConversation.findFirst({
+			where: this.ownedBuilder(id, userId),
+			columns: {
+				id: true,
+				sessionId: true,
+				continuationToken: true,
+				pendingInputRequests: true,
+			},
+			with: { submissions: { columns: { inputRequestId: true } } },
+		});
+		return row ?? null;
+	}
+
+	private async bySession(sessionId: string) {
+		const [row] = await this.db
+			.select({
+				id: agentConversation.id,
+				kind: agentConversation.kind,
+				userId: agentConversation.userId,
+				contactId: agentConversation.contactId,
+				companyId: agentConversation.companyId,
+				dealId: agentConversation.dealId,
+			})
+			.from(agentConversation)
+			.where(eq(agentConversation.sessionId, sessionId))
+			.limit(1);
+		return row ?? null;
+	}
+
+	private async insertSubmission(
+		tx: Executor,
+		values: typeof agentConversationSubmission.$inferInsert,
+		attachments: Omit<
+			typeof agentConversationAttachment.$inferInsert,
+			"submissionId"
+		>[],
+	): Promise<{ id: string }> {
+		const [created] = await tx
+			.insert(agentConversationSubmission)
+			.values(values)
+			.returning({ id: agentConversationSubmission.id });
+		if (!created) throw new Error("The submission insert returned no row.");
+
+		if (attachments.length > 0) {
+			await tx.insert(agentConversationAttachment).values(
+				attachments.map((attachment) => ({
+					...attachment,
+					submissionId: created.id,
+				})),
+			);
+		}
+
+		return created;
+	}
+
+	private async touchConversation(tx: Executor, id: string): Promise<void> {
+		await tx
+			.update(agentConversation)
+			.set({ lastMessageAt: new Date(), lastReadAt: new Date() })
+			.where(eq(agentConversation.id, id));
 	}
 
 	private replayBuilderCreation(
@@ -1385,27 +1532,33 @@ export class ConversationsService {
 	}
 }
 
+const EVENT_FIELDS = {
+	id: agentEvent.id,
+	type: agentEvent.type,
+	data: agentEvent.data,
+	encryptedData: agentEvent.encryptedData,
+	conversationId: agentEvent.conversationId,
+	emittedAt: agentEvent.emittedAt,
+	streamIndex: agentEvent.streamIndex,
+	deliveryIds: agentEvent.deliveryIds,
+};
+
 function isUniqueConstraint(cause: unknown): boolean {
-	return (
-		cause instanceof PrismaNamespace.PrismaClientKnownRequestError &&
-		cause.code === "P2002"
-	);
+	return isUniqueViolation(cause);
 }
 
-function pendingBuilderQuestionOf(
-	value: Prisma.JsonValue,
-): BuilderQuestion | null {
+function pendingBuilderQuestionOf(value: JsonValue): BuilderQuestion | null {
 	return builderQuestion.parse(value);
 }
 
 function pendingBuilderApprovalOf(
-	value: Prisma.JsonValue,
+	value: JsonValue,
 ): BuilderToolApproval | null {
 	return builderToolApproval.parse(value);
 }
 
 function pendingBuilderSessionLimitOf(
-	value: Prisma.JsonValue,
+	value: JsonValue,
 ): BuilderSessionLimit | null {
 	return builderSessionLimit.parse(value);
 }
@@ -1417,7 +1570,7 @@ const BUILDER_INPUT_PRIORITY = {
 } as const satisfies Record<InputRequest["kind"], number>;
 
 function activeBuilderInputRequest(
-	value: Prisma.JsonValue,
+	value: JsonValue,
 	answeredRequestIds: readonly string[],
 ): InputRequest | null {
 	const answered = new Set(answeredRequestIds);

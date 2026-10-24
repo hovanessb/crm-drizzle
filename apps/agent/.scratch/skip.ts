@@ -1,23 +1,24 @@
-import { db, EnrichmentStatus } from "@crm/db";
+import {
+	company as companyTable,
+	db,
+	EnrichmentStatus,
+	firstRow,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { settle } from "../agent/lib/enrichment";
 
-const company = await db.company.create({
-	data: {
+const company = await requireRow(db.insert(companyTable).values({
 		name: "Settle Probe",
 		domain: "settle-probe.test",
 		enrichmentStatus: EnrichmentStatus.PENDING,
-	},
-	select: { id: true, enrichmentStatus: true },
-});
+	}).returning({ id: companyTable.id, enrichmentStatus: companyTable.enrichmentStatus }));
 console.log("created            ", company.enrichmentStatus);
 
 // Exactly what runBrand does when there is no key: settle before anything marks it RUNNING.
 await settle({ companyId: company.id }, EnrichmentStatus.SKIPPED, "no key");
 
-const after = await db.company.findUnique({
-	where: { id: company.id },
-	select: { enrichmentStatus: true },
-});
+const after = await firstRow(db.select({ enrichmentStatus: companyTable.enrichmentStatus }).from(companyTable).where(whereEq(companyTable.id, company.id)).limit(1));
 console.log("after settle(SKIP) ", after?.enrichmentStatus);
 console.log(
 	"swept again?       ",
@@ -26,5 +27,5 @@ console.log(
 		: "NO — stuck",
 );
 
-await db.company.delete({ where: { id: company.id } });
-await db.$disconnect();
+await requireRow(db.delete(companyTable).where(whereEq(companyTable.id, company.id)).returning());
+await db.$client.end();

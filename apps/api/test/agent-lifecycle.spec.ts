@@ -1,10 +1,29 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { DEFAULT_WORKSPACE_NAME, WORKSPACE_ID } from "@crm/auth/organization";
-import { db, type Prisma } from "@crm/db";
+import {
+	agentAction,
+	agentAuditEvent,
+	agentBuilderArtifact,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentTask,
+	agentTrigger,
+	agentVersion,
+	and,
+	db,
+	eq,
+	inArray,
+	type JsonObject,
+	member,
+	organization,
+	user,
+} from "@crm/db";
 import { workspaceSlug } from "@crm/db/workspace";
 import { AgentAccessService } from "../src/agent/agent-access.service";
 import { AgentDefinitionsService } from "../src/agent/agent-definitions.service";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
+import { first, one } from "./rows";
 
 const suffix = crypto.randomUUID();
 const userId = `agent-lifecycle-user-${suffix}`;
@@ -21,121 +40,137 @@ const agents = new AgentDefinitionsService(
 );
 
 beforeAll(async () => {
-	await db.organization.upsert({
-		where: { id: WORKSPACE_ID },
-		update: {},
-		create: {
+	await db
+		.insert(organization)
+		.values({
 			id: WORKSPACE_ID,
 			name: DEFAULT_WORKSPACE_NAME,
 			slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
 			createdAt: new Date(),
+		})
+		.onConflictDoNothing();
+	await db.insert(user).values([
+		{
+			id: userId,
+			name: "Agent Lifecycle Test",
+			email: `${userId}@example.test`,
 		},
-	});
-	await db.user.createMany({
-		data: [
-			{
-				id: userId,
-				name: "Agent Lifecycle Test",
-				email: `${userId}@example.test`,
-			},
-			{
-				id: teammateId,
-				name: "Agent Lifecycle Teammate",
-				email: `${teammateId}@example.test`,
-			},
-		],
-	});
-	await db.member.createMany({
-		data: [
-			{
-				id: memberId,
-				organizationId: WORKSPACE_ID,
-				userId,
-				role: "member",
-				createdAt: new Date(),
-			},
-			{
-				id: teammateMemberId,
-				organizationId: WORKSPACE_ID,
-				userId: teammateId,
-				role: "member",
-				createdAt: new Date(),
-			},
-		],
-	});
+		{
+			id: teammateId,
+			name: "Agent Lifecycle Teammate",
+			email: `${teammateId}@example.test`,
+		},
+	]);
+	await db.insert(member).values([
+		{
+			id: memberId,
+			organizationId: WORKSPACE_ID,
+			userId,
+			role: "member",
+			createdAt: new Date(),
+		},
+		{
+			id: teammateMemberId,
+			organizationId: WORKSPACE_ID,
+			userId: teammateId,
+			role: "member",
+			createdAt: new Date(),
+		},
+	]);
 });
 
 afterAll(async () => {
 	const agentIds = (
-		await db.agentDefinition.findMany({
-			where: { createdById: userId },
-			select: { id: true },
-		})
+		await db
+			.select({ id: agentDefinition.id })
+			.from(agentDefinition)
+			.where(eq(agentDefinition.createdById, userId))
 	).map((agent) => agent.id);
 	if (agentIds.length > 0) {
-		await db.agentRunEvent.deleteMany({
-			where: { run: { agentId: { in: agentIds } } },
-		});
-		await db.agentAction.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentAuditEvent.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentRun.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentTrigger.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentBuilderArtifact.deleteMany({
-			where: { version: { agentId: { in: agentIds } } },
-		});
-		await db.agentDefinition.updateMany({
-			where: { id: { in: agentIds } },
-			data: { currentVersionId: null },
-		});
-		await db.agentVersion.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentDefinition.deleteMany({
-			where: { id: { in: agentIds } },
-		});
+		await db
+			.delete(agentRunEvent)
+			.where(
+				inArray(
+					agentRunEvent.runId,
+					db
+						.select({ id: agentRun.id })
+						.from(agentRun)
+						.where(inArray(agentRun.agentId, agentIds)),
+				),
+			);
+		await db.delete(agentAction).where(inArray(agentAction.agentId, agentIds));
+		await db
+			.delete(agentAuditEvent)
+			.where(inArray(agentAuditEvent.agentId, agentIds));
+		await db.delete(agentRun).where(inArray(agentRun.agentId, agentIds));
+		await db
+			.delete(agentTrigger)
+			.where(inArray(agentTrigger.agentId, agentIds));
+		await db
+			.delete(agentBuilderArtifact)
+			.where(
+				inArray(
+					agentBuilderArtifact.versionId,
+					db
+						.select({ id: agentVersion.id })
+						.from(agentVersion)
+						.where(inArray(agentVersion.agentId, agentIds)),
+				),
+			);
+		await db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(inArray(agentDefinition.id, agentIds));
+		await db
+			.delete(agentVersion)
+			.where(inArray(agentVersion.agentId, agentIds));
+		await db
+			.delete(agentDefinition)
+			.where(inArray(agentDefinition.id, agentIds));
 	}
-	await db.agentTask.deleteMany({
-		where: { kind: "slack-channel-join", reason: joinReason },
-	});
-	await db.member.deleteMany({
-		where: { id: { in: [memberId, teammateMemberId] } },
-	});
-	await db.user.deleteMany({ where: { id: { in: [userId, teammateId] } } });
+	await db
+		.delete(agentTask)
+		.where(
+			and(
+				eq(agentTask.kind, "slack-channel-join"),
+				eq(agentTask.reason, joinReason),
+			),
+		);
+	await db
+		.delete(member)
+		.where(inArray(member.id, [memberId, teammateMemberId]));
+	await db.delete(user).where(inArray(user.id, [userId, teammateId]));
 });
 
 async function createAgent(versionCount = 1, status = "DRAFT" as const) {
-	const agent = await db.agentDefinition.create({
-		data: {
-			name: `Lifecycle agent ${crypto.randomUUID()}`,
-			status,
-			createdById: userId,
-		},
-		select: { id: true },
-	});
+	const agent = await one(
+		db
+			.insert(agentDefinition)
+			.values({
+				name: `Lifecycle agent ${crypto.randomUUID()}`,
+				status,
+				createdById: userId,
+			})
+			.returning({ id: agentDefinition.id }),
+	);
 	const versions = [];
 	for (let number = 1; number <= versionCount; number += 1) {
 		versions.push(
-			await db.agentVersion.create({
-				data: {
-					agentId: agent.id,
-					number,
-					status: "READY",
-					instructions: `Version ${number}`,
-					manifest: {},
-					modelId: "test/model",
-					sandboxPolicy: {},
-					createdById: userId,
-				},
-				select: { id: true, number: true },
-			}),
+			await one(
+				db
+					.insert(agentVersion)
+					.values({
+						agentId: agent.id,
+						number,
+						status: "READY",
+						instructions: `Version ${number}`,
+						manifest: {},
+						modelId: "test/model",
+						sandboxPolicy: {},
+						createdById: userId,
+					})
+					.returning({ id: agentVersion.id, number: agentVersion.number }),
+			),
 		);
 	}
 	return { agentId: agent.id, versions };
@@ -161,15 +196,18 @@ const capableManifest = {
 	dataScope: { mode: "WORKSPACE", summary: "Everything", resources: [] },
 };
 
-async function deployedAgent(manifest: Prisma.InputJsonObject) {
+async function deployedAgent(manifest: JsonObject) {
 	const { agentId, versions } = await createAgent();
 	const versionId = versions[0]?.id;
 	if (!versionId) throw new Error("Missing version");
 
-	await db.agentVersion.update({
-		where: { id: versionId },
-		data: { manifest },
-	});
+	await one(
+		db
+			.update(agentVersion)
+			.set({ manifest })
+			.where(eq(agentVersion.id, versionId))
+			.returning(),
+	);
 	await agents.deploy(
 		{ id: agentId, versionId, clientRequestId: crypto.randomUUID() },
 		userId,
@@ -225,25 +263,37 @@ describe("agent lifecycle", () => {
 		);
 		const nextRunAt = new Date("2036-08-06T12:00:00.000Z");
 		const lastRunAt = new Date("2036-08-05T12:00:00.000Z");
-		await db.agentTrigger.create({
-			data: {
-				agentId,
-				versionId,
-				type: "SCHEDULE",
-				name: "Every morning",
-				config: { intervalMinutes: 1440 },
-				createdById: userId,
-				enabled: true,
-				nextRunAt,
-				lastRunAt,
-			},
-		});
+		await one(
+			db
+				.insert(agentTrigger)
+				.values({
+					agentId,
+					versionId,
+					type: "SCHEDULE",
+					name: "Every morning",
+					config: { intervalMinutes: 1440 },
+					createdById: userId,
+					enabled: true,
+					nextRunAt,
+					lastRunAt,
+				})
+				.returning(),
+		);
 
 		const detail = await agents.byId(agentId, teammateId);
 		const listed = await agents.list(teammateId);
-		const audit = await db.agentAuditEvent.findFirstOrThrow({
-			where: { agentId, type: "agent.updated" },
-		});
+		const audit = await one(
+			db
+				.select()
+				.from(agentAuditEvent)
+				.where(
+					and(
+						eq(agentAuditEvent.agentId, agentId),
+						eq(agentAuditEvent.type, "agent.updated"),
+					),
+				)
+				.limit(1),
+		);
 		const listItem = listed.find((agent) => agent.id === agentId);
 		expect(detail).toMatchObject({
 			id: agentId,
@@ -286,19 +336,29 @@ describe("agent lifecycle", () => {
 		const versionId = versions[0]?.id;
 		if (!versionId) throw new Error("Missing version");
 
-		await db.agentVersion.update({
-			where: { id: versionId },
-			data: {
-				manifest: {
-					name: "Pipeline health monitor",
-					description: "Summarize pipeline health for the team.",
-				},
-			},
-		});
-		const before = await db.agentDefinition.findUniqueOrThrow({
-			where: { id: agentId },
-			select: { name: true, description: true, status: true },
-		});
+		await one(
+			db
+				.update(agentVersion)
+				.set({
+					manifest: {
+						name: "Pipeline health monitor",
+						description: "Summarize pipeline health for the team.",
+					},
+				})
+				.where(eq(agentVersion.id, versionId))
+				.returning(),
+		);
+		const before = await one(
+			db
+				.select({
+					name: agentDefinition.name,
+					description: agentDefinition.description,
+					status: agentDefinition.status,
+				})
+				.from(agentDefinition)
+				.where(eq(agentDefinition.id, agentId))
+				.limit(1),
+		);
 		expect(before).toMatchObject({
 			name: expect.stringContaining("Lifecycle agent"),
 			description: null,
@@ -310,15 +370,18 @@ describe("agent lifecycle", () => {
 			userId,
 		);
 
-		const after = await db.agentDefinition.findUniqueOrThrow({
-			where: { id: agentId },
-			select: {
-				name: true,
-				description: true,
-				status: true,
-				currentVersionId: true,
-			},
-		});
+		const after = await one(
+			db
+				.select({
+					name: agentDefinition.name,
+					description: agentDefinition.description,
+					status: agentDefinition.status,
+					currentVersionId: agentDefinition.currentVersionId,
+				})
+				.from(agentDefinition)
+				.where(eq(agentDefinition.id, agentId))
+				.limit(1),
+		);
 		expect(after).toEqual({
 			name: "Pipeline health monitor",
 			description: "Summarize pipeline health for the team.",
@@ -344,7 +407,13 @@ describe("agent lifecycle", () => {
 		]);
 
 		const [definition, teamAgents] = await Promise.all([
-			db.agentDefinition.findUnique({ where: { id: agentId } }),
+			first(
+				db
+					.select()
+					.from(agentDefinition)
+					.where(eq(agentDefinition.id, agentId))
+					.limit(1),
+			),
 			agents.list(userId),
 		]);
 		expect(definition?.status).toBe("DRAFT");
@@ -380,11 +449,22 @@ describe("agent lifecycle", () => {
 		);
 
 		const [definition, deployedVersions] = await Promise.all([
-			db.agentDefinition.findUnique({ where: { id: agentId } }),
-			db.agentVersion.findMany({
-				where: { agentId, status: "DEPLOYED" },
-				select: { id: true },
-			}),
+			first(
+				db
+					.select()
+					.from(agentDefinition)
+					.where(eq(agentDefinition.id, agentId))
+					.limit(1),
+			),
+			db
+				.select({ id: agentVersion.id })
+				.from(agentVersion)
+				.where(
+					and(
+						eq(agentVersion.agentId, agentId),
+						eq(agentVersion.status, "DEPLOYED"),
+					),
+				),
 		]);
 		expect(definition).toMatchObject({
 			status: "LIVE",
@@ -419,10 +499,13 @@ describe("agent lifecycle", () => {
 			collision.filter((result) => result.status === "rejected"),
 		).toHaveLength(1);
 
-		const definition = await db.agentDefinition.findUniqueOrThrow({
-			where: { id: agentId },
-			select: { currentVersionId: true },
-		});
+		const definition = await one(
+			db
+				.select({ currentVersionId: agentDefinition.currentVersionId })
+				.from(agentDefinition)
+				.where(eq(agentDefinition.id, agentId))
+				.limit(1),
+		);
 		const currentVersionId = definition.currentVersionId;
 		if (!currentVersionId) throw new Error("Missing current version");
 		const retries = await Promise.all(
@@ -441,32 +524,43 @@ describe("agent lifecycle", () => {
 			new Set([currentVersionId]),
 		);
 		expect(
-			await db.agentAuditEvent.count({
-				where: { agentId, type: "agent.deployed", requestId: clientRequestId },
-			}),
+			await db.$count(
+				agentAuditEvent,
+				and(
+					eq(agentAuditEvent.agentId, agentId),
+					eq(agentAuditEvent.type, "agent.deployed"),
+					eq(agentAuditEvent.requestId, clientRequestId),
+				),
+			),
 		).toBe(1);
 		expect(
-			await db.agentVersion.count({
-				where: { agentId, status: "DEPLOYED" },
-			}),
+			await db.$count(
+				agentVersion,
+				and(
+					eq(agentVersion.agentId, agentId),
+					eq(agentVersion.status, "DEPLOYED"),
+				),
+			),
 		).toBe(1);
 	});
 
 	it("moves triggers onto the version a revision creates", async () => {
 		const { agentId, versionId } = await deployedAgent(capableManifest);
-		const trigger = await db.agentTrigger.create({
-			data: {
-				agentId,
-				versionId,
-				type: "SCHEDULE",
-				name: "Every morning",
-				config: { intervalMinutes: 1440 },
-				createdById: userId,
-				enabled: true,
-				nextRunAt: new Date("2036-08-12T06:00:00.000Z"),
-			},
-			select: { id: true },
-		});
+		const trigger = await one(
+			db
+				.insert(agentTrigger)
+				.values({
+					agentId,
+					versionId,
+					type: "SCHEDULE",
+					name: "Every morning",
+					config: { intervalMinutes: 1440 },
+					createdById: userId,
+					enabled: true,
+					nextRunAt: new Date("2036-08-12T06:00:00.000Z"),
+				})
+				.returning({ id: agentTrigger.id }),
+		);
 
 		const revised = await agents.revise(
 			{
@@ -481,18 +575,30 @@ describe("agent lifecycle", () => {
 		if (!revisedId) throw new Error("Missing revised version");
 
 		const [definition, revision, moved] = await Promise.all([
-			db.agentDefinition.findUniqueOrThrow({
-				where: { id: agentId },
-				select: { currentVersionId: true },
-			}),
-			db.agentVersion.findUniqueOrThrow({
-				where: { id: revisedId },
-				select: { manifest: true },
-			}),
-			db.agentTrigger.findUniqueOrThrow({
-				where: { id: trigger.id },
-				select: { versionId: true, enabled: true },
-			}),
+			one(
+				db
+					.select({ currentVersionId: agentDefinition.currentVersionId })
+					.from(agentDefinition)
+					.where(eq(agentDefinition.id, agentId))
+					.limit(1),
+			),
+			one(
+				db
+					.select({ manifest: agentVersion.manifest })
+					.from(agentVersion)
+					.where(eq(agentVersion.id, revisedId))
+					.limit(1),
+			),
+			one(
+				db
+					.select({
+						versionId: agentTrigger.versionId,
+						enabled: agentTrigger.enabled,
+					})
+					.from(agentTrigger)
+					.where(eq(agentTrigger.id, trigger.id))
+					.limit(1),
+			),
 		]);
 
 		expect(revisedId).not.toBe(versionId);
@@ -516,29 +622,34 @@ describe("agent lifecycle", () => {
 
 	it("moves triggers onto the version a file save creates", async () => {
 		const { agentId, versionId } = await deployedAgent(capableManifest);
-		await db.agentBuilderArtifact.create({
-			data: {
-				versionId,
-				path: "agent/instructions.md",
-				language: "markdown",
-				content: "Watch renewals.",
-				revision: 1,
-				status: "READY",
-			},
-		});
-		const trigger = await db.agentTrigger.create({
-			data: {
-				agentId,
-				versionId,
-				type: "SCHEDULE",
-				name: "Every morning",
-				config: { intervalMinutes: 1440 },
-				createdById: userId,
-				enabled: true,
-				nextRunAt: new Date("2036-08-12T06:00:00.000Z"),
-			},
-			select: { id: true },
-		});
+		await one(
+			db
+				.insert(agentBuilderArtifact)
+				.values({
+					versionId,
+					path: "agent/instructions.md",
+					language: "markdown",
+					content: "Watch renewals.",
+					revision: 1,
+					status: "READY",
+				})
+				.returning(),
+		);
+		const trigger = await one(
+			db
+				.insert(agentTrigger)
+				.values({
+					agentId,
+					versionId,
+					type: "SCHEDULE",
+					name: "Every morning",
+					config: { intervalMinutes: 1440 },
+					createdById: userId,
+					enabled: true,
+					nextRunAt: new Date("2036-08-12T06:00:00.000Z"),
+				})
+				.returning({ id: agentTrigger.id }),
+		);
 
 		const saved = await agents.saveFile(
 			{
@@ -553,18 +664,35 @@ describe("agent lifecycle", () => {
 		if (!savedId) throw new Error("Missing saved version");
 
 		const [definition, moved, audit] = await Promise.all([
-			db.agentDefinition.findUniqueOrThrow({
-				where: { id: agentId },
-				select: { currentVersionId: true },
-			}),
-			db.agentTrigger.findUniqueOrThrow({
-				where: { id: trigger.id },
-				select: { versionId: true, enabled: true },
-			}),
-			db.agentAuditEvent.findFirstOrThrow({
-				where: { agentId, type: "agent.file.saved" },
-				select: { after: true },
-			}),
+			one(
+				db
+					.select({ currentVersionId: agentDefinition.currentVersionId })
+					.from(agentDefinition)
+					.where(eq(agentDefinition.id, agentId))
+					.limit(1),
+			),
+			one(
+				db
+					.select({
+						versionId: agentTrigger.versionId,
+						enabled: agentTrigger.enabled,
+					})
+					.from(agentTrigger)
+					.where(eq(agentTrigger.id, trigger.id))
+					.limit(1),
+			),
+			one(
+				db
+					.select({ after: agentAuditEvent.after })
+					.from(agentAuditEvent)
+					.where(
+						and(
+							eq(agentAuditEvent.agentId, agentId),
+							eq(agentAuditEvent.type, "agent.file.saved"),
+						),
+					)
+					.limit(1),
+			),
 		]);
 
 		expect(saved.saved).toBe(true);
@@ -576,18 +704,21 @@ describe("agent lifecycle", () => {
 
 	it("numbers a revision above every existing version", async () => {
 		const { agentId } = await deployedAgent(capableManifest);
-		await db.agentVersion.create({
-			data: {
-				agentId,
-				number: 9,
-				status: "DRAFT",
-				instructions: "A later draft",
-				manifest: capableManifest,
-				modelId: "test/model",
-				sandboxPolicy: {},
-				createdById: userId,
-			},
-		});
+		await one(
+			db
+				.insert(agentVersion)
+				.values({
+					agentId,
+					number: 9,
+					status: "DRAFT",
+					instructions: "A later draft",
+					manifest: capableManifest,
+					modelId: "test/model",
+					sandboxPolicy: {},
+					createdById: userId,
+				})
+				.returning(),
+		);
 
 		const revised = await agents.revise(
 			{
@@ -600,10 +731,13 @@ describe("agent lifecycle", () => {
 		if (!revised.versionId) throw new Error("Missing revised version");
 
 		expect(
-			await db.agentVersion.findUniqueOrThrow({
-				where: { id: revised.versionId },
-				select: { number: true },
-			}),
+			await one(
+				db
+					.select({ number: agentVersion.number })
+					.from(agentVersion)
+					.where(eq(agentVersion.id, revised.versionId))
+					.limit(1),
+			),
 		).toEqual({ number: 10 });
 	});
 
@@ -621,14 +755,25 @@ describe("agent lifecycle", () => {
 		if (!revised.versionId) throw new Error("Missing revised version");
 
 		const [version, join] = await Promise.all([
-			db.agentVersion.findUniqueOrThrow({
-				where: { id: revised.versionId },
-				select: { manifest: true },
-			}),
-			db.agentTask.findFirst({
-				where: { kind: "slack-channel-join", reason: joinReason },
-				select: { payload: true },
-			}),
+			one(
+				db
+					.select({ manifest: agentVersion.manifest })
+					.from(agentVersion)
+					.where(eq(agentVersion.id, revised.versionId))
+					.limit(1),
+			),
+			first(
+				db
+					.select({ payload: agentTask.payload })
+					.from(agentTask)
+					.where(
+						and(
+							eq(agentTask.kind, "slack-channel-join"),
+							eq(agentTask.reason, joinReason),
+						),
+					)
+					.limit(1),
+			),
 		]);
 
 		expect(version.manifest).toMatchObject({
@@ -670,7 +815,9 @@ describe("agent lifecycle", () => {
 		expect((refusal as Error).message).toBe(
 			"None of this agent's actions post to a channel, so its channel cannot be changed.",
 		);
-		expect(await db.agentVersion.count({ where: { agentId } })).toBe(1);
+		expect(
+			await db.$count(agentVersion, eq(agentVersion.agentId, agentId)),
+		).toBe(1);
 	});
 
 	it("cannot resurrect an agent when deletion races a transition", async () => {
@@ -692,10 +839,13 @@ describe("agent lifecycle", () => {
 		]);
 
 		expect(
-			await db.agentDefinition.findUnique({
-				where: { id: agentId },
-				select: { status: true },
-			}),
+			await first(
+				db
+					.select({ status: agentDefinition.status })
+					.from(agentDefinition)
+					.where(eq(agentDefinition.id, agentId))
+					.limit(1),
+			),
 		).toEqual({ status: "DELETED" });
 	});
 });

@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { type Db, sql } from "@crm/db";
 import {
 	Controller,
 	Get,
@@ -38,7 +38,7 @@ export class HealthController {
 		const startedAt = process.hrtime.bigint();
 
 		try {
-			await this.db.$queryRaw`SELECT 1`;
+			await this.db.execute(sql`SELECT 1`);
 		} catch (error) {
 			this.logger.error(
 				{ message: "Database health check failed" },

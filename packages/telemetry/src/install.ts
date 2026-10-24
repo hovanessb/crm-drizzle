@@ -1,7 +1,15 @@
 import "@crm/env/load";
 
 import { createHash } from "node:crypto";
-import { db } from "@crm/db";
+import {
+	db,
+	eq,
+	gt,
+	install,
+	sql,
+	telemetryCounter,
+	telemetryMilestone,
+} from "@crm/db";
 import { crmVersion } from "./version";
 
 export const INSTALL_ID = "install";
@@ -13,12 +21,12 @@ export type Install = {
 	lastRollupAt: Date | null;
 };
 
-const SELECT = {
-	uuid: true,
-	version: true,
-	createdAt: true,
-	lastRollupAt: true,
-} as const;
+const FIELDS = {
+	uuid: install.uuid,
+	version: install.version,
+	createdAt: install.createdAt,
+	lastRollupAt: install.lastRollupAt,
+};
 
 let cached: Install | null = null;
 
@@ -31,15 +39,16 @@ export async function readInstall(): Promise<Install | null> {
 	if (missingSince && Date.now() - missingSince < MISSING_FOR_MS) return null;
 
 	try {
-		const row = await db.install.findUnique({
-			where: { id: INSTALL_ID },
-			select: SELECT,
-		});
+		const [row] = await db
+			.select(FIELDS)
+			.from(install)
+			.where(eq(install.id, INSTALL_ID))
+			.limit(1);
 
 		if (row) cached = row;
 		missingSince = row ? 0 : Date.now();
 
-		return row;
+		return row ?? null;
 	} catch {
 		missingSince = Date.now();
 		return null;
@@ -57,11 +66,12 @@ export async function syncVersion(
 	if (!version) return readInstall();
 
 	try {
-		const row = await db.install.update({
-			where: { id: INSTALL_ID },
-			data: { version },
-			select: SELECT,
-		});
+		const [row] = await db
+			.update(install)
+			.set({ version })
+			.where(eq(install.id, INSTALL_ID))
+			.returning(FIELDS);
+		if (!row) return readInstall();
 
 		cached = row;
 		missingSince = 0;
@@ -87,12 +97,13 @@ export type Milestone = (typeof MILESTONES)[number];
 
 export async function reachMilestone(step: Milestone): Promise<boolean> {
 	try {
-		const { count } = await db.telemetryMilestone.createMany({
-			data: [{ step }],
-			skipDuplicates: true,
-		});
+		const inserted = await db
+			.insert(telemetryMilestone)
+			.values({ step })
+			.onConflictDoNothing()
+			.returning({ step: telemetryMilestone.step });
 
-		return count === 1;
+		return inserted.length === 1;
 	} catch {
 		return false;
 	}
@@ -100,15 +111,17 @@ export async function reachMilestone(step: Milestone): Promise<boolean> {
 
 export async function forgetMilestone(step: Milestone): Promise<void> {
 	try {
-		await db.telemetryMilestone.delete({ where: { step } });
+		await db
+			.delete(telemetryMilestone)
+			.where(eq(telemetryMilestone.step, step));
 	} catch {}
 }
 
 export async function reachedMilestones(): Promise<Milestone[]> {
 	try {
-		const rows = await db.telemetryMilestone.findMany({
-			select: { step: true },
-		});
+		const rows = await db
+			.select({ step: telemetryMilestone.step })
+			.from(telemetryMilestone);
 
 		const reached = new Set(rows.map((row) => row.step));
 		return MILESTONES.filter((step) => reached.has(step));
@@ -123,28 +136,32 @@ export const COUNTERS = {
 
 export async function bumpCounter(name: string, by = 1): Promise<void> {
 	try {
-		await db.telemetryCounter.upsert({
-			where: { name },
-			create: { name, count: by },
-			update: { count: { increment: by } },
-		});
+		await db
+			.insert(telemetryCounter)
+			.values({ name, count: by })
+			.onConflictDoUpdate({
+				target: telemetryCounter.name,
+				set: { count: sql`${telemetryCounter.count} + ${by}` },
+			});
 	} catch {
 		try {
-			await db.telemetryCounter.update({
-				where: { name },
-				data: { count: { increment: by } },
-			});
+			await db
+				.update(telemetryCounter)
+				.set({ count: sql`${telemetryCounter.count} + ${by}` })
+				.where(eq(telemetryCounter.name, name));
 		} catch {}
 	}
 }
 
 export async function drainCounters(): Promise<Record<string, number>> {
 	try {
-		const rows = await db.$queryRaw<{ name: string; count: number }[]>`
-			DELETE FROM "telemetryCounter"
-			WHERE "count" > 0
-			RETURNING "name", "count";
-		`;
+		const rows = await db
+			.delete(telemetryCounter)
+			.where(gt(telemetryCounter.count, 0))
+			.returning({
+				name: telemetryCounter.name,
+				count: telemetryCounter.count,
+			});
 
 		return Object.fromEntries(rows.map((row) => [row.name, row.count]));
 	} catch {
@@ -171,13 +188,12 @@ export async function claimRollup(
 	force = false,
 ): Promise<RollupClaim> {
 	try {
-		return await db.$transaction(async (tx): Promise<RollupClaim> => {
-			const locked = await tx.$queryRaw<{ lastRollupAt: Date | null }[]>`
-				SELECT "lastRollupAt"
-				FROM "install"
-				WHERE "id" = ${INSTALL_ID}
-				FOR UPDATE;
-			`;
+		return await db.transaction(async (tx): Promise<RollupClaim> => {
+			const locked = await tx
+				.select({ lastRollupAt: install.lastRollupAt })
+				.from(install)
+				.where(eq(install.id, INSTALL_ID))
+				.for("update");
 
 			if (locked.length === 0) {
 				return { claimed: false, reason: "no install row" };
@@ -188,11 +204,12 @@ export async function claimRollup(
 				return { claimed: false, reason: "already sent today" };
 			}
 
-			cached = await tx.install.update({
-				where: { id: INSTALL_ID },
-				data: { lastRollupAt: at },
-				select: SELECT,
-			});
+			const [row] = await tx
+				.update(install)
+				.set({ lastRollupAt: at })
+				.where(eq(install.id, INSTALL_ID))
+				.returning(FIELDS);
+			cached = row ?? null;
 
 			return { claimed: true, previous };
 		});
@@ -203,11 +220,12 @@ export async function claimRollup(
 
 export async function releaseRollup(previous: Date | null): Promise<void> {
 	try {
-		cached = await db.install.update({
-			where: { id: INSTALL_ID },
-			data: { lastRollupAt: previous },
-			select: SELECT,
-		});
+		const [row] = await db
+			.update(install)
+			.set({ lastRollupAt: previous })
+			.where(eq(install.id, INSTALL_ID))
+			.returning(FIELDS);
+		cached = row ?? null;
 	} catch {}
 }
 

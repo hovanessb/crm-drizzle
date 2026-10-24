@@ -1,5 +1,15 @@
 import { workspaceDomains } from "@crm/auth/workspace";
-import { type Db, RecordSource } from "@crm/db";
+import {
+	company,
+	contact as contactTable,
+	type Db,
+	eq,
+	inArray,
+	RecordSource,
+	suppressedContact,
+	suppressedDomain,
+	user,
+} from "@crm/db";
 import { lockIdempotencyKey } from "@crm/db/idempotency";
 import { Injectable, Logger } from "@nestjs/common";
 import { AgentTriggerService } from "../agent/agent-trigger.service";
@@ -54,7 +64,7 @@ export class MailboxMatchService {
 		addresses: Set<string>;
 		domains: Set<string>;
 	}> {
-		const users = await this.db.user.findMany({ select: { email: true } });
+		const users = await this.db.select({ email: user.email }).from(user);
 
 		const addresses = new Set<string>();
 		const domains = new Set<string>(workspaceDomains());
@@ -71,16 +81,16 @@ export class MailboxMatchService {
 	}
 
 	async suppressedDomains(): Promise<Set<string>> {
-		const rows = await this.db.suppressedDomain.findMany({
-			select: { domain: true },
-		});
+		const rows = await this.db
+			.select({ domain: suppressedDomain.domain })
+			.from(suppressedDomain);
 		return new Set(rows.map((row) => row.domain));
 	}
 
 	async suppressedEmails(): Promise<Set<string>> {
-		const rows = await this.db.suppressedContact.findMany({
-			select: { email: true },
-		});
+		const rows = await this.db
+			.select({ email: suppressedContact.email })
+			.from(suppressedContact);
 		return new Set(rows.map((row) => row.email.toLowerCase()));
 	}
 
@@ -99,10 +109,16 @@ export class MailboxMatchService {
 			return { companyId: null, contactId: null, external };
 		}
 
-		const contact = await this.db.contact.findFirst({
-			where: { email: { in: external.map((person) => person.email) } },
-			select: { id: true, companyId: true },
-		});
+		const [contact] = await this.db
+			.select({ id: contactTable.id, companyId: contactTable.companyId })
+			.from(contactTable)
+			.where(
+				inArray(
+					contactTable.email,
+					external.map((person) => person.email),
+				),
+			)
+			.limit(1);
 
 		if (contact) {
 			return {
@@ -120,10 +136,13 @@ export class MailboxMatchService {
 			),
 		];
 
-		const known = await this.db.company.findMany({
-			where: { domain: { in: domains } },
-			select: { id: true, domain: true },
-		});
+		const known =
+			domains.length > 0
+				? await this.db
+						.select({ id: company.id, domain: company.domain })
+						.from(company)
+						.where(inArray(company.domain, domains))
+				: [];
 
 		const knownDomains = new Set(
 			known
@@ -170,10 +189,10 @@ export class MailboxMatchService {
 			return { companyId: null, contactId: null, external };
 		}
 
-		await this.db.company.update({
-			where: { id: companyId },
-			data: { source: request.source },
-		});
+		await this.db
+			.update(company)
+			.set({ source: request.source })
+			.where(eq(company.id, companyId));
 
 		const contactId = await this.createContact(
 			external,
@@ -216,37 +235,33 @@ export class MailboxMatchService {
 
 		const outcome = await this.agent.withCrmEvents(async (tx, emit) => {
 			await lockIdempotencyKey(tx, `mailbox-contact:${person.email}`);
-			const existing = await tx.contact.findUnique({
-				where: { email: person.email },
-				select: {
-					id: true,
-					firstName: true,
-					lastName: true,
-					email: true,
-					companyId: true,
-					createdAt: true,
-				},
-			});
+			const fields = {
+				id: contactTable.id,
+				firstName: contactTable.firstName,
+				lastName: contactTable.lastName,
+				email: contactTable.email,
+				companyId: contactTable.companyId,
+				createdAt: contactTable.createdAt,
+			};
+			const [existing] = await tx
+				.select(fields)
+				.from(contactTable)
+				.where(eq(contactTable.email, person.email))
+				.limit(1);
 			if (existing) return { contact: existing, created: false as const };
 
-			const contact = await tx.contact.create({
-				data: {
+			const [contact] = await tx
+				.insert(contactTable)
+				.values({
 					firstName,
 					lastName,
 					email: person.email,
 					companyId,
 					source: request.source,
 					ownerId: request.ownerId,
-				},
-				select: {
-					id: true,
-					firstName: true,
-					lastName: true,
-					email: true,
-					companyId: true,
-					createdAt: true,
-				},
-			});
+				})
+				.returning(fields);
+			if (!contact) throw new Error("The contact insert returned no row.");
 			await emit({
 				type: "contact.created",
 				record: { kind: "contact", id: contact.id },
@@ -281,10 +296,10 @@ export class MailboxMatchService {
 		);
 
 		if (hasRealName && isPlaceholder) {
-			await this.db.contact.update({
-				where: { id: contact.id },
-				data: { firstName, lastName },
-			});
+			await this.db
+				.update(contactTable)
+				.set({ firstName, lastName })
+				.where(eq(contactTable.id, contact.id));
 			return contact.id;
 		}
 

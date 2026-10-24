@@ -1,7 +1,9 @@
 import {
 	type Db,
+	emailMessage,
 	GoogleSyncStatus,
-	type MailboxSyncModel as MailboxSync,
+	inArray,
+	type MailboxSync,
 } from "@crm/db";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
@@ -194,10 +196,10 @@ export class GmailSyncService {
 	): Promise<{ written: number; remaining: number }> {
 		if (ids.length === 0) return { written: 0, remaining: 0 };
 
-		const alreadyHave = await this.db.emailMessage.findMany({
-			where: { gmailMessageId: { in: [...ids] } },
-			select: { gmailMessageId: true },
-		});
+		const alreadyHave = await this.db
+			.select({ gmailMessageId: emailMessage.gmailMessageId })
+			.from(emailMessage)
+			.where(inArray(emailMessage.gmailMessageId, [...ids]));
 		const seen = new Set(
 			alreadyHave.map((existing) => existing.gmailMessageId),
 		);

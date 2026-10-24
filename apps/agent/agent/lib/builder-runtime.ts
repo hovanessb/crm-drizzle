@@ -1,5 +1,37 @@
 import { isDeepStrictEqual } from "node:util";
-import { db, type Prisma } from "@crm/db";
+import {
+	account as accountTable,
+	agentAuditEvent,
+	agentBuilderArtifact,
+	agentConversation,
+	agentConversationSubmission,
+	agentDefinition,
+	agentTrigger,
+	agentVersion,
+	and,
+	asc,
+	company,
+	contact,
+	db,
+	deal,
+	desc,
+	type Executor,
+	eq,
+	firstRow,
+	isNotNull,
+	type JsonValue,
+	mcpConnection,
+	mcpToolSnapshot,
+	member,
+	orNull,
+	queryRows,
+	requireRow,
+	slackChannel,
+	slackMemberMatch,
+	sql,
+	user,
+	whereEq,
+} from "@crm/db";
 import {
 	CRM_EVENT_CATALOG,
 	CRM_EVENT_TYPES,
@@ -104,77 +136,100 @@ export async function writeBuilderArtifact(
 ) {
 	assertSafeArtifact(content);
 
-	return db.$transaction(async (tx) => {
-		const [conversation] = await tx.$queryRaw<Array<{ id: string }>>`
+	return db.transaction(async (tx) => {
+		const [conversation] = await queryRows<{ id: string }>(
+			tx,
+			sql`
 			SELECT id
 			FROM "agentConversation"
 			WHERE id = ${conversationId}
 				AND "userId" = ${userId}
 				AND kind = 'BUILDER'
 			FOR UPDATE
-		`;
+		`,
+		);
 		if (!conversation) {
 			throw new Error("This builder conversation is unavailable.");
 		}
 
-		const latest = await tx.agentBuilderArtifact.findFirst({
-			where: { conversationId, path },
-			orderBy: { revision: "desc" },
-			select: { id: true, revision: true, content: true, status: true },
-		});
+		const latest = await firstRow(
+			tx
+				.select({
+					id: agentBuilderArtifact.id,
+					revision: agentBuilderArtifact.revision,
+					content: agentBuilderArtifact.content,
+					status: agentBuilderArtifact.status,
+				})
+				.from(agentBuilderArtifact)
+				.where(
+					and(
+						whereEq(agentBuilderArtifact.conversationId, conversationId),
+						whereEq(agentBuilderArtifact.path, path),
+					),
+				)
+				.orderBy(desc(agentBuilderArtifact.revision))
+				.limit(1),
+		);
 
 		if (latest?.content === content) {
 			return { saved: true as const, id: latest.id, revision: latest.revision };
 		}
 
-		const artifact = await tx.agentBuilderArtifact.create({
-			data: {
-				conversationId,
-				path,
-				language: ARTIFACT_LANGUAGES[path],
-				content,
-				previousContent: latest?.content ?? null,
-				revision: (latest?.revision ?? 0) + 1,
-				status: "WRITING",
-			},
-			select: { id: true, revision: true },
-		});
+		const artifact = await requireRow(
+			tx
+				.insert(agentBuilderArtifact)
+				.values({
+					conversationId,
+					path,
+					language: ARTIFACT_LANGUAGES[path],
+					content,
+					previousContent: latest?.content ?? null,
+					revision: (latest?.revision ?? 0) + 1,
+					status: "WRITING",
+				})
+				.returning({
+					id: agentBuilderArtifact.id,
+					revision: agentBuilderArtifact.revision,
+				}),
+		);
 
 		return { saved: true as const, ...artifact };
 	});
 }
 
 export async function builderContext(conversationId: string, userId: string) {
-	const conversation = await db.agentConversation.findFirst({
-		where: { id: conversationId, userId, kind: "BUILDER" },
-		select: {
-			id: true,
-			title: true,
-			agent: {
-				select: {
-					id: true,
-					name: true,
-					description: true,
-					status: true,
-					versions: {
-						orderBy: { number: "desc" },
-						take: 1,
-						select: {
-							id: true,
-							number: true,
-							status: true,
-							manifest: true,
-							instructions: true,
+	const conversation = await db.query.agentConversation
+		.findFirst({
+			where: and(
+				whereEq(agentConversation.id, conversationId),
+				whereEq(agentConversation.userId, userId),
+				eq(agentConversation.kind, "BUILDER"),
+			),
+			columns: { id: true, title: true },
+			with: {
+				agent: {
+					columns: { id: true, name: true, description: true, status: true },
+					with: {
+						versions: {
+							orderBy: [desc(agentVersion.number)],
+							limit: 1,
+							columns: {
+								id: true,
+								number: true,
+								status: true,
+								manifest: true,
+								instructions: true,
+							},
 						},
 					},
 				},
+				submissions: {
+					orderBy: [asc(agentConversationSubmission.createdAt)],
+					columns: { id: true, message: true, createdAt: true },
+				},
 			},
-			submissions: {
-				orderBy: { createdAt: "asc" },
-				select: { id: true, message: true, createdAt: true },
-			},
-		},
-	});
+		})
+		.then(orNull);
 
 	if (!conversation)
 		throw new Error("This builder conversation is unavailable.");
@@ -206,13 +261,17 @@ export async function saveBuilderDraft(
 	userId: string,
 	input: DraftAgentInput,
 ) {
-	const conversation = await db.agentConversation.findFirst({
-		where: { id: conversationId, userId, kind: "BUILDER" },
-		select: {
-			id: true,
-			submissions: { select: { message: true } },
-		},
-	});
+	const conversation = await db.query.agentConversation
+		.findFirst({
+			where: and(
+				whereEq(agentConversation.id, conversationId),
+				whereEq(agentConversation.userId, userId),
+				eq(agentConversation.kind, "BUILDER"),
+			),
+			columns: { id: true },
+			with: { submissions: { columns: { message: true } } },
+		})
+		.then(orNull);
 
 	if (!conversation)
 		throw new Error("This builder conversation is unavailable.");
@@ -270,17 +329,21 @@ export async function saveBuilderDraft(
 	const files = artifactFiles(input, JSON.stringify(manifest, null, 2));
 	for (const file of files) assertSafeArtifact(file.content);
 
-	return db.$transaction(async (tx) => {
-		const [lockedConversation] = await tx.$queryRaw<
-			Array<{ id: string; agentId: string | null }>
-		>`
+	return db.transaction(async (tx) => {
+		const [lockedConversation] = await queryRows<{
+			id: string;
+			agentId: string | null;
+		}>(
+			tx,
+			sql`
 			SELECT id, "agentId"
 			FROM "agentConversation"
 			WHERE id = ${conversationId}
 				AND "userId" = ${userId}
 				AND kind = 'BUILDER'
 			FOR UPDATE
-		`;
+		`,
+		);
 		if (!lockedConversation) {
 			throw new Error("This builder conversation is unavailable.");
 		}
@@ -289,56 +352,68 @@ export async function saveBuilderDraft(
 		let created = false;
 
 		if (!agentId) {
-			const agent = await tx.agentDefinition.create({
-				data: {
-					name: input.name,
-					description: input.description,
-					createdById: userId,
-				},
-				select: { id: true },
-			});
+			const agent = await requireRow(
+				tx
+					.insert(agentDefinition)
+					.values({
+						name: input.name,
+						description: input.description,
+						createdById: userId,
+					})
+					.returning({ id: agentDefinition.id }),
+			);
 			agentId = agent.id;
 			created = true;
 
-			await tx.agentConversation.update({
-				where: { id: conversationId },
-				data: { agentId, title: input.name },
-			});
+			await requireRow(
+				tx
+					.update(agentConversation)
+					.set({ agentId, title: input.name })
+					.where(whereEq(agentConversation.id, conversationId))
+					.returning(),
+			);
 		} else {
-			const [agent] = await tx.$queryRaw<
-				Array<{
-					status: "DRAFT" | "LIVE" | "PAUSED" | "ARCHIVED" | "DELETED";
-				}>
-			>`
+			const [agent] = await queryRows<{
+				status: "DRAFT" | "LIVE" | "PAUSED" | "ARCHIVED" | "DELETED";
+			}>(
+				tx,
+				sql`
 				SELECT status
 				FROM "agentDefinition"
 				WHERE id = ${agentId}
 				FOR UPDATE
-			`;
+			`,
+			);
 			if (!agent || agent.status === "DELETED") {
 				throw new Error("This agent is unavailable.");
 			}
 			if (agent.status === "DRAFT") {
-				await tx.agentDefinition.update({
-					where: { id: agentId },
-					data: { name: input.name, description: input.description },
-				});
+				await requireRow(
+					tx
+						.update(agentDefinition)
+						.set({ name: input.name, description: input.description })
+						.where(whereEq(agentDefinition.id, agentId))
+						.returning(),
+				);
 			}
 		}
 
-		const latest = await tx.agentVersion.findFirst({
-			where: { agentId },
-			orderBy: { number: "desc" },
-			select: {
-				id: true,
-				number: true,
-				status: true,
-				instructions: true,
-				manifest: true,
-				modelId: true,
-				modelContextWindowTokens: true,
-			},
-		});
+		const latest = await firstRow(
+			tx
+				.select({
+					id: agentVersion.id,
+					number: agentVersion.number,
+					status: agentVersion.status,
+					instructions: agentVersion.instructions,
+					manifest: agentVersion.manifest,
+					modelId: agentVersion.modelId,
+					modelContextWindowTokens: agentVersion.modelContextWindowTokens,
+				})
+				.from(agentVersion)
+				.where(whereEq(agentVersion.agentId, agentId))
+				.orderBy(desc(agentVersion.number))
+				.limit(1),
+		);
 		if (
 			latest?.status === "READY" &&
 			latest.instructions === input.instructions &&
@@ -357,68 +432,80 @@ export async function saveBuilderDraft(
 		}
 
 		const number = (latest?.number ?? 0) + 1;
-		const version = await tx.agentVersion.create({
-			data: {
-				agentId,
-				number,
-				status: "READY",
-				instructions: input.instructions,
-				manifest: manifest as Prisma.InputJsonValue,
-				modelId: model.id,
-				modelContextWindowTokens: model.contextWindowTokens,
-				sandboxPolicy,
-				validation: {
-					status: "passed",
-					checkedAt: now.toISOString(),
-					capabilities: validation.capabilities,
-				},
-				sourceConversationId: conversationId,
-				createdById: userId,
-			},
-			select: { id: true, number: true, status: true },
-		});
+		const version = await requireRow(
+			tx
+				.insert(agentVersion)
+				.values({
+					agentId,
+					number,
+					status: "READY",
+					instructions: input.instructions,
+					manifest: manifest as JsonValue,
+					modelId: model.id,
+					modelContextWindowTokens: model.contextWindowTokens,
+					sandboxPolicy,
+					validation: {
+						status: "passed",
+						checkedAt: now.toISOString(),
+						capabilities: validation.capabilities,
+					},
+					sourceConversationId: conversationId,
+					createdById: userId,
+				})
+				.returning({
+					id: agentVersion.id,
+					number: agentVersion.number,
+					status: agentVersion.status,
+				}),
+		);
 
 		await persistArtifactSnapshots(tx, conversationId, version.id, files);
 
-		await tx.agentTrigger.createMany({
-			data: input.triggers.map((trigger, index) => ({
+		await tx.insert(agentTrigger).values(
+			input.triggers.map((trigger, index) => ({
 				agentId,
 				versionId: version.id,
 				type: trigger.type,
 				name: trigger.name,
-				config: manifestTriggers[index]?.config as Prisma.InputJsonValue,
+				config: manifestTriggers[index]?.config as JsonValue,
 				createdById: userId,
 				nextRunAt: scheduleDate(trigger, now),
 			})),
-		});
+		);
 
 		if (created) {
-			await tx.agentAuditEvent.create({
-				data: {
+			await requireRow(
+				tx
+					.insert(agentAuditEvent)
+					.values({
+						agentId,
+						actorUserId: userId,
+						actorType: "USER",
+						actorId: userId,
+						type: "agent.created",
+						summary: "Created a draft agent from a private builder chat",
+						requestId: `builder:${conversationId}`,
+					})
+					.returning(),
+			);
+		}
+
+		await requireRow(
+			tx
+				.insert(agentAuditEvent)
+				.values({
 					agentId,
+					versionId: version.id,
 					actorUserId: userId,
 					actorType: "USER",
 					actorId: userId,
-					type: "agent.created",
-					summary: "Created a draft agent from a private builder chat",
-					requestId: `builder:${conversationId}`,
-				},
-			});
-		}
-
-		await tx.agentAuditEvent.create({
-			data: {
-				agentId,
-				versionId: version.id,
-				actorUserId: userId,
-				actorType: "USER",
-				actorId: userId,
-				type: "version.created",
-				summary: `Prepared version ${number} for review`,
-				requestId: version.id,
-				after: { status: "READY", validation: "passed" },
-			},
-		});
+					type: "version.created",
+					summary: `Prepared version ${number} for review`,
+					requestId: version.id,
+					after: { status: "READY", validation: "passed" },
+				})
+				.returning(),
+		);
 
 		return {
 			saved: true as const,
@@ -431,23 +518,31 @@ export async function saveBuilderDraft(
 }
 
 async function persistArtifactSnapshots(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	conversationId: string,
 	versionId: string,
 	files: ReturnType<typeof artifactFiles>,
 ) {
 	for (const file of files) {
-		const latestArtifact = await tx.agentBuilderArtifact.findFirst({
-			where: { conversationId, path: file.path },
-			orderBy: { revision: "desc" },
-			select: {
-				id: true,
-				versionId: true,
-				revision: true,
-				content: true,
-				status: true,
-			},
-		});
+		const latestArtifact = await firstRow(
+			tx
+				.select({
+					id: agentBuilderArtifact.id,
+					versionId: agentBuilderArtifact.versionId,
+					revision: agentBuilderArtifact.revision,
+					content: agentBuilderArtifact.content,
+					status: agentBuilderArtifact.status,
+				})
+				.from(agentBuilderArtifact)
+				.where(
+					and(
+						whereEq(agentBuilderArtifact.conversationId, conversationId),
+						whereEq(agentBuilderArtifact.path, file.path),
+					),
+				)
+				.orderBy(desc(agentBuilderArtifact.revision))
+				.limit(1),
+		);
 		if (
 			latestArtifact?.content === file.content &&
 			latestArtifact.versionId === versionId &&
@@ -460,25 +555,31 @@ async function persistArtifactSnapshots(
 			latestArtifact.status === "WRITING" &&
 			latestArtifact.versionId === null
 		) {
-			await tx.agentBuilderArtifact.update({
-				where: { id: latestArtifact.id },
-				data: { versionId, status: "READY" },
-			});
+			await requireRow(
+				tx
+					.update(agentBuilderArtifact)
+					.set({ versionId, status: "READY" })
+					.where(whereEq(agentBuilderArtifact.id, latestArtifact.id))
+					.returning(),
+			);
 			continue;
 		}
 
-		await tx.agentBuilderArtifact.create({
-			data: {
-				conversationId,
-				versionId,
-				path: file.path,
-				language: file.language,
-				content: file.content,
-				previousContent: latestArtifact?.content ?? null,
-				revision: (latestArtifact?.revision ?? 0) + 1,
-				status: "READY",
-			},
-		});
+		await requireRow(
+			tx
+				.insert(agentBuilderArtifact)
+				.values({
+					conversationId,
+					versionId,
+					path: file.path,
+					language: file.language,
+					content: file.content,
+					previousContent: latestArtifact?.content ?? null,
+					revision: (latestArtifact?.revision ?? 0) + 1,
+					status: "READY",
+				})
+				.returning(),
+		);
 	}
 }
 
@@ -670,42 +771,70 @@ function integrationResourceStatus(
 async function connectionStatus(userId: string) {
 	const [googleAccounts, slackAccount, workspaceMembers, mcpConnections] =
 		await Promise.all([
-			db.account.findMany({
-				where: { userId, providerId: "google" },
-				select: { providerId: true, scope: true },
-			}),
-			db.account.findFirst({
-				where: { providerId: "slack", accessToken: { not: null } },
-				orderBy: { updatedAt: "desc" },
-				select: { id: true },
-			}),
-			db.member.findMany({
-				where: { organizationId: WORKSPACE_ID },
-				orderBy: { user: { name: "asc" } },
-				select: {
-					user: {
-						select: {
-							name: true,
-							email: true,
-							slackMemberMatch: {
-								select: {
-									slackUserId: true,
-									slackHandle: true,
-									slackEmail: true,
-								},
-							},
-						},
+			db
+				.select({
+					providerId: accountTable.providerId,
+					scope: accountTable.scope,
+				})
+				.from(accountTable)
+				.where(
+					and(
+						whereEq(accountTable.userId, userId),
+						eq(accountTable.providerId, "google"),
+					),
+				),
+			firstRow(
+				db
+					.select({ id: accountTable.id })
+					.from(accountTable)
+					.where(
+						and(
+							eq(accountTable.providerId, "slack"),
+							isNotNull(accountTable.accessToken),
+						),
+					)
+					.orderBy(desc(accountTable.updatedAt))
+					.limit(1),
+			),
+			db
+				.select({
+					user: { name: user.name, email: user.email },
+					match: {
+						id: slackMemberMatch.id,
+						slackUserId: slackMemberMatch.slackUserId,
+						slackHandle: slackMemberMatch.slackHandle,
+						slackEmail: slackMemberMatch.slackEmail,
 					},
-				},
-			}),
-			db.mcpConnection.findMany({
-				where: { organizationId: WORKSPACE_ID, status: "CONNECTED" },
-				select: {
-					platformSlug: true,
-					accessMode: true,
+				})
+				.from(member)
+				.innerJoin(user, eq(user.id, member.userId))
+				.leftJoin(slackMemberMatch, eq(slackMemberMatch.crmUserId, user.id))
+				.where(eq(member.organizationId, WORKSPACE_ID))
+				.orderBy(asc(user.name))
+				.then((rows) =>
+					rows.map((row) => ({
+						user: {
+							...row.user,
+							slackMemberMatch: row.match
+								? {
+										slackUserId: row.match.slackUserId,
+										slackHandle: row.match.slackHandle,
+										slackEmail: row.match.slackEmail,
+									}
+								: null,
+						},
+					})),
+				),
+			db.query.mcpConnection.findMany({
+				where: and(
+					eq(mcpConnection.organizationId, WORKSPACE_ID),
+					eq(mcpConnection.status, "CONNECTED"),
+				),
+				columns: { platformSlug: true, accessMode: true },
+				with: {
 					toolSnapshots: {
-						orderBy: { createdAt: "desc" },
-						select: {
+						orderBy: [desc(mcpToolSnapshot.createdAt)],
+						columns: {
 							name: true,
 							description: true,
 							fingerprint: true,
@@ -718,12 +847,16 @@ async function connectionStatus(userId: string) {
 		]);
 	if (slackAccount) void requestStaleSlackInventorySync();
 
-	const slackChannels = await db.slackChannel.findMany({
-		where: { available: true },
-		orderBy: { name: "asc" },
-		take: 100,
-		select: { id: true, name: true, memberCount: true },
-	});
+	const slackChannels = await db
+		.select({
+			id: slackChannel.id,
+			name: slackChannel.name,
+			memberCount: slackChannel.memberCount,
+		})
+		.from(slackChannel)
+		.where(eq(slackChannel.available, true))
+		.orderBy(asc(slackChannel.name))
+		.limit(100);
 	const scopes = new Set(
 		googleAccounts.flatMap((account) => (account.scope ?? "").split(/[,\s]+/)),
 	);
@@ -889,38 +1022,50 @@ async function describeResources(resources: BuilderResource[]) {
 	return Promise.all(
 		resources.map(async (resource) => {
 			if (resource.kind === "company") {
-				const row = await db.company.findUnique({
-					where: { id: resource.id },
-					select: { id: true, name: true, domain: true, industry: true },
-				});
+				const row = await firstRow(
+					db
+						.select({
+							id: company.id,
+							name: company.name,
+							domain: company.domain,
+							industry: company.industry,
+						})
+						.from(company)
+						.where(whereEq(company.id, resource.id))
+						.limit(1),
+				);
 				return { ...resource, record: row };
 			}
 			if (resource.kind === "contact") {
-				const row = await db.contact.findUnique({
-					where: { id: resource.id },
-					select: {
-						id: true,
-						firstName: true,
-						lastName: true,
-						email: true,
-						title: true,
-						company: { select: { id: true, name: true } },
-					},
-				});
+				const row = await db.query.contact
+					.findFirst({
+						where: whereEq(contact.id, resource.id),
+						columns: {
+							id: true,
+							firstName: true,
+							lastName: true,
+							email: true,
+							title: true,
+						},
+						with: { company: { columns: { id: true, name: true } } },
+					})
+					.then(orNull);
 				return { ...resource, record: row };
 			}
 			if (resource.kind === "deal") {
-				const row = await db.deal.findUnique({
-					where: { id: resource.id },
-					select: {
-						id: true,
-						name: true,
-						stage: true,
-						amount: true,
-						currency: true,
-						company: { select: { id: true, name: true } },
-					},
-				});
+				const row = await db.query.deal
+					.findFirst({
+						where: whereEq(deal.id, resource.id),
+						columns: {
+							id: true,
+							name: true,
+							stage: true,
+							amount: true,
+							currency: true,
+						},
+						with: { company: { columns: { id: true, name: true } } },
+					})
+					.then(orNull);
 				return {
 					...resource,
 					record: row
@@ -943,7 +1088,7 @@ async function missingResourceIds(resources: BuilderResource[]) {
 	return described.filter((resource) => !resource.record);
 }
 
-function resourcesOf(value: Prisma.JsonValue): BuilderResource[] {
+function resourcesOf(value: JsonValue): BuilderResource[] {
 	return taggedResources
 		.parse(value)
 		.resources.filter((resource) => resource !== null);

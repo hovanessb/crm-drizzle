@@ -2,7 +2,7 @@ import {
 	chatEventPurpose,
 	createChatEventSecretBox,
 } from "@crm/auth/chat-event-crypto";
-import type { Prisma } from "@crm/db";
+import type { JsonValue } from "@crm/db";
 import {
 	publicEveEventData,
 	publicEveEventInput,
@@ -11,7 +11,7 @@ import {
 export type IndexedConversationEvent = {
 	id: string;
 	type: string;
-	data: Prisma.JsonValue;
+	data: JsonValue;
 	emittedAt: Date;
 	streamIndex: number | null;
 	deliveryIds: string[];
@@ -25,7 +25,7 @@ export function conversationResumeSnapshot(
 ) {
 	const events: Array<{
 		type: string;
-		data: Prisma.JsonValue;
+		data: JsonValue;
 		meta: { id: string; at: string; deliveryIds?: string[] };
 	}> = [];
 	const ids = new Set<string>();
@@ -64,7 +64,7 @@ export function publicConversationEvent(row: IndexedConversationEvent) {
 
 function storedConversationEvent(
 	row: IndexedConversationEvent,
-): { available: true; data: Prisma.JsonValue } | { available: false } {
+): { available: true; data: JsonValue } | { available: false } {
 	if (!row.encryptedData) return { available: true, data: row.data };
 	if (!row.conversationId) return { available: false };
 	const box = createChatEventSecretBox();

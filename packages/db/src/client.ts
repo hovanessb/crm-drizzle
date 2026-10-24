@@ -4,8 +4,10 @@ import type { ExtractTablesWithRelations } from "drizzle-orm";
 import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { PgTransaction } from "drizzle-orm/pg-core";
-import { Pool } from "pg";
+import pg, { Pool } from "pg";
 import * as schema from "./schema/schema";
+
+pg.defaults.parseInputDatesAsUTC = true;
 
 const connectionString =
 	process.env.NODE_ENV === "test" ? testDatabase() : liveDatabase();
@@ -95,8 +97,16 @@ const logQueries = process.env.DB_LOG_QUERIES === "true";
 
 type Schema = typeof schema;
 
+class ReopeningPool extends Pool {
+	override async end(): Promise<void> {
+		if (this.ending) return;
+		await super.end();
+		Object.assign(this, { ending: false, ended: false });
+	}
+}
+
 const createDb = () => {
-	const pool = new Pool({ connectionString });
+	const pool = new ReopeningPool({ connectionString });
 
 	pool.on("error", (error) => {
 		sink({ level: "error", message: error.message, target: "pg.pool" });

@@ -1,4 +1,22 @@
-import { db } from "@crm/db";
+import {
+	agentDefinition,
+	agentRun,
+	agentTask,
+	agentTrigger,
+	agentVersion,
+	and,
+	company as companyTable,
+	db,
+	deal as dealTable,
+	endsWith,
+	eq,
+	inArray,
+	isNull,
+	requireRow,
+	startsWith,
+	user,
+	whereEq,
+} from "@crm/db";
 import { PRIORITY } from "@crm/db/agent-tasks";
 import { runVisibleLane, VISIBLE_BATCH } from "../../agent/lib/dispatch";
 import {
@@ -13,58 +31,70 @@ const COUNT = Number(process.env.E2E_LOAD_COUNT ?? E2E.load.defaultCount);
 const DRAIN_PASSES = Math.ceil(COUNT / VISIBLE_BATCH) + E2E.load.drainPassSlack;
 
 async function seedAgent() {
-	const owner = await db.user.findFirstOrThrow({ select: { id: true } });
-	const agent = await db.agentDefinition.create({
-		data: {
-			name: `${E2E.load.agentPrefix} ${Date.now()}`,
-			description: "Seeded for load testing. Safe to delete.",
-			status: "LIVE",
-			createdById: owner.id,
-		},
-		select: { id: true },
-	});
-	const version = await db.agentVersion.create({
-		data: {
-			agentId: agent.id,
-			number: 1,
-			status: "DEPLOYED",
-			instructions: "Load test agent. Does nothing.",
-			modelId: "test/model",
-			sandboxPolicy: {},
-			createdById: owner.id,
-			manifest: {
-				description: "load test",
-				triggers: [
-					{
-						type: "EVENT",
-						name: "Deal created",
-						summary: "Fires on deal creation",
-						config: { event: "deal.created" },
-					},
-				],
-				dataScope: { mode: "WORKSPACE", summary: "Workspace", resources: [] },
-				actions: [
-					{ type: "run.summary", provider: "crm", summary: "Log the result" },
-				],
-			},
-		},
-		select: { id: true },
-	});
-	await db.agentDefinition.update({
-		where: { id: agent.id },
-		data: { currentVersionId: version.id },
-	});
-	await db.agentTrigger.create({
-		data: {
-			agentId: agent.id,
-			versionId: version.id,
-			type: "EVENT",
-			name: "Deal created",
-			config: { event: "deal.created" },
-			enabled: true,
-			createdById: owner.id,
-		},
-	});
+	const owner = await requireRow(
+		db.select({ id: user.id }).from(user).limit(1),
+	);
+	const agent = await requireRow(
+		db
+			.insert(agentDefinition)
+			.values({
+				name: `${E2E.load.agentPrefix} ${Date.now()}`,
+				description: "Seeded for load testing. Safe to delete.",
+				status: "LIVE",
+				createdById: owner.id,
+			})
+			.returning({ id: agentDefinition.id }),
+	);
+	const version = await requireRow(
+		db
+			.insert(agentVersion)
+			.values({
+				agentId: agent.id,
+				number: 1,
+				status: "DEPLOYED",
+				instructions: "Load test agent. Does nothing.",
+				modelId: "test/model",
+				sandboxPolicy: {},
+				createdById: owner.id,
+				manifest: {
+					description: "load test",
+					triggers: [
+						{
+							type: "EVENT",
+							name: "Deal created",
+							summary: "Fires on deal creation",
+							config: { event: "deal.created" },
+						},
+					],
+					dataScope: { mode: "WORKSPACE", summary: "Workspace", resources: [] },
+					actions: [
+						{ type: "run.summary", provider: "crm", summary: "Log the result" },
+					],
+				},
+			})
+			.returning({ id: agentVersion.id }),
+	);
+	await requireRow(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: version.id })
+			.where(whereEq(agentDefinition.id, agent.id))
+			.returning(),
+	);
+	await requireRow(
+		db
+			.insert(agentTrigger)
+			.values({
+				agentId: agent.id,
+				versionId: version.id,
+				type: "EVENT",
+				name: "Deal created",
+				config: { event: "deal.created" },
+				enabled: true,
+				createdById: owner.id,
+			})
+			.returning(),
+	);
 	return { agentId: agent.id, versionId: version.id };
 }
 
@@ -73,27 +103,37 @@ async function sweepLeftovers() {
 		console.log(`  removed leftover ${name}`);
 	}
 
-	const stale = await db.company.findMany({
-		where: {
-			domain: {
-				startsWith: E2E.load.domainPrefix,
-				endsWith: E2E.load.domainSuffix,
-			},
-			name: { startsWith: E2E.load.companyPrefix },
-		},
-		select: { id: true, name: true },
-	});
+	const stale = await db
+		.select({ id: companyTable.id, name: companyTable.name })
+		.from(companyTable)
+		.where(
+			and(
+				and(
+					startsWith(companyTable.domain, E2E.load.domainPrefix),
+					endsWith(companyTable.domain, E2E.load.domainSuffix),
+				),
+				startsWith(companyTable.name, E2E.load.companyPrefix),
+			),
+		);
 
 	for (const company of stale) {
-		const deals = await db.deal.findMany({
-			where: { companyId: company.id },
-			select: { id: true },
-		});
-		await db.agentTask.deleteMany({
-			where: { dealId: { in: deals.map((deal) => deal.id) } },
-		});
-		await db.deal.deleteMany({ where: { companyId: company.id } });
-		await db.company.delete({ where: { id: company.id } });
+		const deals = await db
+			.select({ id: dealTable.id })
+			.from(dealTable)
+			.where(whereEq(dealTable.companyId, company.id));
+		await db.delete(agentTask).where(
+			inArray(
+				agentTask.dealId,
+				deals.map((deal) => deal.id),
+			),
+		);
+		await db.delete(dealTable).where(whereEq(dealTable.companyId, company.id));
+		await requireRow(
+			db
+				.delete(companyTable)
+				.where(whereEq(companyTable.id, company.id))
+				.returning(),
+		);
 		console.log(`  removed leftover ${company.name}`);
 	}
 }
@@ -107,11 +147,16 @@ async function cleanUp(
 	await removeEventRuns(taskIds);
 	if (agentId) await removeAgent(agentId);
 	if (dealIds.length > 0) {
-		await db.agentTask.deleteMany({ where: { dealId: { in: dealIds } } });
+		await db.delete(agentTask).where(inArray(agentTask.dealId, dealIds));
 	}
 	if (!companyId) return;
-	await db.deal.deleteMany({ where: { companyId } });
-	await db.company.delete({ where: { id: companyId } });
+	await db.delete(dealTable).where(whereEq(dealTable.companyId, companyId));
+	await requireRow(
+		db
+			.delete(companyTable)
+			.where(whereEq(companyTable.id, companyId))
+			.returning(),
+	);
 }
 
 async function main() {
@@ -126,35 +171,37 @@ async function main() {
 	try {
 		const seededAgent = await seedAgent();
 		agentId = seededAgent.agentId;
-		const owner = await db.user.findFirstOrThrow({ select: { id: true } });
-		const company = await db.company.create({
-			data: {
-				name: `Load Co ${Date.now()}`,
-				domain: `load-${Date.now()}.test`,
-			},
-			select: { id: true },
-		});
+		const owner = await requireRow(
+			db.select({ id: user.id }).from(user).limit(1),
+		);
+		const company = await requireRow(
+			db
+				.insert(companyTable)
+				.values({
+					name: `Load Co ${Date.now()}`,
+					domain: `load-${Date.now()}.test`,
+				})
+				.returning({ id: companyTable.id }),
+		);
 		companyId = company.id;
 
 		console.log(`Seeding ${COUNT} deal.created events…`);
 		const seedStart = Date.now();
-		const deals = await db.$transaction(
-			Array.from({ length: COUNT }, (_, index) =>
-				db.deal.create({
-					data: {
-						name: `Load Deal ${index}`,
-						companyId: company.id,
-						ownerId: owner.id,
-						stage: "DEMO_BOOKED",
-						stageChangedAt: new Date(),
-					},
-					select: { id: true },
-				}),
-			),
-		);
+		const deals = await db
+			.insert(dealTable)
+			.values(
+				Array.from({ length: COUNT }, (_, index) => ({
+					name: `Load Deal ${index}`,
+					companyId: company.id,
+					ownerId: owner.id,
+					stage: "DEMO_BOOKED" as const,
+					stageChangedAt: new Date(),
+				})),
+			)
+			.returning({ id: dealTable.id });
 		dealIds.push(...deals.map((deal) => deal.id));
-		await db.agentTask.createMany({
-			data: deals.map((deal) => ({
+		await db.insert(agentTask).values(
+			deals.map((deal) => ({
 				dealId: deal.id,
 				kind: "agent-event" as const,
 				reason: "deal.created",
@@ -168,11 +215,11 @@ async function main() {
 				budget: 1,
 				dueAt: new Date(),
 			})),
-		});
-		const seeded = await db.agentTask.findMany({
-			where: { dealId: { in: dealIds } },
-			select: { id: true },
-		});
+		);
+		const seeded = await db
+			.select({ id: agentTask.id })
+			.from(agentTask)
+			.where(inArray(agentTask.dealId, dealIds));
 		taskIds.push(...seeded.map((task) => task.id));
 		console.log(`  seeded in ${Date.now() - seedStart}ms`);
 
@@ -186,12 +233,14 @@ async function main() {
 		}
 		const drainMs = Date.now() - drainStart;
 
-		const queued = await db.agentRun.count({
-			where: { agentId: seededAgent.agentId },
-		});
-		const leftover = await db.agentTask.count({
-			where: { kind: "agent-event", finishedAt: null },
-		});
+		const queued = await db.$count(
+			agentRun,
+			whereEq(agentRun.agentId, seededAgent.agentId),
+		);
+		const leftover = await db.$count(
+			agentTask,
+			and(eq(agentTask.kind, "agent-event"), isNull(agentTask.finishedAt)),
+		);
 
 		console.log(`\n  tasks drained     ${handled}`);
 		console.log(`  runs queued       ${queued}`);

@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db } from "@crm/db";
+import {
+	agentTask,
+	and,
+	contact as contactTable,
+	db,
+	firstRow,
+	inArray,
+	isNull,
+	requireRow,
+	startsWith,
+	whereEq,
+} from "@crm/db";
 import { MAX_ATTEMPTS } from "@crm/db/agent-tasks";
 import {
 	claimDue,
@@ -13,8 +24,8 @@ const kind = "test-lease";
 const TEST_TASKS = { only: [kind] } as const;
 
 async function clear() {
-	await db.agentTask.deleteMany({ where: { kind } });
-	await db.contact.deleteMany({ where: { email: { startsWith: "lease-" } } });
+	await db.delete(agentTask).where(whereEq(agentTask.kind, kind));
+	await db.delete(contactTable).where(startsWith(contactTable.email, "lease-"));
 }
 
 beforeEach(clear);
@@ -23,34 +34,41 @@ afterEach(clear);
 async function queue(
 	overrides: { priority?: number; dueAt?: Date; contactId?: string } = {},
 ) {
-	return db.agentTask.create({
-		data: {
-			kind,
-			reason: "test",
-			dueAt: overrides.dueAt ?? new Date(Date.now() - 1000),
-			priority: overrides.priority ?? 0,
-			budget: 4,
-			contactId: overrides.contactId ?? null,
-		},
-		select: { id: true },
-	});
+	return requireRow(
+		db
+			.insert(agentTask)
+			.values({
+				kind,
+				reason: "test",
+				dueAt: overrides.dueAt ?? new Date(Date.now() - 1000),
+				priority: overrides.priority ?? 0,
+				budget: 4,
+				contactId: overrides.contactId ?? null,
+			})
+			.returning({ id: agentTask.id }),
+	);
 }
 
 async function expire(taskId: string) {
-	await db.agentTask.update({
-		where: { id: taskId },
-		data: { leasedUntil: new Date(Date.now() - 1000) },
-	});
+	await requireRow(
+		db
+			.update(agentTask)
+			.set({ leasedUntil: new Date(Date.now() - 1000) })
+			.where(whereEq(agentTask.id, taskId))
+			.returning(),
+	);
 }
 
 async function someone() {
-	return db.contact.create({
-		data: {
-			firstName: "Lease",
-			email: `lease-${crypto.randomUUID()}@example.test`,
-		},
-		select: { id: true },
-	});
+	return requireRow(
+		db
+			.insert(contactTable)
+			.values({
+				firstName: "Lease",
+				email: `lease-${crypto.randomUUID()}@example.test`,
+			})
+			.returning({ id: contactTable.id }),
+	);
 }
 
 describe("claimDue", () => {
@@ -60,7 +78,13 @@ describe("claimDue", () => {
 		const claimed = await claimDue(10, TEST_TASKS);
 		expect(claimed.map((t) => t.id)).toContain(task.id);
 
-		const row = await db.agentTask.findUnique({ where: { id: task.id } });
+		const row = await firstRow(
+			db
+				.select()
+				.from(agentTask)
+				.where(whereEq(agentTask.id, task.id))
+				.limit(1),
+		);
 		expect(row?.leasedUntil).not.toBeNull();
 		expect(row?.startedAt).not.toBeNull();
 	});
@@ -99,10 +123,13 @@ describe("claimDue", () => {
 
 		expect(await claimDue(10, TEST_TASKS)).toHaveLength(0);
 
-		await db.agentTask.update({
-			where: { id: task.id },
-			data: { leasedUntil: new Date(Date.now() - 1000) },
-		});
+		await requireRow(
+			db
+				.update(agentTask)
+				.set({ leasedUntil: new Date(Date.now() - 1000) })
+				.where(whereEq(agentTask.id, task.id))
+				.returning(),
+		);
 
 		expect((await claimDue(10, TEST_TASKS)).map((t) => t.id)).toContain(
 			task.id,
@@ -135,10 +162,13 @@ describe("claimDue", () => {
 		await claimDue(10, TEST_TASKS);
 		await completeTask(task.id, "ran");
 
-		await db.agentTask.update({
-			where: { id: task.id },
-			data: { leasedUntil: null },
-		});
+		await requireRow(
+			db
+				.update(agentTask)
+				.set({ leasedUntil: null })
+				.where(whereEq(agentTask.id, task.id))
+				.returning(),
+		);
 
 		expect(await claimDue(10, TEST_TASKS)).toHaveLength(0);
 	});
@@ -158,7 +188,13 @@ describe("retireExhausted", () => {
 		expect(retired.map((t) => t.id)).toContain(task.id);
 		expect(retired.find((t) => t.id === task.id)?.contactId).toBe(contact.id);
 
-		const row = await db.agentTask.findUnique({ where: { id: task.id } });
+		const row = await firstRow(
+			db
+				.select()
+				.from(agentTask)
+				.where(whereEq(agentTask.id, task.id))
+				.limit(1),
+		);
 		expect(row?.finishedAt).not.toBeNull();
 		expect(row?.outcome).toContain("Gave up");
 	});
@@ -194,9 +230,10 @@ describe("retireExhausted", () => {
 			expect((await retireExhausted(2)).length).toBeLessThanOrEqual(2);
 		}
 
-		const open = await db.agentTask.count({
-			where: { id: { in: mine }, finishedAt: null },
-		});
+		const open = await db.$count(
+			agentTask,
+			and(inArray(agentTask.id, mine), isNull(agentTask.finishedAt)),
+		);
 		expect(open).toBe(0);
 	});
 });
@@ -211,7 +248,13 @@ describe("completeTask", () => {
 		expect(subject?.contactId).toBe(contact.id);
 
 		expect(await completeTask(task.id, "ran again")).toBeNull();
-		const row = await db.agentTask.findUnique({ where: { id: task.id } });
+		const row = await firstRow(
+			db
+				.select()
+				.from(agentTask)
+				.where(whereEq(agentTask.id, task.id))
+				.limit(1),
+		);
 		expect(row?.outcome).toBe("ran");
 	});
 });
@@ -225,7 +268,9 @@ describe("scheduleTask", () => {
 			dueAt,
 		});
 
-		const row = await db.agentTask.findUnique({ where: { id } });
+		const row = await firstRow(
+			db.select().from(agentTask).where(whereEq(agentTask.id, id)).limit(1),
+		);
 		expect(row?.reason).toContain("Acme");
 	});
 
@@ -237,6 +282,6 @@ describe("scheduleTask", () => {
 		const second = await scheduleTask({ kind, reason: "second", dueAt: later });
 
 		expect(second.id).toBe(first.id);
-		expect(await db.agentTask.count({ where: { kind } })).toBe(1);
+		expect(await db.$count(agentTask, whereEq(agentTask.kind, kind))).toBe(1);
 	});
 });

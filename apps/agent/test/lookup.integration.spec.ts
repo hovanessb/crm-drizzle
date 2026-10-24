@@ -1,5 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { DealStage, db } from "@crm/db";
+import {
+	activity,
+	company as companyTable,
+	contact,
+	DealStage,
+	Decimal,
+	db,
+	deal as dealTable,
+	inArray,
+	requireRow,
+	user as userTable,
+	whereEq,
+} from "@crm/db";
 import { listDeals, searchCrm } from "../agent/lib/lookup";
 
 const suffix = process.env.TEST_RUN_ID ?? "lookup-spec";
@@ -17,116 +29,134 @@ let closedDealId: string;
 beforeAll(async () => {
 	await cleanup();
 
-	const user = await db.user.create({
-		data: {
-			id: `user-${suffix}`,
-			name: "Rep One",
-			email: `rep.${suffix}@example.test`,
-			emailVerified: true,
-			image: "https://cdn.example.test/rep-one.png",
-		},
-		select: { id: true },
-	});
+	const user = await requireRow(
+		db
+			.insert(userTable)
+			.values({
+				id: `user-${suffix}`,
+				name: "Rep One",
+				email: `rep.${suffix}@example.test`,
+				emailVerified: true,
+				image: "https://cdn.example.test/rep-one.png",
+			})
+			.returning({ id: userTable.id }),
+	);
 
-	const northwind = await db.company.create({
-		data: {
-			name: `Northwind ${suffix}`,
-			domain,
-			iconUrl: "https://cdn.example.test/northwind-icon.png",
-			iconDarkUrl: "https://cdn.example.test/northwind-icon-dark.png",
-			iconTone: "opaque",
-			logoUrl: "https://cdn.example.test/northwind-logo.svg",
-		},
-		select: { id: true },
-	});
+	const northwind = await requireRow(
+		db
+			.insert(companyTable)
+			.values({
+				name: `Northwind ${suffix}`,
+				domain,
+				iconUrl: "https://cdn.example.test/northwind-icon.png",
+				iconDarkUrl: "https://cdn.example.test/northwind-icon-dark.png",
+				iconTone: "opaque",
+				logoUrl: "https://cdn.example.test/northwind-logo.svg",
+			})
+			.returning({ id: companyTable.id }),
+	);
 	northwindId = northwind.id;
 
-	const brightwater = await db.company.create({
-		data: { name: `Brightwater ${suffix}`, domain: otherDomain },
-		select: { id: true },
-	});
+	const brightwater = await requireRow(
+		db
+			.insert(companyTable)
+			.values({ name: `Brightwater ${suffix}`, domain: otherDomain })
+			.returning({ id: companyTable.id }),
+	);
 	brightwaterId = brightwater.id;
 
-	const paula = await db.contact.create({
-		data: {
-			firstName: "Paula",
-			lastName: "Marchetti",
-			title: "Growth Specialist",
-			email: `paula.marchetti@${domain}`,
-			companyId: northwindId,
-			lastActivityAt: new Date(),
-		},
-		select: { id: true },
-	});
+	const paula = await requireRow(
+		db
+			.insert(contact)
+			.values({
+				firstName: "Paula",
+				lastName: "Marchetti",
+				title: "Growth Specialist",
+				email: `paula.marchetti@${domain}`,
+				companyId: northwindId,
+				lastActivityAt: new Date(),
+			})
+			.returning({ id: contact.id }),
+	);
 	paulaId = paula.id;
 
-	const peter = await db.contact.create({
-		data: {
-			firstName: "Peter",
-			lastName: "Marchetti",
-			title: "Controller",
-			email: `peter.marchetti@${otherDomain}`,
-			companyId: brightwaterId,
-		},
-		select: { id: true },
-	});
+	const peter = await requireRow(
+		db
+			.insert(contact)
+			.values({
+				firstName: "Peter",
+				lastName: "Marchetti",
+				title: "Controller",
+				email: `peter.marchetti@${otherDomain}`,
+				companyId: brightwaterId,
+			})
+			.returning({ id: contact.id }),
+	);
 	peterId = peter.id;
 
-	const deal = await db.deal.create({
-		data: {
-			name: `Northwind renewal ${suffix}`,
-			companyId: northwindId,
-			ownerId: user.id,
-			stage: DealStage.QUALIFIED_TO_BUY,
-			amount: 12_000,
-			lastActivityAt: new Date("2026-06-01T12:00:00.000Z"),
-		},
-		select: { id: true },
-	});
+	const deal = await requireRow(
+		db
+			.insert(dealTable)
+			.values({
+				name: `Northwind renewal ${suffix}`,
+				companyId: northwindId,
+				ownerId: user.id,
+				stage: DealStage.QUALIFIED_TO_BUY,
+				amount: new Decimal(12_000),
+				lastActivityAt: new Date("2026-06-01T12:00:00.000Z"),
+			})
+			.returning({ id: dealTable.id }),
+	);
 	dealId = deal.id;
 
-	const freshDeal = await db.deal.create({
-		data: {
-			name: `Fresh expansion ${suffix}`,
-			companyId: northwindId,
-			ownerId: user.id,
-			stage: DealStage.CONTRACT_SENT,
-			lastActivityAt: new Date("2026-08-04T12:00:00.000Z"),
-		},
-		select: { id: true },
-	});
+	const freshDeal = await requireRow(
+		db
+			.insert(dealTable)
+			.values({
+				name: `Fresh expansion ${suffix}`,
+				companyId: northwindId,
+				ownerId: user.id,
+				stage: DealStage.CONTRACT_SENT,
+				lastActivityAt: new Date("2026-08-04T12:00:00.000Z"),
+			})
+			.returning({ id: dealTable.id }),
+	);
 	freshDealId = freshDeal.id;
 
-	const closedDeal = await db.deal.create({
-		data: {
-			name: `Closed renewal ${suffix}`,
-			companyId: brightwaterId,
-			ownerId: user.id,
-			stage: DealStage.CLOSED_LOST,
-			lastActivityAt: new Date("2026-05-01T12:00:00.000Z"),
-		},
-		select: { id: true },
-	});
+	const closedDeal = await requireRow(
+		db
+			.insert(dealTable)
+			.values({
+				name: `Closed renewal ${suffix}`,
+				companyId: brightwaterId,
+				ownerId: user.id,
+				stage: DealStage.CLOSED_LOST,
+				lastActivityAt: new Date("2026-05-01T12:00:00.000Z"),
+			})
+			.returning({ id: dealTable.id }),
+	);
 	closedDealId = closedDeal.id;
 });
 
 afterAll(cleanup);
 
 async function cleanup(): Promise<void> {
-	const companies = await db.company.findMany({
-		where: { domain: { in: [domain, otherDomain] } },
-		select: { id: true },
-	});
+	const companies = await db
+		.select({ id: companyTable.id })
+		.from(companyTable)
+		.where(inArray(companyTable.domain, [domain, otherDomain]));
 	const ids = companies.map((company) => company.id);
 
 	if (ids.length > 0) {
-		await db.activity.deleteMany({ where: { companyId: { in: ids } } });
-		await db.deal.deleteMany({ where: { companyId: { in: ids } } });
-		await db.contact.deleteMany({ where: { companyId: { in: ids } } });
-		await db.company.deleteMany({ where: { id: { in: ids } } });
+		await db.delete(activity).where(inArray(activity.companyId, ids));
+		await db.delete(dealTable).where(inArray(dealTable.companyId, ids));
+		await db.delete(contact).where(inArray(contact.companyId, ids));
+		await db.delete(companyTable).where(inArray(companyTable.id, ids));
 	}
 
-	await db.user.deleteMany({ where: { email: `rep.${suffix}@example.test` } });
+	await db
+		.delete(userTable)
+		.where(whereEq(userTable.email, `rep.${suffix}@example.test`));
 }
 
 describe("searchCrm", () => {

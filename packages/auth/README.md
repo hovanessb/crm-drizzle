@@ -84,7 +84,8 @@ Adding a plugin or an additional user field changes the database schema. After
 editing `src/auth.ts`:
 
 ```bash
-bun run auth:generate   # rewrites packages/db/prisma/schema.prisma
+bun run auth:generate   # writes packages/db/drizzle/auth-schema.generated.ts
+                        # carry the differences into packages/db/src/schema/schema.ts
 bun run db:migrate      # create the migration
 ```
 

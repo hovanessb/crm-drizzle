@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { appSetting, type Db, eq } from "@crm/db";
 import { SETTINGS_ID } from "@crm/db/settings";
 import {
 	configHash,
@@ -49,10 +49,11 @@ export class TrackingConfigService {
 	}
 
 	private async current(hash: string): Promise<boolean> {
-		const row = await this.db.appSetting.findUnique({
-			where: { id: SETTINGS_ID },
-			select: { trackingConfigHash: true },
-		});
+		const [row] = await this.db
+			.select({ trackingConfigHash: appSetting.trackingConfigHash })
+			.from(appSetting)
+			.where(eq(appSetting.id, SETTINGS_ID))
+			.limit(1);
 
 		return row?.trackingConfigHash === hash;
 	}
@@ -71,20 +72,20 @@ export class TrackingConfigService {
 		const config = await readTrackingConfig(this.db);
 
 		if (!config) {
-			await this.db.appSetting.updateMany({
-				where: { id: SETTINGS_ID },
-				data: { trackingConfigHash: null },
-			});
+			await this.db
+				.update(appSetting)
+				.set({ trackingConfigHash: null })
+				.where(eq(appSetting.id, SETTINGS_ID));
 
 			return;
 		}
 
 		const hash = configHash(config);
 
-		await this.db.appSetting.update({
-			where: { id: SETTINGS_ID },
-			data: { trackingConfigHash: hash },
-		});
+		await this.db
+			.update(appSetting)
+			.set({ trackingConfigHash: hash })
+			.where(eq(appSetting.id, SETTINGS_ID));
 
 		if (written !== this.generation) return;
 		if (!(await this.current(hash))) return;
@@ -93,20 +94,20 @@ export class TrackingConfigService {
 	}
 
 	async ensureSiteId(): Promise<string> {
-		const existing = await this.db.appSetting.findUnique({
-			where: { id: SETTINGS_ID },
-			select: { trackingSiteId: true },
-		});
+		const [existing] = await this.db
+			.select({ trackingSiteId: appSetting.trackingSiteId })
+			.from(appSetting)
+			.where(eq(appSetting.id, SETTINGS_ID))
+			.limit(1);
 
 		if (existing?.trackingSiteId) return existing.trackingSiteId;
 
 		const trackingSiteId = mintSiteId();
 
-		await this.db.appSetting.upsert({
-			where: { id: SETTINGS_ID },
-			create: { id: SETTINGS_ID, trackingSiteId },
-			update: { trackingSiteId },
-		});
+		await this.db
+			.insert(appSetting)
+			.values({ id: SETTINGS_ID, trackingSiteId })
+			.onConflictDoUpdate({ target: appSetting.id, set: { trackingSiteId } });
 
 		await this.invalidate();
 
@@ -118,11 +119,10 @@ export class TrackingConfigService {
 	async rotateSiteId(): Promise<string> {
 		const trackingSiteId = mintSiteId();
 
-		await this.db.appSetting.upsert({
-			where: { id: SETTINGS_ID },
-			create: { id: SETTINGS_ID, trackingSiteId },
-			update: { trackingSiteId },
-		});
+		await this.db
+			.insert(appSetting)
+			.values({ id: SETTINGS_ID, trackingSiteId })
+			.onConflictDoUpdate({ target: appSetting.id, set: { trackingSiteId } });
 
 		await this.invalidate();
 

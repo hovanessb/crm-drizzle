@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { isGoogleConfigured } from "@crm/auth/env";
 import { WORKSPACE_ID } from "@crm/auth/organization";
-import type { Db } from "@crm/db";
 import { ForbiddenException } from "@nestjs/common";
 import { SsoService } from "../src/sso/sso.service";
+import { fakeDb, rendered } from "./fake-db";
 
 type Row = {
 	providerId: string;
@@ -26,18 +26,17 @@ type Seen = { providerWhere?: unknown };
 function service(role: string | null, rows: Row[] = []) {
 	const seen: Seen = {};
 
-	const db = {
-		member: {
-			findUnique: async () => (role === null ? null : { role }),
-		},
-		ssoProvider: {
-			findMany: async ({ where }: { where: unknown }) => {
-				seen.providerWhere = where;
+	const { db } = fakeDb({
+		select: (table, call) => {
+			if (table === "member") return role === null ? [] : [{ role }];
+			if (table === "ssoProvider") {
+				seen.providerWhere = rendered(call.where);
 				return rows;
-			},
-			count: async () => rows.length,
+			}
+			return [];
 		},
-	} as unknown as Db;
+		count: () => rows.length,
+	});
 
 	return { sso: new SsoService(db), seen };
 }
@@ -110,7 +109,10 @@ describe("what a provider looks like once it is saved", () => {
 		const { sso, seen } = service("owner", [OKTA]);
 		await sso.list(LIST);
 
-		expect(seen.providerWhere).toEqual({ organizationId: WORKSPACE_ID });
+		expect(seen.providerWhere).toEqual({
+			sql: '"ssoProvider"."organizationId" = $1',
+			params: [WORKSPACE_ID],
+		});
 	});
 
 	it("searches the name, the domain and the issuer", async () => {
@@ -118,12 +120,8 @@ describe("what a provider looks like once it is saved", () => {
 		await sso.list({ ...LIST, q: " acme " });
 
 		expect(seen.providerWhere).toEqual({
-			organizationId: WORKSPACE_ID,
-			OR: [
-				{ providerId: { contains: "acme", mode: "insensitive" } },
-				{ domain: { contains: "acme", mode: "insensitive" } },
-				{ issuer: { contains: "acme", mode: "insensitive" } },
-			],
+			sql: '("ssoProvider"."organizationId" = $1 and ("ssoProvider"."providerId" ilike $2 or "ssoProvider"."domain" ilike $3 or "ssoProvider"."issuer" ilike $4))',
+			params: [WORKSPACE_ID, "%acme%", "%acme%", "%acme%"],
 		});
 	});
 });

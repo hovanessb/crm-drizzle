@@ -1,4 +1,4 @@
-import { setPrismaLogSink } from "@crm/db";
+import { setDbLogSink } from "@crm/db";
 import {
 	Injectable,
 	Logger,
@@ -7,11 +7,11 @@ import {
 } from "@nestjs/common";
 
 @Injectable()
-export class PrismaLogBridge implements OnModuleInit, OnApplicationShutdown {
-	private readonly logger = new Logger("Prisma");
+export class DbLogBridge implements OnModuleInit, OnApplicationShutdown {
+	private readonly logger = new Logger("Database");
 
 	onModuleInit(): void {
-		setPrismaLogSink(({ level, message, target, durationMs }) => {
+		setDbLogSink(({ level, message, target, durationMs }) => {
 			const payload =
 				durationMs === undefined
 					? { message, target }
@@ -32,6 +32,6 @@ export class PrismaLogBridge implements OnModuleInit, OnApplicationShutdown {
 	}
 
 	onApplicationShutdown(): void {
-		setPrismaLogSink(null);
+		setDbLogSink(null);
 	}
 }

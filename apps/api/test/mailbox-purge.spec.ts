@@ -5,13 +5,31 @@ import {
 	OUTLOOK_MAIL_SCOPE,
 	SYNC_SCOPES,
 } from "@crm/auth/scopes";
-import { ActivityType, db, EmailDirection, GoogleSyncStatus } from "@crm/db";
+import {
+	ActivityType,
+	account as accountTable,
+	activity,
+	and,
+	asc,
+	calendarEvent,
+	company as companyTable,
+	db,
+	EmailDirection,
+	emailMessage,
+	emailThread,
+	eq,
+	GoogleSyncStatus,
+	inArray,
+	mailboxSync,
+	user,
+} from "@crm/db";
 import { ActivityStampService } from "../src/crm/activity-stamp.service";
 import { GoogleConnectionService } from "../src/google/google-connection.service";
 import type { MailboxMatchService } from "../src/mailbox/mailbox-match.service";
 import { MailboxTokenService } from "../src/mailbox/mailbox-token.service";
 import { SyncStateService } from "../src/mailbox/sync-state.service";
 import { MicrosoftConnectionService } from "../src/microsoft/microsoft-connection.service";
+import { first, one } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "mailbox-purge-spec";
 const domain = `purge-${suffix}.test`;
@@ -61,48 +79,53 @@ async function thread(
 	const last = messages[messages.length - 1];
 	if (!first || !last) return;
 
-	await db.emailThread.create({
-		data: {
-			rootMessageId,
-			subject: first.subject,
-			companyId,
-			firstMessageAt: first.sentAt,
-			lastMessageAt: last.sentAt,
-			messageCount: messages.length,
-			messages: {
-				create: messages.map((message) => ({
-					rfcMessageId: `${message.id}@${domain}`,
-					syncedByUserId: message.syncedByUserId,
-					gmailMessageId: message.provider === "gmail" ? message.id : null,
-					outlookMessageId: message.provider === "outlook" ? message.id : null,
-					direction: EmailDirection.INBOUND,
-					fromEmail: `them@${domain}`,
-					recipients: [],
-					subject: message.subject,
-					snippet: message.snippet,
-					sentAt: message.sentAt,
-				})),
-			},
-			activity: {
-				create: {
-					type: ActivityType.EMAIL,
-					subject: first.subject,
-					body: last.snippet,
-					occurredAt: last.sentAt,
-					companyId,
-					createdById: first.syncedByUserId,
-					meta: { synced: true },
-				},
-			},
-		},
+	const thread = await one(
+		db
+			.insert(emailThread)
+			.values({
+				rootMessageId,
+				subject: first.subject,
+				companyId,
+				firstMessageAt: first.sentAt,
+				lastMessageAt: last.sentAt,
+				messageCount: messages.length,
+			})
+			.returning({ id: emailThread.id }),
+	);
+	await db.insert(emailMessage).values(
+		messages.map((message) => ({
+			threadId: thread.id,
+			rfcMessageId: `${message.id}@${domain}`,
+			syncedByUserId: message.syncedByUserId,
+			gmailMessageId: message.provider === "gmail" ? message.id : null,
+			outlookMessageId: message.provider === "outlook" ? message.id : null,
+			direction: EmailDirection.INBOUND,
+			fromEmail: `them@${domain}`,
+			recipients: [],
+			subject: message.subject,
+			snippet: message.snippet,
+			sentAt: message.sentAt,
+		})),
+	);
+	await db.insert(activity).values({
+		type: ActivityType.EMAIL,
+		subject: first.subject,
+		body: last.snippet,
+		occurredAt: last.sentAt,
+		companyId,
+		createdById: first.syncedByUserId,
+		meta: { synced: true },
+		emailThreadId: thread.id,
 	});
 }
 
 async function seed(): Promise<void> {
-	const company = await db.company.create({
-		data: { name: "Purge Co", domain },
-		select: { id: true },
-	});
+	const company = await one(
+		db
+			.insert(companyTable)
+			.values({ name: "Purge Co", domain })
+			.returning({ id: companyTable.id }),
+	);
 
 	await thread(shared, company.id, [
 		{
@@ -153,63 +176,68 @@ async function seed(): Promise<void> {
 		},
 	]);
 
-	await db.calendarEvent.create({
-		data: {
-			iCalUid: `ical-${suffix}`,
-			originalStartTime: at(12),
-			startsAt: at(12),
-			endsAt: at(13),
-			status: "confirmed",
-			companyId: company.id,
-			syncedByUserId: gmailRep,
-		},
-	});
+	await one(
+		db
+			.insert(calendarEvent)
+			.values({
+				iCalUid: `ical-${suffix}`,
+				originalStartTime: at(12),
+				startsAt: at(12),
+				endsAt: at(13),
+				status: "confirmed",
+				companyId: company.id,
+				syncedByUserId: gmailRep,
+			})
+			.returning(),
+	);
 }
 
 async function clean(): Promise<void> {
-	await db.calendarEvent.deleteMany({
-		where: { syncedByUserId: { in: userIds } },
-	});
-	await db.emailThread.deleteMany({ where: { rootMessageId: { in: roots } } });
-	await db.mailboxSync.deleteMany({ where: { userId: { in: userIds } } });
-	await db.account.deleteMany({ where: { userId: { in: userIds } } });
-	await db.user.deleteMany({ where: { id: { in: userIds } } });
-	await db.company.deleteMany({ where: { domain } });
+	await db
+		.delete(calendarEvent)
+		.where(inArray(calendarEvent.syncedByUserId, userIds));
+	await db.delete(emailThread).where(inArray(emailThread.rootMessageId, roots));
+	await db.delete(mailboxSync).where(inArray(mailboxSync.userId, userIds));
+	await db.delete(accountTable).where(inArray(accountTable.userId, userIds));
+	await db.delete(user).where(inArray(user.id, userIds));
+	await db.delete(companyTable).where(eq(companyTable.domain, domain));
 }
 
 async function messagesOn(rootMessageId: string): Promise<string[]> {
-	const rows = await db.emailMessage.findMany({
-		where: { thread: { rootMessageId } },
-		orderBy: { sentAt: "asc" },
-		select: { snippet: true },
-	});
+	const rows = await db
+		.select({ snippet: emailMessage.snippet })
+		.from(emailMessage)
+		.innerJoin(emailThread, eq(emailThread.id, emailMessage.threadId))
+		.where(eq(emailThread.rootMessageId, rootMessageId))
+		.orderBy(asc(emailMessage.sentAt));
 
 	return rows.map((row) => row.snippet ?? "");
 }
 
 async function threadState(rootMessageId: string) {
-	return db.emailThread.findUnique({
-		where: { rootMessageId },
-		select: {
+	const row = await db.query.emailThread.findFirst({
+		where: eq(emailThread.rootMessageId, rootMessageId),
+		columns: {
 			subject: true,
 			messageCount: true,
 			firstMessageAt: true,
 			lastMessageAt: true,
-			activity: { select: { body: true, occurredAt: true } },
 		},
+		with: { activity: { columns: { body: true, occurredAt: true } } },
 	});
+	return row ?? null;
 }
 
 beforeEach(async () => {
 	await clean();
 
-	await db.user.createMany({
-		data: userIds.map((id) => ({
+	await db.insert(user).values(
+		userIds.map((id) => ({
 			id,
 			name: id,
 			email: `${id}@${domain}`,
 		})),
-	});
+	);
 
 	await seed();
 });
@@ -238,7 +266,7 @@ describe("purging Gmail data", () => {
 		await google.purgeSyncedData(gmailRep);
 
 		expect(await threadState(solo)).toBeNull();
-		expect(await db.activity.count({ where: { subject: "Only mine" } })).toBe(
+		expect(await db.$count(activity, eq(activity.subject, "Only mine"))).toBe(
 			0,
 		);
 	});
@@ -280,22 +308,28 @@ describe("purging Outlook data", () => {
 
 		expect(await messagesOn(solo)).toEqual(["alone"]);
 		expect(
-			await db.calendarEvent.count({ where: { iCalUid: `ical-${suffix}` } }),
+			await db.$count(
+				calendarEvent,
+				eq(calendarEvent.iCalUid, `ical-${suffix}`),
+			),
 		).toBe(1);
 	});
 });
 
 describe("disconnecting Microsoft", () => {
 	async function grant(scope: string): Promise<void> {
-		await db.account.create({
-			data: {
-				id: `ms-${suffix}`,
-				accountId: `ms-account-${suffix}`,
-				providerId: MICROSOFT_PROVIDER_ID,
-				userId: outlookRep,
-				scope,
-			},
-		});
+		await one(
+			db
+				.insert(accountTable)
+				.values({
+					id: `ms-${suffix}`,
+					accountId: `ms-account-${suffix}`,
+					providerId: MICROSOFT_PROVIDER_ID,
+					userId: outlookRep,
+					scope,
+				})
+				.returning(),
+		);
 	}
 
 	it("clears the grant even when the token columns are already empty", async () => {
@@ -304,10 +338,18 @@ describe("disconnecting Microsoft", () => {
 
 		expect(await microsoft.revoke(outlookRep)).toEqual({ revoked: true });
 
-		const account = await db.account.findFirst({
-			where: { userId: outlookRep, providerId: MICROSOFT_PROVIDER_ID },
-			select: { scope: true },
-		});
+		const account = await first(
+			db
+				.select({ scope: accountTable.scope })
+				.from(accountTable)
+				.where(
+					and(
+						eq(accountTable.userId, outlookRep),
+						eq(accountTable.providerId, MICROSOFT_PROVIDER_ID),
+					),
+				)
+				.limit(1),
+		);
 		expect(account?.scope).toBeNull();
 	});
 
@@ -346,23 +388,34 @@ describe("disconnecting Google", () => {
 	const realFetch = globalThis.fetch;
 
 	async function grant(scope: string, refreshToken: string | null) {
-		await db.account.create({
-			data: {
-				id: `goog-${suffix}`,
-				accountId: `goog-account-${suffix}`,
-				providerId: GOOGLE_PROVIDER_ID,
-				userId: gmailRep,
-				refreshToken,
-				scope,
-			},
-		});
+		await one(
+			db
+				.insert(accountTable)
+				.values({
+					id: `goog-${suffix}`,
+					accountId: `goog-account-${suffix}`,
+					providerId: GOOGLE_PROVIDER_ID,
+					userId: gmailRep,
+					refreshToken,
+					scope,
+				})
+				.returning(),
+		);
 	}
 
 	async function scopeOf(): Promise<string | null | undefined> {
-		const account = await db.account.findFirst({
-			where: { userId: gmailRep, providerId: GOOGLE_PROVIDER_ID },
-			select: { scope: true },
-		});
+		const account = await first(
+			db
+				.select({ scope: accountTable.scope })
+				.from(accountTable)
+				.where(
+					and(
+						eq(accountTable.userId, gmailRep),
+						eq(accountTable.providerId, GOOGLE_PROVIDER_ID),
+					),
+				)
+				.limit(1),
+		);
 
 		return account?.scope;
 	}

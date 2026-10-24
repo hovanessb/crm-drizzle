@@ -1,5 +1,16 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { db, FactBand, FactStatus } from "@crm/db";
+import {
+	and,
+	contactFact,
+	contact as contactTable,
+	db,
+	eq,
+	FactBand,
+	FactStatus,
+	firstRow,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { sweepBlankFacts } from "../agent/lib/blank-facts";
 
 const suffix = process.env.TEST_RUN_ID ?? "blank-facts-spec";
@@ -12,40 +23,46 @@ async function propose(input: {
 	value: string;
 	score: number;
 }): Promise<string> {
-	const fact = await db.contactFact.create({
-		data: {
-			contactId,
-			field: input.field,
-			value: input.value,
-			score: input.score,
-			band: input.score >= 0.55 ? FactBand.PROBABLE : FactBand.POSSIBLE,
-			evidence: [{ kind: "web.cited-claim", detail: "a page said so" }],
-			method: "web",
-			status: FactStatus.PROPOSED,
-		},
-		select: { id: true },
-	});
+	const fact = await requireRow(
+		db
+			.insert(contactFact)
+			.values({
+				contactId,
+				field: input.field,
+				value: input.value,
+				score: input.score,
+				band: input.score >= 0.55 ? FactBand.PROBABLE : FactBand.POSSIBLE,
+				evidence: [{ kind: "web.cited-claim", detail: "a page said so" }],
+				method: "web",
+				status: FactStatus.PROPOSED,
+			})
+			.returning({ id: contactFact.id }),
+	);
 
 	return fact.id;
 }
 
 function statusOf(id: string) {
-	return db.contactFact
-		.findUnique({ where: { id }, select: { status: true } })
-		.then((fact) => fact?.status);
+	return db
+		.select({ status: contactFact.status })
+		.from(contactFact)
+		.where(eq(contactFact.id, id))
+		.then(([fact]) => fact?.status);
 }
 
 beforeEach(async () => {
-	await db.contact.deleteMany({ where: { email } });
-	const contact = await db.contact.create({
-		data: { firstName: "Blank", lastName: "Subject", email },
-		select: { id: true },
-	});
+	await db.delete(contactTable).where(whereEq(contactTable.email, email));
+	const contact = await requireRow(
+		db
+			.insert(contactTable)
+			.values({ firstName: "Blank", lastName: "Subject", email })
+			.returning({ id: contactTable.id }),
+	);
 	contactId = contact.id;
 });
 
 afterAll(async () => {
-	await db.contact.deleteMany({ where: { email } });
+	await db.delete(contactTable).where(whereEq(contactTable.email, email));
 });
 
 describe("sweepBlankFacts", () => {
@@ -67,18 +84,24 @@ describe("sweepBlankFacts", () => {
 		expect(await statusOf(strong)).toBe("APPLIED");
 		expect(await statusOf(weak)).toBe("SUPERSEDED");
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: { linkedinUrl: true },
-		});
+		const contact = await firstRow(
+			db
+				.select({ linkedinUrl: contactTable.linkedinUrl })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.linkedinUrl).toBe("https://www.linkedin.com/in/subject");
 	});
 
 	it("leaves a suggestion that disagrees with what is already there", async () => {
-		await db.contact.update({
-			where: { id: contactId },
-			data: { title: "Head of Security" },
-		});
+		await requireRow(
+			db
+				.update(contactTable)
+				.set({ title: "Head of Security" })
+				.where(whereEq(contactTable.id, contactId))
+				.returning(),
+		);
 
 		const offer = await propose({
 			field: "title",
@@ -94,10 +117,13 @@ describe("sweepBlankFacts", () => {
 	});
 
 	it("clears a suggestion that only repeats the record", async () => {
-		await db.contact.update({
-			where: { id: contactId },
-			data: { title: "Head of Security" },
-		});
+		await requireRow(
+			db
+				.update(contactTable)
+				.set({ title: "Head of Security" })
+				.where(whereEq(contactTable.id, contactId))
+				.returning(),
+		);
 
 		const echo = await propose({
 			field: "title",
@@ -113,10 +139,13 @@ describe("sweepBlankFacts", () => {
 	});
 
 	it("clears a suggestion that differs only by a trailing slash", async () => {
-		await db.contact.update({
-			where: { id: contactId },
-			data: { linkedinUrl: "https://www.linkedin.com/in/pogrebs" },
-		});
+		await requireRow(
+			db
+				.update(contactTable)
+				.set({ linkedinUrl: "https://www.linkedin.com/in/pogrebs" })
+				.where(whereEq(contactTable.id, contactId))
+				.returning(),
+		);
 
 		const echo = await propose({
 			field: "linkedinUrl",
@@ -132,19 +161,27 @@ describe("sweepBlankFacts", () => {
 	});
 
 	it("keeps one of two suggestions offering the same value", async () => {
-		await db.contact.update({
-			where: { id: contactId },
-			data: { title: "Head of Security" },
-		});
+		await requireRow(
+			db
+				.update(contactTable)
+				.set({ title: "Head of Security" })
+				.where(whereEq(contactTable.id, contactId))
+				.returning(),
+		);
 
 		await propose({ field: "title", value: "VP Security", score: 0.61 });
 		await propose({ field: "title", value: "VP Security", score: 0.61 });
 
 		await sweepBlankFacts();
 
-		const left = await db.contactFact.count({
-			where: { contactId, field: "title", status: FactStatus.PROPOSED },
-		});
+		const left = await db.$count(
+			contactFact,
+			and(
+				whereEq(contactFact.contactId, contactId),
+				eq(contactFact.field, "title"),
+				eq(contactFact.status, FactStatus.PROPOSED),
+			),
+		);
 		expect(left).toBe(1);
 	});
 
@@ -160,10 +197,13 @@ describe("sweepBlankFacts", () => {
 		expect(sweep.filled).toBe(1);
 		expect(await statusOf(offer)).toBe("PROPOSED");
 
-		const contact = await db.contact.findUnique({
-			where: { id: contactId },
-			select: { githubUrl: true },
-		});
+		const contact = await firstRow(
+			db
+				.select({ githubUrl: contactTable.githubUrl })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contactId))
+				.limit(1),
+		);
 		expect(contact?.githubUrl).toBeNull();
 	});
 });

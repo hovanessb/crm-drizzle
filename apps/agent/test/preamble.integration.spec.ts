@@ -1,5 +1,18 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { DealStage, db } from "@crm/db";
+import {
+	activity,
+	company as companyTable,
+	contact as contactTable,
+	DealStage,
+	Decimal,
+	db,
+	dealContact,
+	deal as dealTable,
+	firstRow,
+	requireRow,
+	user as userTable,
+	whereEq,
+} from "@crm/db";
 import {
 	companyPreamble,
 	composeClosing,
@@ -24,81 +37,105 @@ const rep = { dispatched: false };
 beforeAll(async () => {
 	await cleanup();
 
-	const user = await db.user.create({
-		data: {
-			id: `user-${suffix}`,
-			name: "Rep One",
-			email: `rep.${suffix}@example.test`,
-			emailVerified: true,
-		},
-		select: { id: true },
-	});
+	const user = await requireRow(
+		db
+			.insert(userTable)
+			.values({
+				id: `user-${suffix}`,
+				name: "Rep One",
+				email: `rep.${suffix}@example.test`,
+				emailVerified: true,
+			})
+			.returning({ id: userTable.id }),
+	);
 
-	const company = await db.company.create({
-		data: {
-			name: `Fernhill Systems ${suffix}`,
-			domain,
-			industry: "Security software",
-		},
-		select: { id: true },
-	});
+	const company = await requireRow(
+		db
+			.insert(companyTable)
+			.values({
+				name: `Fernhill Systems ${suffix}`,
+				domain,
+				industry: "Security software",
+			})
+			.returning({ id: companyTable.id }),
+	);
 	companyId = company.id;
 
-	const paula = await db.contact.create({
-		data: {
-			firstName: "Paula",
-			lastName: "Marchetti",
-			title: "Growth Specialist",
-			email: `paula.marchetti@${domain}`,
-			companyId,
-			lastActivityAt: new Date(),
-		},
-		select: { id: true },
-	});
+	const paula = await requireRow(
+		db
+			.insert(contactTable)
+			.values({
+				firstName: "Paula",
+				lastName: "Marchetti",
+				title: "Growth Specialist",
+				email: `paula.marchetti@${domain}`,
+				companyId,
+				lastActivityAt: new Date(),
+			})
+			.returning({ id: contactTable.id }),
+	);
 	paulaId = paula.id;
 
-	const tomi = await db.contact.create({
-		data: {
-			firstName: "Tomi",
-			lastName: "Okonkwo",
-			title: "Head of Security",
-			email: `tomi.okonkwo@${domain}`,
-			companyId,
-		},
-		select: { id: true },
-	});
+	const tomi = await requireRow(
+		db
+			.insert(contactTable)
+			.values({
+				firstName: "Tomi",
+				lastName: "Okonkwo",
+				title: "Head of Security",
+				email: `tomi.okonkwo@${domain}`,
+				companyId,
+			})
+			.returning({ id: contactTable.id }),
+	);
 	tomiId = tomi.id;
 
-	const deal = await db.deal.create({
-		data: {
-			name: `Fernhill platform ${suffix}`,
-			companyId,
-			ownerId: user.id,
-			stage: DealStage.CONTRACT_SENT,
-			amount: 48_000,
-			contacts: { create: [{ contactId: paulaId, role: "Champion" }] },
-		},
-		select: { id: true },
-	});
+	const deal = await requireRow(
+		db
+			.insert(dealTable)
+			.values({
+				name: `Fernhill platform ${suffix}`,
+				companyId,
+				ownerId: user.id,
+				stage: DealStage.CONTRACT_SENT,
+				amount: new Decimal(48_000),
+			})
+			.returning({ id: dealTable.id }),
+	);
+	await db
+		.insert(dealContact)
+		.values({ dealId: deal.id, contactId: paulaId, role: "Champion" });
 	dealId = deal.id;
 });
 
 afterAll(cleanup);
 
 async function cleanup(): Promise<void> {
-	const company = await db.company.findFirst({
-		where: { domain },
-		select: { id: true },
-	});
+	const company = await firstRow(
+		db
+			.select({ id: companyTable.id })
+			.from(companyTable)
+			.where(whereEq(companyTable.domain, domain))
+			.limit(1),
+	);
 
 	if (company) {
-		await db.activity.deleteMany({ where: { companyId: company.id } });
-		await db.deal.deleteMany({ where: { companyId: company.id } });
-		await db.contact.deleteMany({ where: { companyId: company.id } });
-		await db.company.delete({ where: { id: company.id } });
+		await db.delete(activity).where(whereEq(activity.companyId, company.id));
+		await db.delete(dealTable).where(whereEq(dealTable.companyId, company.id));
+		await db
+			.delete(contactTable)
+			.where(whereEq(contactTable.companyId, company.id));
+		await requireRow(
+			db
+				.delete(companyTable)
+				.where(whereEq(companyTable.id, company.id))
+				.returning(),
+		);
 	}
 
-	await db.user.deleteMany({ where: { email: `rep.${suffix}@example.test` } });
+	await db
+		.delete(userTable)
+		.where(whereEq(userTable.email, `rep.${suffix}@example.test`));
 }
 
 describe("companyPreamble", () => {
@@ -142,15 +179,22 @@ describe("contactPreamble", () => {
 	});
 
 	it("offers a way out when they have no company", async () => {
-		const orphan = await db.contact.create({
-			data: { firstName: "Nobody", email: `nobody.${suffix}@example.test` },
-			select: { id: true },
-		});
+		const orphan = await requireRow(
+			db
+				.insert(contactTable)
+				.values({ firstName: "Nobody", email: `nobody.${suffix}@example.test` })
+				.returning({ id: contactTable.id }),
+		);
 
 		const { markdown } = await contactPreamble(orphan.id, rep);
 		expect(markdown).toContain("`search_crm` will find one");
 
-		await db.contact.delete({ where: { id: orphan.id } });
+		await requireRow(
+			db
+				.delete(contactTable)
+				.where(whereEq(contactTable.id, orphan.id))
+				.returning(),
+		);
 	});
 });
 

@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { db, EnrichmentStatus } from "@crm/db";
+import {
+	agentTask,
+	company,
+	contact as contactTable,
+	db,
+	EnrichmentStatus,
+	eq,
+	firstRow,
+	requireRow,
+	startsWith,
+	whereEq,
+} from "@crm/db";
 import { MAX_ATTEMPTS, RETIRED_OUTCOME } from "@crm/db/agent-tasks";
 import { reconcileStaleTasks } from "../agent/lib/stale-tasks";
 
@@ -10,35 +21,39 @@ const REASON = "stale-spec";
 const MINUTE_MS = 60_000;
 
 async function clear() {
-	await db.agentTask.deleteMany({ where: { reason: REASON } });
-	await db.contact.deleteMany({ where: { email: { startsWith: "stale-" } } });
-	await db.company.deleteMany({ where: { name: { startsWith: "Stale Co " } } });
+	await db.delete(agentTask).where(eq(agentTask.reason, REASON));
+	await db.delete(contactTable).where(startsWith(contactTable.email, "stale-"));
+	await db.delete(company).where(startsWith(company.name, "Stale Co "));
 }
 
 beforeEach(clear);
 afterEach(clear);
 
 async function someone(status: EnrichmentStatus, enrichedAt?: Date) {
-	return db.contact.create({
-		data: {
-			firstName: "Stale",
-			email: `stale-${crypto.randomUUID()}@example.test`,
-			enrichmentStatus: status,
-			enrichedAt: enrichedAt ?? null,
-		},
-		select: { id: true },
-	});
+	return requireRow(
+		db
+			.insert(contactTable)
+			.values({
+				firstName: "Stale",
+				email: `stale-${crypto.randomUUID()}@example.test`,
+				enrichmentStatus: status,
+				enrichedAt: enrichedAt ?? null,
+			})
+			.returning({ id: contactTable.id }),
+	);
 }
 
 async function anAccount(status: EnrichmentStatus, enrichedAt?: Date) {
-	return db.company.create({
-		data: {
-			name: `Stale Co ${crypto.randomUUID()}`,
-			enrichmentStatus: status,
-			enrichedAt: enrichedAt ?? null,
-		},
-		select: { id: true },
-	});
+	return requireRow(
+		db
+			.insert(company)
+			.values({
+				name: `Stale Co ${crypto.randomUUID()}`,
+				enrichmentStatus: status,
+				enrichedAt: enrichedAt ?? null,
+			})
+			.returning({ id: company.id }),
+	);
 }
 
 async function queue(overrides: {
@@ -50,28 +65,37 @@ async function queue(overrides: {
 	startedAt?: Date | null;
 	leasedUntil?: Date | null;
 }) {
-	return db.agentTask.create({
-		data: {
-			kind: overrides.kind ?? (overrides.companyId ? "brand" : kind),
-			reason: REASON,
-			dueAt: overrides.dueAt ?? new Date(Date.now() - MINUTE_MS),
-			priority: 0,
-			budget: 4,
-			contactId: overrides.contactId ?? null,
-			companyId: overrides.companyId ?? null,
-			attempts: overrides.attempts ?? 0,
-			startedAt: overrides.startedAt ?? null,
-			leasedUntil: overrides.leasedUntil ?? null,
-		},
-		select: { id: true },
-	});
+	return requireRow(
+		db
+			.insert(agentTask)
+			.values({
+				kind: overrides.kind ?? (overrides.companyId ? "brand" : kind),
+				reason: REASON,
+				dueAt: overrides.dueAt ?? new Date(Date.now() - MINUTE_MS),
+				priority: 0,
+				budget: 4,
+				contactId: overrides.contactId ?? null,
+				companyId: overrides.companyId ?? null,
+				attempts: overrides.attempts ?? 0,
+				startedAt: overrides.startedAt ?? null,
+				leasedUntil: overrides.leasedUntil ?? null,
+			})
+			.returning({ id: agentTask.id }),
+	);
 }
 
 async function row(id: string) {
-	return db.agentTask.findUnique({
-		where: { id },
-		select: { finishedAt: true, outcome: true, leasedUntil: true },
-	});
+	return firstRow(
+		db
+			.select({
+				finishedAt: agentTask.finishedAt,
+				outcome: agentTask.outcome,
+				leasedUntil: agentTask.leasedUntil,
+			})
+			.from(agentTask)
+			.where(whereEq(agentTask.id, id))
+			.limit(1),
+	);
 }
 
 describe("a task whose lease ran out", () => {
@@ -90,10 +114,13 @@ describe("a task whose lease ran out", () => {
 		expect(closed?.finishedAt).not.toBeNull();
 		expect(closed?.outcome).toBe(RETIRED_OUTCOME);
 
-		const settled = await db.contact.findUnique({
-			where: { id: contact.id },
-			select: { enrichmentStatus: true },
-		});
+		const settled = await firstRow(
+			db
+				.select({ enrichmentStatus: contactTable.enrichmentStatus })
+				.from(contactTable)
+				.where(whereEq(contactTable.id, contact.id))
+				.limit(1),
+		);
 		expect(settled?.enrichmentStatus).toBe(EnrichmentStatus.FAILED);
 	});
 
@@ -240,21 +267,33 @@ describe("a task whose record is already done", () => {
 			leasedUntil: new Date(Date.now() - MINUTE_MS),
 		});
 
-		const findMany = db.agentTask.findMany;
-		db.agentTask.findMany = async (...args) => {
-			const rows = await findMany.apply(db.agentTask, args);
-			await db.agentTask.update({
-				where: { id: task.id },
-				data: { leasedUntil: new Date(Date.now() + 10 * MINUTE_MS) },
-			});
-
-			return rows;
-		};
+		const select = db.select;
+		let renewed = false;
+		db.select = ((fields: Parameters<typeof select>[0]) => {
+			const builder = select.call(db, fields);
+			const from = builder.from.bind(builder);
+			builder.from = ((table: Parameters<typeof from>[0]) => {
+				const query = from(table);
+				if (table !== agentTask || renewed) return query;
+				renewed = true;
+				const execute = query.execute.bind(query);
+				query.execute = (async (...args: Parameters<typeof execute>) => {
+					const rows = await execute(...args);
+					await db
+						.update(agentTask)
+						.set({ leasedUntil: new Date(Date.now() + 10 * MINUTE_MS) })
+						.where(eq(agentTask.id, task.id));
+					return rows;
+				}) as typeof query.execute;
+				return query;
+			}) as typeof builder.from;
+			return builder;
+		}) as typeof db.select;
 
 		try {
 			await reconcileStaleTasks();
 		} finally {
-			db.agentTask.findMany = findMany;
+			db.select = select;
 		}
 
 		expect((await row(task.id))?.finishedAt).toBeNull();
@@ -336,17 +375,17 @@ describe("running it twice", () => {
 	});
 
 	it("reports a database failure instead of throwing", async () => {
-		const findMany = db.agentTask.findMany;
-		db.agentTask.findMany = () => {
+		const count = db.$count;
+		db.$count = (() => {
 			throw new Error("the database is unreachable");
-		};
+		}) as typeof db.$count;
 
 		try {
 			const sweep = await reconcileStaleTasks();
 			expect(sweep.error).toBe("the database is unreachable");
 			expect(sweep.scanned).toBe(0);
 		} finally {
-			db.agentTask.findMany = findMany;
+			db.$count = count;
 		}
 
 		expect((await reconcileStaleTasks()).error).toBeNull();
@@ -360,16 +399,16 @@ describe("running it twice", () => {
 			leasedUntil: new Date(Date.now() - MINUTE_MS),
 		});
 
-		const updateMany = db.agentTask.updateMany;
-		db.agentTask.updateMany = () => {
+		const update = db.update;
+		db.update = (() => {
 			throw new Error("the write failed");
-		};
+		}) as typeof db.update;
 
 		let sweep: Awaited<ReturnType<typeof reconcileStaleTasks>>;
 		try {
 			sweep = await reconcileStaleTasks();
 		} finally {
-			db.agentTask.updateMany = updateMany;
+			db.update = update;
 		}
 
 		expect(sweep.error).toBe("the write failed");

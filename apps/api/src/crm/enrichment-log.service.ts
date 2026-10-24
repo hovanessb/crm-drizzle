@@ -1,4 +1,12 @@
-import { ActivityType, type Db } from "@crm/db";
+import {
+	ActivityType,
+	activity as activityTable,
+	company,
+	contact,
+	type Db,
+	eq,
+	user,
+} from "@crm/db";
 import type { ActivityMetaFields } from "@crm/validation/activity-meta";
 import { Injectable } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
@@ -23,8 +31,9 @@ export class EnrichmentLogService {
 		const author = await this.authorFor(event);
 		if (!author) return null;
 
-		const activity = await this.db.activity.create({
-			data: {
+		const [activity] = await this.db
+			.insert(activityTable)
+			.values({
 				type: ActivityType.ENRICHMENT,
 				subject: event.subject,
 				body: event.body ?? null,
@@ -33,9 +42,9 @@ export class EnrichmentLogService {
 				contactId: event.contactId ?? null,
 				createdById: author,
 				meta: { ...event.meta, automated: true },
-			},
-			select: { id: true, createdAt: true },
-		});
+			})
+			.returning({ id: activityTable.id, createdAt: activityTable.createdAt });
+		if (!activity) return null;
 
 		await this.stamp.touch(
 			{ companyId: event.companyId, contactId: event.contactId },
@@ -47,22 +56,24 @@ export class EnrichmentLogService {
 
 	private async authorFor(event: EnrichmentEvent): Promise<string | null> {
 		if (event.contactId) {
-			const contact = await this.db.contact.findUnique({
-				where: { id: event.contactId },
-				select: { ownerId: true },
-			});
-			if (contact?.ownerId) return contact.ownerId;
+			const [person] = await this.db
+				.select({ ownerId: contact.ownerId })
+				.from(contact)
+				.where(eq(contact.id, event.contactId))
+				.limit(1);
+			if (person?.ownerId) return person.ownerId;
 		}
 
 		if (event.companyId) {
-			const company = await this.db.company.findUnique({
-				where: { id: event.companyId },
-				select: { ownerId: true },
-			});
-			if (company?.ownerId) return company.ownerId;
+			const [owner] = await this.db
+				.select({ ownerId: company.ownerId })
+				.from(company)
+				.where(eq(company.id, event.companyId))
+				.limit(1);
+			if (owner?.ownerId) return owner.ownerId;
 		}
 
-		const anyUser = await this.db.user.findFirst({ select: { id: true } });
+		const [anyUser] = await this.db.select({ id: user.id }).from(user).limit(1);
 		return anyUser?.id ?? null;
 	}
 }

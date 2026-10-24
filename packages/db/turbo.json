@@ -1,8 +1,6 @@
 {
 	"$schema": "https://turborepo.dev/schema.json",
-	"extends": [
-		"//"
-	],
+	"extends": ["//"],
 	"tasks": {
 		"dev:prepare": {
 			"cache": false,
@@ -25,9 +23,7 @@
 		"db:generate": {
 			"cache": false,
 			"interactive": true,
-			"passThroughEnv": [
-				"DATABASE_URL"
-			]
+			"passThroughEnv": ["DATABASE_URL"]
 		},
 		"db:deploy": {
 			"cache": false,
@@ -40,51 +36,33 @@
 		"db:migrate": {
 			"cache": false,
 			"interactive": true,
-			"passThroughEnv": [
-				"DATABASE_URL"
-			]
+			"passThroughEnv": ["DATABASE_URL"]
 		},
 		"db:push": {
 			"cache": false,
 			"interactive": true,
-			"passThroughEnv": [
-				"DATABASE_URL"
-			]
+			"passThroughEnv": ["DATABASE_URL"]
 		},
 		"db:reset": {
 			"cache": false,
 			"interactive": true,
-			"passThroughEnv": [
-				"DATABASE_URL"
-			]
+			"passThroughEnv": ["DATABASE_URL"]
 		},
 		"db:seed": {
 			"cache": false,
-			"passThroughEnv": [
-				"BLOB_READ_WRITE_TOKEN",
-				"DATABASE_URL"
-			]
+			"passThroughEnv": ["BLOB_READ_WRITE_TOKEN", "DATABASE_URL"]
 		},
 		"db:studio": {
 			"cache": false,
 			"persistent": true,
-			"passThroughEnv": [
-				"DATABASE_URL"
-			]
+			"passThroughEnv": ["DATABASE_URL"]
 		},
 		"check-types": {
-			"dependsOn": [
-				"$TURBO_EXTENDS$"
-			],
-			"passThroughEnv": [
-				"DATABASE_URL"
-			]
+			"dependsOn": ["$TURBO_EXTENDS$"],
+			"passThroughEnv": ["DATABASE_URL"]
 		},
 		"db:check": {
-			"inputs": [
-				"src/schema/**",
-				"drizzle/**"
-			]
+			"inputs": ["src/schema/**", "drizzle/**"]
 		}
 	}
 }

@@ -1,4 +1,4 @@
-import type { Db } from "@crm/db";
+import { appSetting, type Db } from "@crm/db";
 import {
 	DEFAULT_AGENT_MODEL,
 	maskKey,
@@ -35,7 +35,11 @@ export class SettingsService {
 	async agentModel(): Promise<AgentModelSettings> {
 		const [model, row] = await Promise.all([
 			readAgentModel(this.db),
-			this.db.appSetting.findFirst({ select: { updatedAt: true } }),
+			this.db
+				.select({ updatedAt: appSetting.updatedAt })
+				.from(appSetting)
+				.limit(1)
+				.then((rows) => rows[0]),
 		]);
 
 		return {

@@ -1,4 +1,13 @@
-import type { Db, Prisma } from "@crm/db";
+import {
+	agentTask,
+	and,
+	type Db,
+	eq,
+	inArray,
+	isNull,
+	lte,
+	type SQL,
+} from "@crm/db";
 import { Injectable } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
 
@@ -9,11 +18,10 @@ export class AgentQueueService {
 	async queuedCompanies(ids: readonly string[]): Promise<Set<string>> {
 		if (ids.length === 0) return new Set();
 
-		const rows = await this.db.agentTask.findMany({
-			where: this.due({ companyId: { in: [...ids] } }),
-			select: { companyId: true },
-			distinct: ["companyId"],
-		});
+		const rows = await this.db
+			.selectDistinct({ companyId: agentTask.companyId })
+			.from(agentTask)
+			.where(this.due(inArray(agentTask.companyId, [...ids])));
 
 		return this.identifiers(rows.map((row) => row.companyId));
 	}
@@ -21,11 +29,10 @@ export class AgentQueueService {
 	async queuedContacts(ids: readonly string[]): Promise<Set<string>> {
 		if (ids.length === 0) return new Set();
 
-		const rows = await this.db.agentTask.findMany({
-			where: this.due({ contactId: { in: [...ids] } }),
-			select: { contactId: true },
-			distinct: ["contactId"],
-		});
+		const rows = await this.db
+			.selectDistinct({ contactId: agentTask.contactId })
+			.from(agentTask)
+			.where(this.due(inArray(agentTask.contactId, [...ids])));
 
 		return this.identifiers(rows.map((row) => row.contactId));
 	}
@@ -34,19 +41,32 @@ export class AgentQueueService {
 		companyId?: string;
 		contactId?: string;
 	}): Promise<boolean> {
-		const row = await this.db.agentTask.findFirst({
-			where: this.due({
-				companyId: subject.companyId,
-				contactId: subject.contactId,
-			}),
-			select: { id: true },
-		});
+		const [row] = await this.db
+			.select({ id: agentTask.id })
+			.from(agentTask)
+			.where(
+				this.due(
+					and(
+						subject.companyId
+							? eq(agentTask.companyId, subject.companyId)
+							: undefined,
+						subject.contactId
+							? eq(agentTask.contactId, subject.contactId)
+							: undefined,
+					),
+				),
+			)
+			.limit(1);
 
-		return row !== null;
+		return row !== undefined;
 	}
 
-	private due(subject: Prisma.AgentTaskWhereInput): Prisma.AgentTaskWhereInput {
-		return { ...subject, finishedAt: null, dueAt: { lte: new Date() } };
+	private due(subject: SQL | undefined): SQL | undefined {
+		return and(
+			subject,
+			isNull(agentTask.finishedAt),
+			lte(agentTask.dueAt, new Date()),
+		);
 	}
 
 	private identifiers(values: (string | null)[]): Set<string> {

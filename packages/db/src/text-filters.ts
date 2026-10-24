@@ -1,10 +1,4 @@
-import {
-	type Column,
-	ilike,
-	like,
-	type SQL,
-	type SQLWrapper,
-} from "drizzle-orm";
+import { type Column, ilike, like, type SQL } from "drizzle-orm";
 
 type TextColumn = Column | SQL;
 

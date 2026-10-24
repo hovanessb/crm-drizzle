@@ -1,10 +1,27 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { DEFAULT_WORKSPACE_NAME, WORKSPACE_ID } from "@crm/auth/organization";
-import { db } from "@crm/db";
+import {
+	agentAction,
+	agentAuditEvent,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentVersion,
+	and,
+	asc,
+	Decimal,
+	db,
+	eq,
+	inArray,
+	member,
+	organization,
+	user,
+} from "@crm/db";
 import { workspaceSlug } from "@crm/db/workspace";
 import { AgentAccessService } from "../src/agent/agent-access.service";
 import { AgentRunsService } from "../src/agent/agent-runs.service";
 import { AgentTriggerService } from "../src/agent/agent-trigger.service";
+import { one } from "./rows";
 
 const suffix = crypto.randomUUID();
 const userId = `agent-run-user-${suffix}`;
@@ -25,113 +42,126 @@ const trigger = {
 const service = new AgentRunsService(db, new AgentAccessService(db), trigger);
 
 beforeAll(async () => {
-	await db.organization.upsert({
-		where: { id: WORKSPACE_ID },
-		update: {},
-		create: {
+	await db
+		.insert(organization)
+		.values({
 			id: WORKSPACE_ID,
 			name: DEFAULT_WORKSPACE_NAME,
 			slug: workspaceSlug(DEFAULT_WORKSPACE_NAME),
 			createdAt: new Date(),
+		})
+		.onConflictDoNothing();
+	await db.insert(user).values([
+		{
+			id: userId,
+			name: "Agent Run Test",
+			email: `${userId}@example.test`,
 		},
-	});
-	await db.user.createMany({
-		data: [
-			{
-				id: userId,
-				name: "Agent Run Test",
-				email: `${userId}@example.test`,
-			},
-			{
-				id: outsiderId,
-				name: "Agent Run Outsider",
-				email: `${outsiderId}@example.test`,
-			},
-		],
-	});
-	await db.member.create({
-		data: {
-			id: memberId,
-			organizationId: WORKSPACE_ID,
-			userId,
-			role: "member",
-			createdAt: new Date(),
+		{
+			id: outsiderId,
+			name: "Agent Run Outsider",
+			email: `${outsiderId}@example.test`,
 		},
-	});
-	const agent = await db.agentDefinition.create({
-		data: { name: "Run safely", status: "LIVE", createdById: userId },
-		select: { id: true },
-	});
+	]);
+	await one(
+		db
+			.insert(member)
+			.values({
+				id: memberId,
+				organizationId: WORKSPACE_ID,
+				userId,
+				role: "member",
+				createdAt: new Date(),
+			})
+			.returning(),
+	);
+	const agent = await one(
+		db
+			.insert(agentDefinition)
+			.values({ name: "Run safely", status: "LIVE", createdById: userId })
+			.returning({ id: agentDefinition.id }),
+	);
 	agentId = agent.id;
-	const version = await db.agentVersion.create({
-		data: {
-			agentId,
-			number: 1,
-			status: "DEPLOYED",
-			instructions: "Run once.",
-			manifest: {},
-			modelId: "test/model",
-			sandboxPolicy: {},
-			createdById: userId,
-		},
-		select: { id: true },
-	});
+	const version = await one(
+		db
+			.insert(agentVersion)
+			.values({
+				agentId,
+				number: 1,
+				status: "DEPLOYED",
+				instructions: "Run once.",
+				manifest: {},
+				modelId: "test/model",
+				sandboxPolicy: {},
+				createdById: userId,
+			})
+			.returning({ id: agentVersion.id }),
+	);
 	versionId = version.id;
-	await db.agentDefinition.update({
-		where: { id: agentId },
-		data: { currentVersionId: versionId },
-	});
+	await one(
+		db
+			.update(agentDefinition)
+			.set({ currentVersionId: versionId })
+			.where(eq(agentDefinition.id, agentId))
+			.returning(),
+	);
 });
 
 afterAll(async () => {
 	const agentIds = (
-		await db.agentDefinition.findMany({
-			where: { createdById: userId },
-			select: { id: true },
-		})
+		await db
+			.select({ id: agentDefinition.id })
+			.from(agentDefinition)
+			.where(eq(agentDefinition.createdById, userId))
 	).map((agent) => agent.id);
 	if (agentIds.length > 0) {
-		await db.agentRunEvent.deleteMany({
-			where: { run: { agentId: { in: agentIds } } },
-		});
-		await db.agentAction.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentAuditEvent.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentRun.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentDefinition.updateMany({
-			where: { id: { in: agentIds } },
-			data: { currentVersionId: null },
-		});
-		await db.agentVersion.deleteMany({
-			where: { agentId: { in: agentIds } },
-		});
-		await db.agentDefinition.deleteMany({
-			where: { id: { in: agentIds } },
-		});
+		await db
+			.delete(agentRunEvent)
+			.where(
+				inArray(
+					agentRunEvent.runId,
+					db
+						.select({ id: agentRun.id })
+						.from(agentRun)
+						.where(inArray(agentRun.agentId, agentIds)),
+				),
+			);
+		await db.delete(agentAction).where(inArray(agentAction.agentId, agentIds));
+		await db
+			.delete(agentAuditEvent)
+			.where(inArray(agentAuditEvent.agentId, agentIds));
+		await db.delete(agentRun).where(inArray(agentRun.agentId, agentIds));
+		await db
+			.update(agentDefinition)
+			.set({ currentVersionId: null })
+			.where(inArray(agentDefinition.id, agentIds));
+		await db
+			.delete(agentVersion)
+			.where(inArray(agentVersion.agentId, agentIds));
+		await db
+			.delete(agentDefinition)
+			.where(inArray(agentDefinition.id, agentIds));
 	}
-	await db.member.deleteMany({ where: { id: memberId } });
-	await db.user.deleteMany({ where: { id: { in: [userId, outsiderId] } } });
+	await db.delete(member).where(eq(member.id, memberId));
+	await db.delete(user).where(inArray(user.id, [userId, outsiderId]));
 });
 
 afterEach(async () => {
 	if (!agentId) return;
-	await db.agentRun.updateMany({
-		where: {
-			agentId,
-			status: { in: ["QUEUED", "RUNNING", "WAITING_FOR_APPROVAL"] },
-		},
-		data: {
+	await db
+		.update(agentRun)
+		.set({
 			status: "CANCELLED",
 			errorCode: "TEST_CLEANUP",
 			errorMessage: "Settled between tests.",
 			finishedAt: new Date(),
-		},
-	});
+		})
+		.where(
+			and(
+				eq(agentRun.agentId, agentId),
+				inArray(agentRun.status, ["QUEUED", "RUNNING", "WAITING_FOR_APPROVAL"]),
+			),
+		);
 });
 
 describe("manual agent runs", () => {
@@ -143,45 +173,54 @@ describe("manual agent runs", () => {
 		);
 		const startedAt = new Date("2026-08-05T12:00:00.000Z");
 		const completedAt = new Date("2026-08-05T12:00:02.000Z");
-		await db.agentRun.update({
-			where: { id: runId },
-			data: {
-				status: "SUCCEEDED",
-				summary: "Prepared the account brief",
-				modelId: "test/model",
-				inputTokens: 120,
-				outputTokens: 80,
-				costUsd: "0.012345",
-				startedAt,
-				finishedAt: completedAt,
-			},
-		});
-		await db.agentRunEvent.create({
-			data: {
-				runId,
-				sequence: 1,
-				type: "run.completed",
-				data: { summary: "Prepared the account brief" },
-				emittedAt: completedAt,
-			},
-		});
-		await db.agentAction.create({
-			data: {
-				agentId,
-				runId,
-				type: "timeline.note.created",
-				provider: "crm",
-				targetType: "company",
-				targetId: "company-1",
-				targetLabel: "Acme",
-				summary: "Added a meeting brief",
-				status: "SUCCEEDED",
-				idempotencyKey: `action-${clientRequestId}`,
-				plannedAt: startedAt,
-				startedAt,
-				completedAt,
-			},
-		});
+		await one(
+			db
+				.update(agentRun)
+				.set({
+					status: "SUCCEEDED",
+					summary: "Prepared the account brief",
+					modelId: "test/model",
+					inputTokens: 120,
+					outputTokens: 80,
+					costUsd: new Decimal("0.012345"),
+					startedAt,
+					finishedAt: completedAt,
+				})
+				.where(eq(agentRun.id, runId))
+				.returning(),
+		);
+		await one(
+			db
+				.insert(agentRunEvent)
+				.values({
+					runId,
+					sequence: 1,
+					type: "run.completed",
+					data: { summary: "Prepared the account brief" },
+					emittedAt: completedAt,
+				})
+				.returning(),
+		);
+		await one(
+			db
+				.insert(agentAction)
+				.values({
+					agentId,
+					runId,
+					type: "timeline.note.created",
+					provider: "crm",
+					targetType: "company",
+					targetId: "company-1",
+					targetLabel: "Acme",
+					summary: "Added a meeting brief",
+					status: "SUCCEEDED",
+					idempotencyKey: `action-${clientRequestId}`,
+					plannedAt: startedAt,
+					startedAt,
+					completedAt,
+				})
+				.returning(),
+		);
 
 		const [runs, activity] = await Promise.all([
 			service.list(agentId, 1, userId),
@@ -226,14 +265,16 @@ describe("manual agent runs", () => {
 
 	it("rejects a manual run while an agent is not live", async () => {
 		const beforePokeCount = pokeCount;
-		const draft = await db.agentDefinition.create({
-			data: {
-				name: "Draft run guard",
-				status: "DRAFT",
-				createdById: userId,
-			},
-			select: { id: true },
-		});
+		const draft = await one(
+			db
+				.insert(agentDefinition)
+				.values({
+					name: "Draft run guard",
+					status: "DRAFT",
+					createdById: userId,
+				})
+				.returning({ id: agentDefinition.id }),
+		);
 
 		let runError: unknown;
 		try {
@@ -259,12 +300,17 @@ describe("manual agent runs", () => {
 
 		expect(new Set(results.map((result) => result.id)).size).toBe(1);
 		expect(
-			await db.agentRun.count({ where: { idempotencyKey: clientRequestId } }),
+			await db.$count(agentRun, eq(agentRun.idempotencyKey, clientRequestId)),
 		).toBe(1);
 		expect(
-			await db.agentAuditEvent.count({
-				where: { agentId, type: "run.requested", requestId: clientRequestId },
-			}),
+			await db.$count(
+				agentAuditEvent,
+				and(
+					eq(agentAuditEvent.agentId, agentId),
+					eq(agentAuditEvent.type, "run.requested"),
+					eq(agentAuditEvent.requestId, clientRequestId),
+				),
+			),
 		).toBe(1);
 		expect(pokeCount).toBe(beforePokeCount + 4);
 	});
@@ -289,15 +335,22 @@ describe("manual agent runs", () => {
 			"This agent already has an active run. Stop it or wait for it to finish.",
 		);
 		expect(
-			await db.agentRun.count({
-				where: {
-					agentId,
-					status: { in: ["QUEUED", "RUNNING", "WAITING_FOR_APPROVAL"] },
-				},
-			}),
+			await db.$count(
+				agentRun,
+				and(
+					eq(agentRun.agentId, agentId),
+					inArray(agentRun.status, [
+						"QUEUED",
+						"RUNNING",
+						"WAITING_FOR_APPROVAL",
+					]),
+				),
+			),
 		).toBe(1);
 		expect(
-			await db.agentRun.findUniqueOrThrow({ where: { id: first.id } }),
+			await one(
+				db.select().from(agentRun).where(eq(agentRun.id, first.id)).limit(1),
+			),
 		).toMatchObject({ status: "QUEUED" });
 	});
 
@@ -319,32 +372,40 @@ describe("manual agent runs", () => {
 			{ id: agentId, clientRequestId: crypto.randomUUID() },
 			userId,
 		);
-		await db.agentRun.update({
-			where: { id: first.id },
-			data: {
-				status: "FAILED",
-				errorCode: "TEST_FAILURE",
-				errorMessage: "Broke before the retry.",
-				finishedAt: new Date(),
-			},
-		});
-		const redeployed = await db.agentVersion.create({
-			data: {
-				agentId,
-				number: 2,
-				status: "DEPLOYED",
-				instructions: "Run differently.",
-				manifest: {},
-				modelId: "test/model",
-				sandboxPolicy: {},
-				createdById: userId,
-			},
-			select: { id: true },
-		});
-		await db.agentDefinition.update({
-			where: { id: agentId },
-			data: { currentVersionId: redeployed.id },
-		});
+		await one(
+			db
+				.update(agentRun)
+				.set({
+					status: "FAILED",
+					errorCode: "TEST_FAILURE",
+					errorMessage: "Broke before the retry.",
+					finishedAt: new Date(),
+				})
+				.where(eq(agentRun.id, first.id))
+				.returning(),
+		);
+		const redeployed = await one(
+			db
+				.insert(agentVersion)
+				.values({
+					agentId,
+					number: 2,
+					status: "DEPLOYED",
+					instructions: "Run differently.",
+					manifest: {},
+					modelId: "test/model",
+					sandboxPolicy: {},
+					createdById: userId,
+				})
+				.returning({ id: agentVersion.id }),
+		);
+		await one(
+			db
+				.update(agentDefinition)
+				.set({ currentVersionId: redeployed.id })
+				.where(eq(agentDefinition.id, agentId))
+				.returning(),
+		);
 
 		const clientRequestId = crypto.randomUUID();
 		try {
@@ -354,47 +415,73 @@ describe("manual agent runs", () => {
 			);
 
 			expect(
-				await db.agentRun.findUniqueOrThrow({
-					where: { id: retried.id },
-					select: { versionId: true },
-				}),
+				await one(
+					db
+						.select({ versionId: agentRun.versionId })
+						.from(agentRun)
+						.where(eq(agentRun.id, retried.id))
+						.limit(1),
+				),
 			).toEqual({ versionId });
 			expect(
-				await db.agentAuditEvent.findFirstOrThrow({
-					where: { agentId, type: "run.requested", requestId: clientRequestId },
-					select: { versionId: true },
-				}),
+				await one(
+					db
+						.select({ versionId: agentAuditEvent.versionId })
+						.from(agentAuditEvent)
+						.where(
+							and(
+								eq(agentAuditEvent.agentId, agentId),
+								eq(agentAuditEvent.type, "run.requested"),
+								eq(agentAuditEvent.requestId, clientRequestId),
+							),
+						)
+						.limit(1),
+				),
 			).toEqual({ versionId });
 		} finally {
-			await db.agentDefinition.update({
-				where: { id: agentId },
-				data: { currentVersionId: versionId },
-			});
+			await one(
+				db
+					.update(agentDefinition)
+					.set({ currentVersionId: versionId })
+					.where(eq(agentDefinition.id, agentId))
+					.returning(),
+			);
 		}
 	});
 
 	it("allows only one agent to claim a globally reused request id", async () => {
-		const otherAgent = await db.agentDefinition.create({
-			data: { name: "Other live agent", status: "LIVE", createdById: userId },
-			select: { id: true },
-		});
-		const otherVersion = await db.agentVersion.create({
-			data: {
-				agentId: otherAgent.id,
-				number: 1,
-				status: "DEPLOYED",
-				instructions: "Run once.",
-				manifest: {},
-				modelId: "test/model",
-				sandboxPolicy: {},
-				createdById: userId,
-			},
-			select: { id: true },
-		});
-		await db.agentDefinition.update({
-			where: { id: otherAgent.id },
-			data: { currentVersionId: otherVersion.id },
-		});
+		const otherAgent = await one(
+			db
+				.insert(agentDefinition)
+				.values({
+					name: "Other live agent",
+					status: "LIVE",
+					createdById: userId,
+				})
+				.returning({ id: agentDefinition.id }),
+		);
+		const otherVersion = await one(
+			db
+				.insert(agentVersion)
+				.values({
+					agentId: otherAgent.id,
+					number: 1,
+					status: "DEPLOYED",
+					instructions: "Run once.",
+					manifest: {},
+					modelId: "test/model",
+					sandboxPolicy: {},
+					createdById: userId,
+				})
+				.returning({ id: agentVersion.id }),
+		);
+		await one(
+			db
+				.update(agentDefinition)
+				.set({ currentVersionId: otherVersion.id })
+				.where(eq(agentDefinition.id, otherAgent.id))
+				.returning(),
+		);
 		const clientRequestId = crypto.randomUUID();
 
 		const attempts = await Promise.allSettled([
@@ -408,7 +495,7 @@ describe("manual agent runs", () => {
 			attempts.filter((attempt) => attempt.status === "rejected"),
 		).toHaveLength(1);
 		expect(
-			await db.agentRun.count({ where: { idempotencyKey: clientRequestId } }),
+			await db.$count(agentRun, eq(agentRun.idempotencyKey, clientRequestId)),
 		).toBe(1);
 	});
 });
@@ -432,10 +519,17 @@ describe("cancelling a run", () => {
 		expect(result.cancelled).toBe(true);
 		expect(cancelPokes).toEqual([runId]);
 
-		const run = await db.agentRun.findUniqueOrThrow({
-			where: { id: runId },
-			select: { status: true, errorCode: true, finishedAt: true },
-		});
+		const run = await one(
+			db
+				.select({
+					status: agentRun.status,
+					errorCode: agentRun.errorCode,
+					finishedAt: agentRun.finishedAt,
+				})
+				.from(agentRun)
+				.where(eq(agentRun.id, runId))
+				.limit(1),
+		);
 		expect(run.status).toBe("CANCELLED");
 		expect(run.errorCode).toBe("CANCELLED_BY_USER");
 		expect(run.finishedAt).not.toBeNull();
@@ -445,54 +539,62 @@ describe("cancelling a run", () => {
 		const runId = await queuedRun();
 		await service.cancelRun({ id: agentId, runId }, userId);
 
-		const events = await db.agentRunEvent.findMany({
-			where: { runId, type: "run.cancelled" },
-			select: { id: true },
-		});
+		const events = await db
+			.select({ id: agentRunEvent.id })
+			.from(agentRunEvent)
+			.where(
+				and(
+					eq(agentRunEvent.runId, runId),
+					eq(agentRunEvent.type, "run.cancelled"),
+				),
+			);
 		expect(events).toHaveLength(1);
 		expect(events[0]?.id).toBe(`run-terminal:${runId}:cancelled`);
 
 		expect(
-			await db.agentAuditEvent.count({
-				where: { agentId, type: "run.cancelled", requestId: runId },
-			}),
+			await db.$count(
+				agentAuditEvent,
+				and(
+					eq(agentAuditEvent.agentId, agentId),
+					eq(agentAuditEvent.type, "run.cancelled"),
+					eq(agentAuditEvent.requestId, runId),
+				),
+			),
 		).toBe(1);
 	});
 
 	it("cancels outstanding actions so nothing is left running", async () => {
 		const runId = await queuedRun();
-		await db.agentAction.createMany({
-			data: [
-				{
-					agentId,
-					runId,
-					type: "crm.activity.create",
-					provider: "crm",
-					summary: "Planned note",
-					status: "PLANNED",
-					idempotencyKey: `${runId}:planned`,
-					requestHash: "planned",
-				},
-				{
-					agentId,
-					runId,
-					type: "slack.message.post",
-					provider: "slack",
-					summary: "Already posted",
-					status: "SUCCEEDED",
-					idempotencyKey: `${runId}:done`,
-					requestHash: "done",
-				},
-			],
-		});
+		await db.insert(agentAction).values([
+			{
+				agentId,
+				runId,
+				type: "crm.activity.create",
+				provider: "crm",
+				summary: "Planned note",
+				status: "PLANNED",
+				idempotencyKey: `${runId}:planned`,
+				requestHash: "planned",
+			},
+			{
+				agentId,
+				runId,
+				type: "slack.message.post",
+				provider: "slack",
+				summary: "Already posted",
+				status: "SUCCEEDED",
+				idempotencyKey: `${runId}:done`,
+				requestHash: "done",
+			},
+		]);
 
 		await service.cancelRun({ id: agentId, runId }, userId);
 
-		const actions = await db.agentAction.findMany({
-			where: { runId },
-			orderBy: { idempotencyKey: "asc" },
-			select: { status: true },
-		});
+		const actions = await db
+			.select({ status: agentAction.status })
+			.from(agentAction)
+			.where(eq(agentAction.runId, runId))
+			.orderBy(asc(agentAction.idempotencyKey));
 		expect(actions.map((action) => action.status)).toEqual([
 			"SUCCEEDED",
 			"CANCELLED",
@@ -510,16 +612,25 @@ describe("cancelling a run", () => {
 		expect(again.status).toBe("CANCELLED");
 		expect(cancelPokes).toEqual([]);
 		expect(
-			await db.agentRunEvent.count({ where: { runId, type: "run.cancelled" } }),
+			await db.$count(
+				agentRunEvent,
+				and(
+					eq(agentRunEvent.runId, runId),
+					eq(agentRunEvent.type, "run.cancelled"),
+				),
+			),
 		).toBe(1);
 	});
 
 	it("leaves a finished run alone", async () => {
 		const runId = await queuedRun();
-		await db.agentRun.update({
-			where: { id: runId },
-			data: { status: "SUCCEEDED", finishedAt: new Date() },
-		});
+		await one(
+			db
+				.update(agentRun)
+				.set({ status: "SUCCEEDED", finishedAt: new Date() })
+				.where(eq(agentRun.id, runId))
+				.returning(),
+		);
 
 		const result = await service.cancelRun({ id: agentId, runId }, userId);
 
@@ -529,10 +640,12 @@ describe("cancelling a run", () => {
 
 	it("refuses a run id that belongs to another agent", async () => {
 		const runId = await queuedRun();
-		const other = await db.agentDefinition.create({
-			data: { name: "Unrelated", status: "LIVE", createdById: userId },
-			select: { id: true },
-		});
+		const other = await one(
+			db
+				.insert(agentDefinition)
+				.values({ name: "Unrelated", status: "LIVE", createdById: userId })
+				.returning({ id: agentDefinition.id }),
+		);
 
 		let error: Error | null = null;
 		try {
@@ -569,10 +682,13 @@ describe("cancelling a run", () => {
 
 	it("asks the agent again until the cancellation lands", async () => {
 		const runId = await queuedRun();
-		await db.agentRun.update({
-			where: { id: runId },
-			data: { status: "RUNNING", startedAt: new Date() },
-		});
+		await one(
+			db
+				.update(agentRun)
+				.set({ status: "RUNNING", startedAt: new Date() })
+				.where(eq(agentRun.id, runId))
+				.returning(),
+		);
 		await service.cancelRun({ id: agentId, runId }, userId);
 
 		const trigger = new AgentTriggerService(db);

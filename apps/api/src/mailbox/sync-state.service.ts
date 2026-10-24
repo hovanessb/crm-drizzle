@@ -1,8 +1,17 @@
 import {
+	and,
 	type Db,
+	eq,
 	GoogleSyncStatus,
-	type MailboxSyncModel as MailboxSync,
-	type Prisma,
+	inArray,
+	isNull,
+	lte,
+	type MailboxSync,
+	mailboxSync,
+	type NewMailboxSync,
+	notInArray,
+	or,
+	sql,
 } from "@crm/db";
 import { Injectable, Logger } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
@@ -17,45 +26,63 @@ export class SyncStateService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async get(userId: string, source: SyncSource): Promise<MailboxSync | null> {
-		return this.db.mailboxSync.findUnique({
-			where: { userId_source: { userId, source } },
-		});
+		const [row] = await this.db
+			.select()
+			.from(mailboxSync)
+			.where(
+				and(eq(mailboxSync.userId, userId), eq(mailboxSync.source, source)),
+			)
+			.limit(1);
+		return row ?? null;
 	}
 
 	async listForUser(
 		userId: string,
 		sources?: readonly SyncSource[],
 	): Promise<MailboxSync[]> {
-		const where: Prisma.MailboxSyncWhereInput = { userId };
-		if (sources) where.source = { in: [...sources] };
-
-		return this.db.mailboxSync.findMany({ where });
+		return this.db
+			.select()
+			.from(mailboxSync)
+			.where(
+				and(
+					eq(mailboxSync.userId, userId),
+					sources ? inArray(mailboxSync.source, [...sources]) : undefined,
+				),
+			);
 	}
 
 	async due(now: Date): Promise<MailboxSync[]> {
-		return this.db.mailboxSync.findMany({
-			where: dueWhere(now),
-			orderBy: [{ lastSyncedAt: { sort: "asc", nulls: "first" } }],
-		});
+		return this.db
+			.select()
+			.from(mailboxSync)
+			.where(dueWhere(now))
+			.orderBy(sql`${mailboxSync.lastSyncedAt} asc nulls first`);
 	}
 
 	async claim(row: MailboxSync, now: Date): Promise<boolean> {
-		const { count } = await this.db.mailboxSync.updateMany({
-			where: { id: row.id, updatedAt: row.updatedAt, ...dueWhere(now) },
-			data: {
+		const claimed = await this.db
+			.update(mailboxSync)
+			.set({
 				status: GoogleSyncStatus.RUNNING,
 				retryAfter: new Date(now.getTime() + SYNC_LEASE_MS),
-			},
-		});
+			})
+			.where(
+				and(
+					eq(mailboxSync.id, row.id),
+					eq(mailboxSync.updatedAt, row.updatedAt),
+					dueWhere(now),
+				),
+			)
+			.returning({ id: mailboxSync.id });
 
-		return count === 1;
+		return claimed.length === 1;
 	}
 
 	async release(id: string): Promise<void> {
-		await this.db.mailboxSync.updateMany({
-			where: { id },
-			data: { retryAfter: null },
-		});
+		await this.db
+			.update(mailboxSync)
+			.set({ retryAfter: null })
+			.where(eq(mailboxSync.id, id));
 	}
 
 	async ensure(
@@ -63,27 +90,30 @@ export class SyncStateService {
 		source: SyncSource,
 		options: { autoCreate: boolean },
 	): Promise<MailboxSync> {
-		return this.db.mailboxSync.upsert({
-			where: { userId_source: { userId, source } },
-			create: {
+		const [row] = await this.db
+			.insert(mailboxSync)
+			.values({
 				userId,
 				source,
 				status: GoogleSyncStatus.IDLE,
 				autoCreate: options.autoCreate,
-			},
-			update: {
-				status: GoogleSyncStatus.IDLE,
-				lastError: null,
-				retryAfter: null,
-			},
-		});
+			})
+			.onConflictDoUpdate({
+				target: [mailboxSync.userId, mailboxSync.source],
+				set: {
+					status: GoogleSyncStatus.IDLE,
+					lastError: null,
+					retryAfter: null,
+				},
+			})
+			.returning();
+		if (!row)
+			throw new Error(`The ${source} sync row for ${userId} was not written.`);
+		return row;
 	}
 
 	async markRunning(id: string): Promise<void> {
-		await this.db.mailboxSync.update({
-			where: { id },
-			data: { status: GoogleSyncStatus.RUNNING, lastError: null },
-		});
+		await this.write(id, { status: GoogleSyncStatus.RUNNING, lastError: null });
 	}
 
 	async settle(
@@ -93,14 +123,11 @@ export class SyncStateService {
 			status: GoogleSyncStatus;
 		},
 	): Promise<void> {
-		await this.db.mailboxSync.update({
-			where: { id },
-			data: {
-				...update,
-				lastSyncedAt: new Date(),
-				lastError: null,
-				retryAfter: null,
-			},
+		await this.write(id, {
+			...update,
+			lastSyncedAt: new Date(),
+			lastError: null,
+			retryAfter: null,
 		});
 	}
 
@@ -111,46 +138,34 @@ export class SyncStateService {
 			reason,
 		});
 
-		await this.db.mailboxSync.update({
-			where: { id },
-			data: {
-				cursor: null,
-				status: GoogleSyncStatus.IDLE,
-				lastError: null,
-				retryAfter: null,
-			},
+		await this.write(id, {
+			cursor: null,
+			status: GoogleSyncStatus.IDLE,
+			lastError: null,
+			retryAfter: null,
 		});
 	}
 
 	async markNeedsReconnect(id: string, reason: string): Promise<void> {
-		await this.db.mailboxSync.update({
-			where: { id },
-			data: {
-				status: GoogleSyncStatus.NEEDS_RECONNECT,
-				lastError: reason,
-				retryAfter: null,
-			},
+		await this.write(id, {
+			status: GoogleSyncStatus.NEEDS_RECONNECT,
+			lastError: reason,
+			retryAfter: null,
 		});
 	}
 
 	async markRateLimited(id: string, retryAfterMs: number): Promise<void> {
-		await this.db.mailboxSync.update({
-			where: { id },
-			data: {
-				status: GoogleSyncStatus.IDLE,
-				retryAfter: new Date(Date.now() + retryAfterMs),
-			},
+		await this.write(id, {
+			status: GoogleSyncStatus.IDLE,
+			retryAfter: new Date(Date.now() + retryAfterMs),
 		});
 	}
 
 	async markFailed(id: string, reason: string): Promise<void> {
-		await this.db.mailboxSync.update({
-			where: { id },
-			data: {
-				status: GoogleSyncStatus.FAILED,
-				lastError: reason,
-				retryAfter: null,
-			},
+		await this.write(id, {
+			status: GoogleSyncStatus.FAILED,
+			lastError: reason,
+			retryAfter: null,
 		});
 	}
 
@@ -159,23 +174,41 @@ export class SyncStateService {
 		source: SyncSource,
 		enabled: boolean,
 	): Promise<void> {
-		await this.db.mailboxSync.updateMany({
-			where: { userId, source },
-			data: { autoCreate: enabled },
-		});
+		await this.db
+			.update(mailboxSync)
+			.set({ autoCreate: enabled })
+			.where(
+				and(eq(mailboxSync.userId, userId), eq(mailboxSync.source, source)),
+			);
 	}
 
 	async remove(userId: string, source?: SyncSource): Promise<void> {
-		const where: Prisma.MailboxSyncWhereInput = { userId };
-		if (source) where.source = source;
+		await this.db
+			.delete(mailboxSync)
+			.where(
+				and(
+					eq(mailboxSync.userId, userId),
+					source ? eq(mailboxSync.source, source) : undefined,
+				),
+			);
+	}
 
-		await this.db.mailboxSync.deleteMany({ where });
+	private async write(
+		id: string,
+		data: Partial<NewMailboxSync>,
+	): Promise<void> {
+		const [row] = await this.db
+			.update(mailboxSync)
+			.set(data)
+			.where(eq(mailboxSync.id, id))
+			.returning({ id: mailboxSync.id });
+		if (!row) throw new Error(`No mailbox sync row with id ${id}.`);
 	}
 }
 
 function dueWhere(now: Date) {
-	return {
-		status: { notIn: [GoogleSyncStatus.NEEDS_RECONNECT] },
-		OR: [{ retryAfter: null }, { retryAfter: { lte: now } }],
-	};
+	return and(
+		notInArray(mailboxSync.status, [GoogleSyncStatus.NEEDS_RECONNECT]),
+		or(isNull(mailboxSync.retryAfter), lte(mailboxSync.retryAfter, now)),
+	);
 }

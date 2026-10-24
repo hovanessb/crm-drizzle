@@ -2,7 +2,7 @@ import {
 	chatEventPurpose,
 	createChatEventSecretBox,
 } from "@crm/auth/chat-event-crypto";
-import type { Prisma } from "@crm/db";
+import type { JsonValue } from "@crm/db";
 import {
 	publicEveEventData,
 	publicEveEventInput,
@@ -14,23 +14,23 @@ type BuilderEventIdentity = {
 };
 
 type StoredBuilderEvent = {
-	data: Prisma.InputJsonValue;
+	data: JsonValue;
 	encryptedData: string | null;
 };
 
 type BuilderEventRecord = {
-	data: Prisma.JsonValue;
+	data: JsonValue;
 	encryptedData: string | null;
 };
 
 type RuntimeEventValue =
-	| Prisma.InputJsonValue
+	| JsonValue
 	| undefined
 	| RuntimeEventValue[]
 	| { [key: string]: RuntimeEventValue };
 
 export function storeBuilderEvent(
-	value: Prisma.InputJsonValue,
+	value: JsonValue,
 	identity: BuilderEventIdentity,
 ): StoredBuilderEvent {
 	const box = createChatEventSecretBox();
@@ -56,7 +56,7 @@ export function prepareBuilderEventForStorage(
 export function readBuilderEvent(
 	record: BuilderEventRecord,
 	identity: BuilderEventIdentity,
-): Prisma.JsonValue | null {
+): JsonValue | null {
 	if (!record.encryptedData) return record.data;
 	const box = createChatEventSecretBox();
 	if (!box) return null;

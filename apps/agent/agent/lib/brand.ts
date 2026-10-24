@@ -1,8 +1,18 @@
-import { db, EnrichmentStatus } from "@crm/db";
+import {
+	and,
+	companyEnrichment,
+	company as companyTable,
+	db,
+	EnrichmentStatus,
+	eq,
+	orNull,
+	requireRow,
+	whereEq,
+} from "@crm/db";
 import { mirrorBrandImages } from "./brand-images";
 import { brandToUpdate, filledFields, stillFillable } from "./brand-mapping";
 import { brandByDomain, contextDevEnabled } from "./context-dev";
-import { UNLESS_COMPLETE } from "./enrichment";
+import { guardSql, UNLESS_COMPLETE } from "./enrichment";
 
 export type BrandResult = {
 	enriched: boolean;
@@ -51,10 +61,12 @@ export async function runBrand({
 	fresh?: boolean;
 	spend?: Spend;
 }): Promise<BrandResult> {
-	const company = await db.company.findUnique({
-		where: { id: companyId },
-		select: COMPANY_FIELDS,
-	});
+	const company = await db.query.company
+		.findFirst({
+			where: eq(companyTable.id, companyId),
+			columns: COMPANY_FIELDS,
+		})
+		.then(orNull);
 
 	if (!company) return { enriched: false, reason: "No such company." };
 
@@ -78,13 +90,18 @@ export async function runBrand({
 	const charge = spend(2);
 	if (!charge.ok) return { enriched: false, reason: charge.reason };
 
-	await db.company.updateMany({
-		where: { id: companyId, ...UNLESS_COMPLETE },
-		data: {
+	await db
+		.update(companyTable)
+		.set({
 			enrichmentStatus: EnrichmentStatus.RUNNING,
 			enrichmentError: null,
-		},
-	});
+		})
+		.where(
+			and(
+				eq(companyTable.id, companyId),
+				guardSql(companyTable, UNLESS_COMPLETE),
+			),
+		);
 
 	const result = await brandByDomain(company.domain, fresh ? 0 : undefined);
 
@@ -106,31 +123,41 @@ export async function runBrand({
 
 	const { mirrored } = await mirrorBrandImages(companyId, update);
 
-	const filled = await db.$transaction(async (tx) => {
-		const current = await tx.company.findUnique({
-			where: { id: companyId },
-			select: COMPANY_FIELDS,
-		});
+	const filled = await db.transaction(async (tx) => {
+		const current = await tx.query.company
+			.findFirst({
+				where: eq(companyTable.id, companyId),
+				columns: COMPANY_FIELDS,
+			})
+			.then(orNull);
 
 		if (!current) return null;
 
 		const data = stillFillable(update, snapshot(current));
 
-		await tx.company.update({
-			where: { id: companyId },
-			data: {
-				...data,
-				enrichmentStatus: EnrichmentStatus.COMPLETE,
-				enrichedAt: new Date(),
-				enrichmentError: null,
-			},
-		});
+		await requireRow(
+			tx
+				.update(companyTable)
+				.set({
+					...data,
+					enrichmentStatus: EnrichmentStatus.COMPLETE,
+					enrichedAt: new Date(),
+					enrichmentError: null,
+				})
+				.where(whereEq(companyTable.id, companyId))
+				.returning(),
+		);
 
-		await tx.companyEnrichment.upsert({
-			where: { companyId },
-			create: { companyId, raw: result.raw as object },
-			update: { raw: result.raw as object, fetchedAt: new Date() },
-		});
+		await requireRow(
+			tx
+				.insert(companyEnrichment)
+				.values({ companyId, raw: result.raw as object })
+				.onConflictDoUpdate({
+					target: companyEnrichment.companyId,
+					set: { raw: result.raw as object, fetchedAt: new Date() },
+				})
+				.returning(),
+		);
 
 		return filledFields(data);
 	});
@@ -173,8 +200,8 @@ async function settle(
 	error: string,
 	guard: SettleGuard = { enrichmentStatus: EnrichmentStatus.RUNNING },
 ): Promise<void> {
-	await db.company.updateMany({
-		where: { id: companyId, ...guard },
-		data: { enrichmentStatus: status, enrichmentError: error },
-	});
+	await db
+		.update(companyTable)
+		.set({ enrichmentStatus: status, enrichmentError: error })
+		.where(and(eq(companyTable.id, companyId), guardSql(companyTable, guard)));
 }

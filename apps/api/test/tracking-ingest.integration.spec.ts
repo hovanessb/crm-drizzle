@@ -6,7 +6,19 @@ import {
 	expect,
 	it,
 } from "bun:test";
-import { db } from "@crm/db";
+import {
+	and,
+	asc,
+	db,
+	eq,
+	formSubmission,
+	inArray,
+	isNull,
+	startsWith,
+	trackedDomain,
+	trackedEvent,
+	trackingCounter,
+} from "@crm/db";
 import { EVENTS_PER_MINUTE, type TrackingConfig } from "@crm/db/tracking";
 import type { TrackingConfigService } from "../src/tracking/tracking-config.service";
 import { TrackingCounterService } from "../src/tracking/tracking-counter.service";
@@ -15,6 +27,7 @@ import {
 	type IncomingEvent,
 	TrackingIngestService,
 } from "../src/tracking/tracking-ingest.service";
+import { first } from "./rows";
 
 const suffix = process.env.TEST_RUN_ID ?? "ingest-spec";
 const parent = `sites-${suffix}.test`;
@@ -46,12 +59,12 @@ const filed: string[] = [];
 
 const filing = {
 	file: async ({ id }: { id: string }) => {
-		const claimed = await db.formSubmission.updateMany({
-			where: { id, filedAt: null },
-			data: { filedAt: new Date() },
-		});
+		const claimed = await db
+			.update(formSubmission)
+			.set({ filedAt: new Date() })
+			.where(and(eq(formSubmission.id, id), isNull(formSubmission.filedAt)));
 
-		if (claimed.count === 0) {
+		if (claimed.rowCount === 0) {
 			return { filed: false as const, reason: "another delivery filed it" };
 		}
 
@@ -93,14 +106,14 @@ function view(host: string, path = "/pricing"): IncomingEvent {
 
 async function clean() {
 	for (const host of [parent, child, exact]) {
-		await db.formSubmission.deleteMany({ where: { host } });
-		await db.trackedEvent.deleteMany({ where: { host } });
+		await db.delete(formSubmission).where(eq(formSubmission.host, host));
+		await db.delete(trackedEvent).where(eq(trackedEvent.host, host));
 	}
 
-	await db.trackedDomain.deleteMany({
-		where: { host: { in: [parent, exact] } },
-	});
-	await db.trackingCounter.deleteMany({ where: {} });
+	await db
+		.delete(trackedDomain)
+		.where(inArray(trackedDomain.host, [parent, exact]));
+	await db.delete(trackingCounter);
 }
 
 beforeAll(clean);
@@ -108,12 +121,10 @@ beforeAll(clean);
 beforeEach(async () => {
 	filed.length = 0;
 	await clean();
-	await db.trackedDomain.createMany({
-		data: [
-			{ host: parent, scope: "SITE_AND_SUBDOMAINS" },
-			{ host: exact, scope: "EXACT_HOST" },
-		],
-	});
+	await db.insert(trackedDomain).values([
+		{ host: parent, scope: "SITE_AND_SUBDOMAINS" },
+		{ host: exact, scope: "EXACT_HOST" },
+	]);
 });
 
 afterAll(clean);
@@ -122,10 +133,13 @@ describe("counting page views against a domain", () => {
 	it("credits a subdomain's views to the parent that covers it", async () => {
 		await accept([view(child), view(child), view(parent)]);
 
-		const row = await db.trackedDomain.findUnique({
-			where: { host: parent },
-			select: { pageViews: true },
-		});
+		const row = await first(
+			db
+				.select({ pageViews: trackedDomain.pageViews })
+				.from(trackedDomain)
+				.where(eq(trackedDomain.host, parent))
+				.limit(1),
+		);
 
 		expect(row?.pageViews).toBe(3);
 	});
@@ -133,11 +147,11 @@ describe("counting page views against a domain", () => {
 	it("gives each domain only the views that were its own", async () => {
 		await accept([view(child), view(exact), view(exact)]);
 
-		const rows = await db.trackedDomain.findMany({
-			where: { host: { in: [parent, exact] } },
-			select: { host: true, pageViews: true },
-			orderBy: { host: "asc" },
-		});
+		const rows = await db
+			.select({ host: trackedDomain.host, pageViews: trackedDomain.pageViews })
+			.from(trackedDomain)
+			.where(inArray(trackedDomain.host, [parent, exact]))
+			.orderBy(asc(trackedDomain.host));
 
 		expect(rows.find((row) => row.host === parent)?.pageViews).toBe(1);
 		expect(rows.find((row) => row.host === exact)?.pageViews).toBe(2);
@@ -149,10 +163,13 @@ describe("counting page views against a domain", () => {
 			{ type: "click", host: parent, path: "/pricing", at: Date.now() },
 		]);
 
-		const row = await db.trackedDomain.findUnique({
-			where: { host: parent },
-			select: { pageViews: true },
-		});
+		const row = await first(
+			db
+				.select({ pageViews: trackedDomain.pageViews })
+				.from(trackedDomain)
+				.where(eq(trackedDomain.host, parent))
+				.limit(1),
+		);
 
 		expect(row?.pageViews).toBe(1);
 	});
@@ -162,16 +179,19 @@ describe("the rate limit", () => {
 	it("charges every event in the batch, not one per request", async () => {
 		await accept([view(parent), view(parent), view(parent)]);
 
-		const counter = await db.trackingCounter.findFirst({
-			where: { key: { startsWith: "rate:" } },
-			select: { value: true },
-		});
+		const counter = await first(
+			db
+				.select({ value: trackingCounter.value })
+				.from(trackingCounter)
+				.where(startsWith(trackingCounter.key, "rate:"))
+				.limit(1),
+		);
 
 		expect(counter?.value).toBe(3);
 	});
 
 	it("stops writing once the window is spent", async () => {
-		await db.trackingCounter.deleteMany({ where: {} });
+		await db.delete(trackingCounter);
 
 		for (const key of spendableWindows()) {
 			await counters.take(key, EVENTS_PER_MINUTE, EVENTS_PER_MINUTE);
@@ -179,21 +199,27 @@ describe("the rate limit", () => {
 
 		await accept([view(parent)]);
 
-		expect(await db.trackedEvent.count({ where: { host: parent } })).toBe(0);
+		expect(await db.$count(trackedEvent, eq(trackedEvent.host, parent))).toBe(
+			0,
+		);
 	});
 
 	it("does not spend the window on a batch it refuses", async () => {
-		await db.trackingCounter.deleteMany({ where: {} });
+		await db.delete(trackingCounter);
 
 		for (const key of spendableWindows()) {
 			await counters.take(key, EVENTS_PER_MINUTE, EVENTS_PER_MINUTE - 1);
 		}
 
 		await accept([view(parent), view(parent)]);
-		expect(await db.trackedEvent.count({ where: { host: parent } })).toBe(0);
+		expect(await db.$count(trackedEvent, eq(trackedEvent.host, parent))).toBe(
+			0,
+		);
 
 		await accept([view(parent)]);
-		expect(await db.trackedEvent.count({ where: { host: parent } })).toBe(1);
+		expect(await db.$count(trackedEvent, eq(trackedEvent.host, parent))).toBe(
+			1,
+		);
 	});
 });
 
@@ -210,10 +236,13 @@ describe("what a stored event keeps", () => {
 			},
 		]);
 
-		const row = await db.trackedEvent.findFirst({
-			where: { host: parent },
-			select: { path: true, referrer: true },
-		});
+		const row = await first(
+			db
+				.select({ path: trackedEvent.path, referrer: trackedEvent.referrer })
+				.from(trackedEvent)
+				.where(eq(trackedEvent.host, parent))
+				.limit(1),
+		);
 
 		expect(row?.path).toBe("/pricing");
 		expect(row?.referrer).toBe("https://elsewhere.test/reset");
@@ -232,10 +261,16 @@ describe("what a stored event keeps", () => {
 			},
 		]);
 
-		const row = await db.formSubmission.findFirst({
-			where: { host: parent },
-			select: { firstTouch: true, lastTouch: true },
-		});
+		const row = await first(
+			db
+				.select({
+					firstTouch: formSubmission.firstTouch,
+					lastTouch: formSubmission.lastTouch,
+				})
+				.from(formSubmission)
+				.where(eq(formSubmission.host, parent))
+				.limit(1),
+		);
 
 		expect(JSON.stringify(row)).not.toContain("token=secret");
 	});
@@ -256,15 +291,17 @@ describe("a batch delivered twice", () => {
 		await accept([submission], id);
 		expect(filed).toHaveLength(1);
 
-		await db.formSubmission.updateMany({
-			where: { host: parent },
-			data: { filedAt: null, contactId: null, skipReason: null },
-		});
+		await db
+			.update(formSubmission)
+			.set({ filedAt: null, contactId: null, skipReason: null })
+			.where(eq(formSubmission.host, parent));
 
 		await accept([submission], id);
 
 		expect(filed).toHaveLength(2);
-		expect(await db.formSubmission.count({ where: { host: parent } })).toBe(1);
+		expect(
+			await db.$count(formSubmission, eq(formSubmission.host, parent)),
+		).toBe(1);
 	});
 
 	it("files once when both deliveries arrive together", async () => {
@@ -280,7 +317,9 @@ describe("a batch delivered twice", () => {
 		const id = visitorId();
 		await Promise.all([accept([submission], id), accept([submission], id)]);
 
-		expect(await db.formSubmission.count({ where: { host: parent } })).toBe(1);
+		expect(
+			await db.$count(formSubmission, eq(formSubmission.host, parent)),
+		).toBe(1);
 		expect(filed).toHaveLength(1);
 	});
 
@@ -296,10 +335,10 @@ describe("a batch delivered twice", () => {
 
 		const id = visitorId();
 		await accept([submission], id);
-		await db.formSubmission.updateMany({
-			where: { host: parent },
-			data: { filedAt: new Date() },
-		});
+		await db
+			.update(formSubmission)
+			.set({ filedAt: new Date() })
+			.where(eq(formSubmission.host, parent));
 
 		await accept([submission], id);
 
@@ -317,7 +356,9 @@ describe("a batch that looks scripted", () => {
 			{ type: "page_view", host: parent, path: "/c", at },
 		]);
 
-		expect(await db.trackedEvent.count({ where: { host: parent } })).toBe(0);
+		expect(await db.$count(trackedEvent, eq(trackedEvent.host, parent))).toBe(
+			0,
+		);
 	});
 
 	it("keeps a batch whose events carry no timestamp at all", async () => {
@@ -327,7 +368,9 @@ describe("a batch that looks scripted", () => {
 			{ type: "page_view", host: parent, path: "/c" },
 		]);
 
-		expect(await db.trackedEvent.count({ where: { host: parent } })).toBe(3);
+		expect(await db.$count(trackedEvent, eq(trackedEvent.host, parent))).toBe(
+			3,
+		);
 	});
 });
 

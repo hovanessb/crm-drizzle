@@ -13,7 +13,23 @@ import {
 	WORKSPACE_ID,
 	workspaceRoleOf,
 } from "@crm/auth/organization";
-import type { Db } from "@crm/db";
+import {
+	agentDefinition,
+	agentTask,
+	and,
+	type Db,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	mcpClientRegistration,
+	mcpConnection,
+	mcpOauthState,
+	mcpToolSnapshot,
+	type NewMcpConnection,
+} from "@crm/db";
 import { PRIORITY } from "@crm/db/agent-tasks";
 import {
 	vendorAccess,
@@ -162,32 +178,32 @@ export class McpConnectionsService {
 	async list(userId: string) {
 		const [role, connections, agentRows] = await Promise.all([
 			workspaceRoleOf(userId, this.db),
-			this.db.mcpConnection.findMany({
-				where: { organizationId: WORKSPACE_ID },
-				select: {
-					platformSlug: true,
-					status: true,
-					accessMode: true,
-					grantedScopes: true,
-					connectedAt: true,
-					lastSuccessfulCallAt: true,
-					lastErrorCode: true,
-				},
-			}),
-			this.db.agentDefinition.findMany({
-				where: {
-					status: { in: ["LIVE", "PAUSED"] },
-					deletedAt: null,
-					currentVersionId: { not: null },
-				},
-				orderBy: { updatedAt: "desc" },
-				select: {
+			this.db
+				.select({
+					platformSlug: mcpConnection.platformSlug,
+					status: mcpConnection.status,
+					accessMode: mcpConnection.accessMode,
+					grantedScopes: mcpConnection.grantedScopes,
+					connectedAt: mcpConnection.connectedAt,
+					lastSuccessfulCallAt: mcpConnection.lastSuccessfulCallAt,
+					lastErrorCode: mcpConnection.lastErrorCode,
+				})
+				.from(mcpConnection)
+				.where(eq(mcpConnection.organizationId, WORKSPACE_ID)),
+			this.db.query.agentDefinition.findMany({
+				where: and(
+					inArray(agentDefinition.status, ["LIVE", "PAUSED"]),
+					isNull(agentDefinition.deletedAt),
+					isNotNull(agentDefinition.currentVersionId),
+				),
+				orderBy: [desc(agentDefinition.updatedAt)],
+				columns: {
 					id: true,
 					name: true,
 					description: true,
 					status: true,
-					currentVersion: { select: { manifest: true } },
 				},
+				with: { currentVersion: { columns: { manifest: true } } },
 			}),
 		]);
 		const bySlug = new Map(
@@ -255,15 +271,10 @@ export class McpConnectionsService {
 		const rawState = randomBytes(32).toString("base64url");
 		const hash = stateHash(rawState);
 
-		await this.db.$transaction(async (tx) => {
-			await tx.mcpConnection.upsert({
-				where: {
-					organizationId_platformSlug: {
-						organizationId: WORKSPACE_ID,
-						platformSlug: vendor.slug,
-					},
-				},
-				create: {
+		await this.db.transaction(async (tx) => {
+			await tx
+				.insert(mcpConnection)
+				.values({
 					organizationId: WORKSPACE_ID,
 					platformSlug: vendor.slug,
 					status: "CONNECTING",
@@ -271,27 +282,27 @@ export class McpConnectionsService {
 					grantedScopes: [],
 					registrationId: registration.id,
 					connectedById: userId,
-				},
-				update: {
-					status: "CONNECTING",
-					accessMode: ACCESS_MODE[input.accessMode],
-					registrationId: registration.id,
-					connectedById: userId,
-					lastErrorCode: null,
-				},
-			});
-			await tx.mcpOauthState.create({
-				data: {
-					stateHash: hash,
-					organizationId: WORKSPACE_ID,
-					userId,
-					platformSlug: vendor.slug,
-					accessMode: ACCESS_MODE[input.accessMode],
-					returnPath: input.returnPath,
-					encryptedCodeVerifier: box.encrypt(pkce.verifier, statePurpose(hash)),
-					registrationId: registration.id,
-					expiresAt: new Date(Date.now() + MCP_AUTH.state.expiresMs),
-				},
+				})
+				.onConflictDoUpdate({
+					target: [mcpConnection.organizationId, mcpConnection.platformSlug],
+					set: {
+						status: "CONNECTING",
+						accessMode: ACCESS_MODE[input.accessMode],
+						registrationId: registration.id,
+						connectedById: userId,
+						lastErrorCode: null,
+					},
+				});
+			await tx.insert(mcpOauthState).values({
+				stateHash: hash,
+				organizationId: WORKSPACE_ID,
+				userId,
+				platformSlug: vendor.slug,
+				accessMode: ACCESS_MODE[input.accessMode],
+				returnPath: input.returnPath,
+				encryptedCodeVerifier: box.encrypt(pkce.verifier, statePurpose(hash)),
+				registrationId: registration.id,
+				expiresAt: new Date(Date.now() + MCP_AUTH.state.expiresMs),
 			});
 		});
 
@@ -316,15 +327,7 @@ export class McpConnectionsService {
 
 	async reconnect(userId: string, input: McpStartInput) {
 		await this.assertManager(userId);
-		const connection = await this.db.mcpConnection.findUnique({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug: input.platformSlug,
-				},
-			},
-			select: { id: true },
-		});
+		const connection = await this.connectionBySlug(input.platformSlug);
 		if (!connection) {
 			throw new NotFoundException("The MCP platform is not connected.");
 		}
@@ -333,18 +336,16 @@ export class McpConnectionsService {
 
 	async tools(userId: string, platformSlug: string) {
 		await workspaceRoleOf(userId, this.db);
-		const connection = await this.db.mcpConnection.findUnique({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug,
-				},
-			},
-			select: {
-				status: true,
+		const connection = await this.db.query.mcpConnection.findFirst({
+			where: and(
+				eq(mcpConnection.organizationId, WORKSPACE_ID),
+				eq(mcpConnection.platformSlug, platformSlug),
+			),
+			columns: { status: true },
+			with: {
 				toolSnapshots: {
-					orderBy: { createdAt: "desc" },
-					select: {
+					orderBy: [desc(mcpToolSnapshot.createdAt)],
+					columns: {
 						name: true,
 						description: true,
 						fingerprint: true,
@@ -388,32 +389,27 @@ export class McpConnectionsService {
 		tools: readonly { name: string; fingerprint: string }[],
 	) {
 		await this.assertManager(userId);
-		const connection = await this.db.mcpConnection.findUnique({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug,
-				},
-			},
-			select: { id: true, status: true },
-		});
+		const connection = await this.connectionBySlug(platformSlug);
 		if (connection?.status !== "CONNECTED") {
 			throw new NotFoundException("The MCP connection is not active.");
 		}
 
-		const count = await this.db.$transaction(async (tx) => {
+		const count = await this.db.transaction(async (tx) => {
 			let total = 0;
 			for (const tool of tools) {
-				const result = await tx.mcpToolSnapshot.updateMany({
-					where: {
-						connectionId: connection.id,
-						name: tool.name,
-						fingerprint: tool.fingerprint,
-						reviewState: "PENDING",
-					},
-					data: { reviewState: "REVIEWED" },
-				});
-				total += result.count;
+				const result = await tx
+					.update(mcpToolSnapshot)
+					.set({ reviewState: "REVIEWED" })
+					.where(
+						and(
+							eq(mcpToolSnapshot.connectionId, connection.id),
+							eq(mcpToolSnapshot.name, tool.name),
+							eq(mcpToolSnapshot.fingerprint, tool.fingerprint),
+							eq(mcpToolSnapshot.reviewState, "PENDING"),
+						),
+					)
+					.returning({ id: mcpToolSnapshot.id });
+				total += result.length;
 			}
 			if (total !== tools.length) {
 				throw new BadRequestException("The MCP tool inventory changed.");
@@ -432,9 +428,9 @@ export class McpConnectionsService {
 			);
 
 		const hash = stateHash(input.state);
-		const state = await this.db.mcpOauthState.findUnique({
-			where: { stateHash: hash },
-			include: { registration: true },
+		const state = await this.db.query.mcpOauthState.findFirst({
+			where: eq(mcpOauthState.stateHash, hash),
+			with: { registration: true },
 		});
 		if (
 			!state ||
@@ -445,11 +441,18 @@ export class McpConnectionsService {
 			throw new BadRequestException("The MCP authorization state is invalid.");
 		}
 
-		const consumed = await this.db.mcpOauthState.updateMany({
-			where: { id: state.id, consumedAt: null, expiresAt: { gt: new Date() } },
-			data: { consumedAt: new Date() },
-		});
-		if (consumed.count !== 1) {
+		const consumed = await this.db
+			.update(mcpOauthState)
+			.set({ consumedAt: new Date() })
+			.where(
+				and(
+					eq(mcpOauthState.id, state.id),
+					isNull(mcpOauthState.consumedAt),
+					gt(mcpOauthState.expiresAt, new Date()),
+				),
+			)
+			.returning({ id: mcpOauthState.id });
+		if (consumed.length !== 1) {
 			throw new BadRequestException(
 				"The MCP authorization state was already used.",
 			);
@@ -500,19 +503,13 @@ export class McpConnectionsService {
 		];
 		assertGrantedScopeBounds(vendor.slug, state.accessMode, granted);
 
-		const connection = await this.db.mcpConnection.findUniqueOrThrow({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug: vendor.slug,
-				},
-			},
-			select: { id: true },
-		});
-		await this.db.$transaction([
-			this.db.mcpConnection.update({
-				where: { id: connection.id },
-				data: {
+		const connection = await this.connectionBySlug(vendor.slug);
+		if (!connection)
+			throw new NotFoundException("The MCP platform is not connected.");
+		await this.db.transaction(async (tx) => {
+			await tx
+				.update(mcpConnection)
+				.set({
 					status: "CONNECTING",
 					grantedScopes: granted,
 					encryptedAccessToken: box.encrypt(
@@ -533,52 +530,54 @@ export class McpConnectionsService {
 					),
 					connectedAt: new Date(),
 					lastErrorCode: null,
-				},
-			}),
-			this.db.agentTask.create({
-				data: {
-					kind: "mcp-tool-discovery",
-					reason: `Discover ${vendor.name} MCP tools after connection`,
-					payload: { connectionId: connection.id, platformSlug: vendor.slug },
-					priority: PRIORITY.mcpDiscovery,
-					budget: 1,
-					dueAt: new Date(),
-					subject: connection.id,
-				},
-			}),
-		]);
+				})
+				.where(eq(mcpConnection.id, connection.id));
+			await tx.insert(agentTask).values({
+				kind: "mcp-tool-discovery",
+				reason: `Discover ${vendor.name} MCP tools after connection`,
+				payload: { connectionId: connection.id, platformSlug: vendor.slug },
+				priority: PRIORITY.mcpDiscovery,
+				budget: 1,
+				dueAt: new Date(),
+				subject: connection.id,
+			});
+		});
 		this.agent.mcpToolDiscoveryQueued();
 
 		return new URL(state.returnPath, appUrl).toString();
 	}
 
 	async failCallback(rawState: string, userId: string): Promise<void> {
-		const state = await this.db.mcpOauthState.findUnique({
-			where: { stateHash: stateHash(rawState) },
-			select: { userId: true, platformSlug: true },
-		});
+		const [state] = await this.db
+			.select({
+				userId: mcpOauthState.userId,
+				platformSlug: mcpOauthState.platformSlug,
+			})
+			.from(mcpOauthState)
+			.where(eq(mcpOauthState.stateHash, stateHash(rawState)))
+			.limit(1);
 		if (!state || state.userId !== userId) return;
 
-		await this.db.mcpConnection.updateMany({
-			where: {
-				organizationId: WORKSPACE_ID,
-				platformSlug: state.platformSlug,
-				status: "CONNECTING",
-			},
-			data: { status: "ERROR", lastErrorCode: "oauth_callback_failed" },
-		});
+		await this.db
+			.update(mcpConnection)
+			.set({ status: "ERROR", lastErrorCode: "oauth_callback_failed" })
+			.where(
+				and(
+					eq(mcpConnection.organizationId, WORKSPACE_ID),
+					eq(mcpConnection.platformSlug, state.platformSlug),
+					eq(mcpConnection.status, "CONNECTING"),
+				),
+			);
 	}
 
 	async disconnect(userId: string, platformSlug: string) {
 		await this.assertManager(userId);
-		const connection = await this.db.mcpConnection.findUnique({
-			where: {
-				organizationId_platformSlug: {
-					organizationId: WORKSPACE_ID,
-					platformSlug,
-				},
-			},
-			include: { registration: true },
+		const connection = await this.db.query.mcpConnection.findFirst({
+			where: and(
+				eq(mcpConnection.organizationId, WORKSPACE_ID),
+				eq(mcpConnection.platformSlug, platformSlug),
+			),
+			with: { registration: true },
 		});
 		if (!connection)
 			throw new NotFoundException("The MCP platform is not connected.");
@@ -613,22 +612,22 @@ export class McpConnectionsService {
 			}
 		}
 
-		await this.db.$transaction([
-			this.db.mcpConnection.update({
-				where: { id: connection.id },
-				data: {
+		await this.db.transaction(async (tx) => {
+			await tx
+				.update(mcpConnection)
+				.set({
 					status: "DISCONNECTED",
 					encryptedAccessToken: null,
 					encryptedRefreshToken: null,
 					tokenExpiresAt: null,
 					lastErrorCode: revocationErrorCode,
-				},
-			}),
-			this.db.mcpToolSnapshot.updateMany({
-				where: { connectionId: connection.id },
-				data: { reviewState: "REMOVED" },
-			}),
-		]);
+				})
+				.where(eq(mcpConnection.id, connection.id));
+			await tx
+				.update(mcpToolSnapshot)
+				.set({ reviewState: "REMOVED" })
+				.where(eq(mcpToolSnapshot.connectionId, connection.id));
+		});
 
 		return { disconnected: true as const };
 	}
@@ -641,9 +640,9 @@ export class McpConnectionsService {
 			);
 		}
 
-		const connection = await this.db.mcpConnection.findUnique({
-			where: { id: connectionId },
-			include: { registration: true },
+		const connection = await this.db.query.mcpConnection.findFirst({
+			where: eq(mcpConnection.id, connectionId),
+			with: { registration: true },
 		});
 		if (
 			!connection?.encryptedAccessToken ||
@@ -698,22 +697,19 @@ export class McpConnectionsService {
 			const nextExpiresAt = refreshed.expiresIn
 				? new Date(Date.now() + refreshed.expiresIn * 1_000)
 				: null;
-			await this.db.mcpConnection.update({
-				where: { id: connection.id },
-				data: {
-					encryptedAccessToken: box.encrypt(
-						refreshed.accessToken,
-						tokenPurpose(connection.id, "access"),
-					),
-					encryptedRefreshToken: refreshed.refreshToken
-						? box.encrypt(
-								refreshed.refreshToken,
-								tokenPurpose(connection.id, "refresh"),
-							)
-						: connection.encryptedRefreshToken,
-					tokenExpiresAt: nextExpiresAt,
-					lastErrorCode: null,
-				},
+			await this.writeConnection(connection.id, {
+				encryptedAccessToken: box.encrypt(
+					refreshed.accessToken,
+					tokenPurpose(connection.id, "access"),
+				),
+				encryptedRefreshToken: refreshed.refreshToken
+					? box.encrypt(
+							refreshed.refreshToken,
+							tokenPurpose(connection.id, "refresh"),
+						)
+					: connection.encryptedRefreshToken,
+				tokenExpiresAt: nextExpiresAt,
+				lastErrorCode: null,
 			});
 			return {
 				token: refreshed.accessToken,
@@ -721,14 +717,15 @@ export class McpConnectionsService {
 			};
 		} catch (error) {
 			const code = error instanceof Error ? error.message : "refresh_failed";
-			const latest = await this.db.mcpConnection.findUnique({
-				where: { id: connection.id },
-				select: {
-					status: true,
-					encryptedAccessToken: true,
-					tokenExpiresAt: true,
-				},
-			});
+			const [latest] = await this.db
+				.select({
+					status: mcpConnection.status,
+					encryptedAccessToken: mcpConnection.encryptedAccessToken,
+					tokenExpiresAt: mcpConnection.tokenExpiresAt,
+				})
+				.from(mcpConnection)
+				.where(eq(mcpConnection.id, connection.id))
+				.limit(1);
 			if (
 				latest?.encryptedAccessToken &&
 				latest.encryptedAccessToken !== connection.encryptedAccessToken &&
@@ -755,9 +752,8 @@ export class McpConnectionsService {
 				);
 			}
 
-			await this.db.mcpConnection.update({
-				where: { id: connection.id },
-				data: { lastErrorCode: code.slice(0, 120) },
+			await this.writeConnection(connection.id, {
+				lastErrorCode: code.slice(0, 120),
 			});
 			throw new ServiceUnavailableException(
 				"The MCP connection is temporarily unavailable.",
@@ -771,14 +767,16 @@ export class McpConnectionsService {
 		server: Awaited<ReturnType<McpOAuthClient["discover"]>>,
 		scopes: readonly string[],
 	) {
-		const existing = await this.db.mcpClientRegistration.findUnique({
-			where: {
-				platformSlug_metadataFingerprint: {
-					platformSlug: vendor.slug,
-					metadataFingerprint,
-				},
-			},
-		});
+		const [existing] = await this.db
+			.select()
+			.from(mcpClientRegistration)
+			.where(
+				and(
+					eq(mcpClientRegistration.platformSlug, vendor.slug),
+					eq(mcpClientRegistration.metadataFingerprint, metadataFingerprint),
+				),
+			)
+			.limit(1);
 		const box = createMcpSecretBox();
 		if (!box)
 			throw new ServiceUnavailableException(
@@ -800,14 +798,9 @@ export class McpConnectionsService {
 		);
 		const id = existing?.id ?? randomUUID();
 
-		return this.db.mcpClientRegistration.upsert({
-			where: {
-				platformSlug_metadataFingerprint: {
-					platformSlug: vendor.slug,
-					metadataFingerprint,
-				},
-			},
-			create: {
+		const [saved] = await this.db
+			.insert(mcpClientRegistration)
+			.values({
 				id,
 				platformSlug: vendor.slug,
 				metadataFingerprint,
@@ -826,25 +819,33 @@ export class McpConnectionsService {
 				clientSecretExpiresAt: dateFromSeconds(
 					registered.clientSecretExpiresAt,
 				),
-			},
-			update: {
-				issuer: server.issuer,
-				clientId: registered.clientId,
-				encryptedClientSecret: registered.clientSecret
-					? box.encrypt(registered.clientSecret, registrationPurpose(id))
-					: null,
-				encryptedRegistrationAccessToken: registered.registrationAccessToken
-					? box.encrypt(
-							registered.registrationAccessToken,
-							registrationAccessPurpose(id),
-						)
-					: null,
-				clientIdIssuedAt: dateFromSeconds(registered.clientIdIssuedAt),
-				clientSecretExpiresAt: dateFromSeconds(
-					registered.clientSecretExpiresAt,
-				),
-			},
-		});
+			})
+			.onConflictDoUpdate({
+				target: [
+					mcpClientRegistration.platformSlug,
+					mcpClientRegistration.metadataFingerprint,
+				],
+				set: {
+					issuer: server.issuer,
+					clientId: registered.clientId,
+					encryptedClientSecret: registered.clientSecret
+						? box.encrypt(registered.clientSecret, registrationPurpose(id))
+						: null,
+					encryptedRegistrationAccessToken: registered.registrationAccessToken
+						? box.encrypt(
+								registered.registrationAccessToken,
+								registrationAccessPurpose(id),
+							)
+						: null,
+					clientIdIssuedAt: dateFromSeconds(registered.clientIdIssuedAt),
+					clientSecretExpiresAt: dateFromSeconds(
+						registered.clientSecretExpiresAt,
+					),
+				},
+			})
+			.returning();
+		if (!saved) throw new Error("The MCP client registration was not written.");
+		return saved;
 	}
 
 	private callbackUrl(): string {
@@ -855,10 +856,36 @@ export class McpConnectionsService {
 		connectionId: string,
 		code: string,
 	): Promise<void> {
-		await this.db.mcpConnection.update({
-			where: { id: connectionId },
-			data: { status: "ERROR", lastErrorCode: code.slice(0, 120) },
+		await this.writeConnection(connectionId, {
+			status: "ERROR",
+			lastErrorCode: code.slice(0, 120),
 		});
+	}
+
+	private async connectionBySlug(platformSlug: string) {
+		const [row] = await this.db
+			.select({ id: mcpConnection.id, status: mcpConnection.status })
+			.from(mcpConnection)
+			.where(
+				and(
+					eq(mcpConnection.organizationId, WORKSPACE_ID),
+					eq(mcpConnection.platformSlug, platformSlug),
+				),
+			)
+			.limit(1);
+		return row ?? null;
+	}
+
+	private async writeConnection(
+		id: string,
+		data: Partial<NewMcpConnection>,
+	): Promise<void> {
+		const [row] = await this.db
+			.update(mcpConnection)
+			.set(data)
+			.where(eq(mcpConnection.id, id))
+			.returning({ id: mcpConnection.id });
+		if (!row) throw new NotFoundException("The MCP connection is not active.");
 	}
 
 	private async assertManager(userId: string): Promise<void> {

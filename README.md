@@ -174,13 +174,13 @@ A [Turborepo](https://turborepo.dev) monorepo on [Bun](https://bun.com), deploye
 | **Sandbox** | [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) in production, Docker or microsandbox locally |
 | **Front end** | [Next.js](https://nextjs.org) App Router · [shadcn/ui](https://ui.shadcn.com) · [nuqs](https://nuqs.dev) for URL state |
 | **API** | [NestJS](https://nestjs.com) with [nestjs-trpc](https://nestjs-trpc.io) — HTTP, auth, tRPC, mailbox sync |
-| **Data** | [Prisma](https://prisma.io) · Postgres ([Neon](https://neon.tech)) · optional Redis ([Upstash](https://upstash.com)) |
+| **Data** | [Drizzle](https://orm.drizzle.team) · Postgres ([Neon](https://neon.tech)) · optional Redis ([Upstash](https://upstash.com)) |
 | **Auth** | [Better Auth](https://better-auth.com) — Google, Microsoft, or your own IdP; one allow-list |
 | **Files** | [Vercel Blob](https://vercel.com/docs/vercel-blob) — mirrors profile pictures so they survive the source going away |
 | **Tooling** | [Biome](https://biomejs.dev) · TypeScript everywhere |
 
 The app talks to the API over **tRPC**, and the router type is generated from the
-NestJS routers — so the front end is type-safe from the Prisma row to the table cell.
+NestJS routers — so the front end is type-safe from the Drizzle row to the table cell.
 List state (filters, sort, page) lives in the URL, so copying the address bar
 reproduces the view.
 
@@ -191,7 +191,7 @@ reproduces the view.
 | `apps/agent` | The research agent — tools, skills, schedules, sandbox |
 | `apps/app` | Next.js front end · :3000 |
 | `apps/api` | NestJS API — HTTP, auth, tRPC, mailbox sync · :3001 |
-| `packages/db` | Prisma schema, migrations, shared Postgres client |
+| `packages/db` | Drizzle schema, migrations, shared Postgres client |
 | `packages/auth` | Better Auth config and the sign-in allow-list |
 | `packages/ui` | shadcn/ui components, the Tailwind theme |
 | `packages/env` | Finds and loads the root `.env` |
@@ -351,7 +351,7 @@ short version:
 | `bun run lint` / `format` | [Biome](https://biomejs.dev) |
 | `bun run db:migrate` | Create and apply a migration |
 | `bun run db:seed` | Top up the demo pipeline (idempotent) |
-| `bun run db:studio` | Prisma Studio |
+| `bun run db:studio` | Drizzle Studio |
 | `bun run --filter=api trpc:generate` | Regenerate the `AppRouter` type |
 | `bun run --filter=api dev:session` | Print a one-click local sign-in link |
 

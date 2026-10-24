@@ -1,4 +1,19 @@
-import type { Db, Prisma } from "@crm/db";
+import {
+	and,
+	asc,
+	company,
+	contact,
+	contains,
+	type Db,
+	eq,
+	isNotNull,
+	isNull,
+	type NewCompany,
+	not,
+	or,
+	type SQL,
+	user,
+} from "@crm/db";
 import { blobEnabled, mirror } from "@crm/db/blob";
 import {
 	BLOB_HOST_SUFFIX,
@@ -12,15 +27,15 @@ const MAX_PER_SWEEP = 25;
 
 type CompanyImageRow = Record<CompanyImageField, string | null>;
 
-const EXTERNAL_CONTACT_IMAGE: Prisma.ContactWhereInput = {
-	imageUrl: { not: null },
-	NOT: { imageUrl: { contains: BLOB_HOST_SUFFIX } },
-};
+const EXTERNAL_CONTACT_IMAGE = and(
+	isNotNull(contact.imageUrl),
+	not(contains(contact.imageUrl, BLOB_HOST_SUFFIX)),
+);
 
-const EXTERNAL_USER_IMAGE: Prisma.UserWhereInput = {
-	image: { not: null },
-	NOT: { image: { contains: BLOB_HOST_SUFFIX } },
-};
+const EXTERNAL_USER_IMAGE = and(
+	isNotNull(user.image),
+	not(contains(user.image, BLOB_HOST_SUFFIX)),
+);
 
 export type ImageMirrorResult = {
 	scanned: number;
@@ -58,25 +73,23 @@ export class ImageMirrorService {
 	}
 
 	private async sweepCompanies(): Promise<ImageMirrorResult> {
-		const rows = await this.db.company.findMany({
-			where: {
-				OR: COMPANY_IMAGE_FIELDS.map(externalCompanyImage),
-			},
-			orderBy: { createdAt: "asc" },
-			take: MAX_PER_SWEEP,
-			select: {
-				id: true,
-				logoUrl: true,
-				logoDarkUrl: true,
-				iconUrl: true,
-				iconDarkUrl: true,
-			},
-		});
+		const rows = await this.db
+			.select({
+				id: company.id,
+				logoUrl: company.logoUrl,
+				logoDarkUrl: company.logoDarkUrl,
+				iconUrl: company.iconUrl,
+				iconDarkUrl: company.iconDarkUrl,
+			})
+			.from(company)
+			.where(or(...COMPANY_IMAGE_FIELDS.map(externalCompanyImage)))
+			.orderBy(asc(company.createdAt))
+			.limit(MAX_PER_SWEEP);
 
 		let copied = 0;
 
 		for (const row of rows) {
-			const data: Prisma.CompanyUpdateInput = {};
+			const data: Partial<NewCompany> = {};
 
 			for (const field of COMPANY_IMAGE_FIELDS) {
 				const current = row[field];
@@ -91,22 +104,22 @@ export class ImageMirrorService {
 
 			if (Object.keys(data).length === 0) continue;
 
-			await this.db.company.updateMany({
-				where: { id: row.id, ...unchanged(row) },
-				data,
-			});
+			await this.db
+				.update(company)
+				.set(data)
+				.where(and(eq(company.id, row.id), unchanged(row)));
 		}
 
 		return { scanned: rows.length, copied };
 	}
 
 	private async sweepContacts(): Promise<ImageMirrorResult> {
-		const rows = await this.db.contact.findMany({
-			where: EXTERNAL_CONTACT_IMAGE,
-			orderBy: { createdAt: "asc" },
-			take: MAX_PER_SWEEP,
-			select: { id: true, imageUrl: true },
-		});
+		const rows = await this.db
+			.select({ id: contact.id, imageUrl: contact.imageUrl })
+			.from(contact)
+			.where(EXTERNAL_CONTACT_IMAGE)
+			.orderBy(asc(contact.createdAt))
+			.limit(MAX_PER_SWEEP);
 
 		let copied = 0;
 
@@ -116,23 +129,24 @@ export class ImageMirrorService {
 			const stored = await mirror(row.imageUrl, `contacts/${row.id}`);
 			if (!stored || stored === row.imageUrl) continue;
 
-			const { count } = await this.db.contact.updateMany({
-				where: { id: row.id, imageUrl: row.imageUrl },
-				data: { imageUrl: stored },
-			});
+			const changed = await this.db
+				.update(contact)
+				.set({ imageUrl: stored })
+				.where(and(eq(contact.id, row.id), eq(contact.imageUrl, row.imageUrl)))
+				.returning({ id: contact.id });
 
-			copied += count;
+			copied += changed.length;
 		}
 
 		return { scanned: rows.length, copied };
 	}
 
 	private async sweepUsers(): Promise<ImageMirrorResult> {
-		const rows = await this.db.user.findMany({
-			where: EXTERNAL_USER_IMAGE,
-			take: MAX_PER_SWEEP,
-			select: { id: true, image: true },
-		});
+		const rows = await this.db
+			.select({ id: user.id, image: user.image })
+			.from(user)
+			.where(EXTERNAL_USER_IMAGE)
+			.limit(MAX_PER_SWEEP);
 
 		let copied = 0;
 
@@ -142,33 +156,33 @@ export class ImageMirrorService {
 			const stored = await mirror(row.image, `users/${row.id}/avatar`);
 			if (!stored || stored === row.image) continue;
 
-			const { count } = await this.db.user.updateMany({
-				where: { id: row.id, image: row.image },
-				data: { image: stored },
-			});
+			const changed = await this.db
+				.update(user)
+				.set({ image: stored })
+				.where(and(eq(user.id, row.id), eq(user.image, row.image)))
+				.returning({ id: user.id });
 
-			copied += count;
+			copied += changed.length;
 		}
 
 		return { scanned: rows.length, copied };
 	}
 }
 
-function externalCompanyImage(
-	field: CompanyImageField,
-): Prisma.CompanyWhereInput {
-	const mirrored: Prisma.CompanyWhereInput = {};
-	mirrored[field] = { contains: BLOB_HOST_SUFFIX };
-
-	const where: Prisma.CompanyWhereInput = { NOT: mirrored };
-	where[field] = { not: null };
-
-	return where;
+function externalCompanyImage(field: CompanyImageField): SQL | undefined {
+	return and(
+		isNotNull(company[field]),
+		not(contains(company[field], BLOB_HOST_SUFFIX)),
+	);
 }
 
-function unchanged(row: CompanyImageRow): Prisma.CompanyWhereInput {
-	const where: Prisma.CompanyWhereInput = {};
-	for (const field of COMPANY_IMAGE_FIELDS) where[field] = row[field] ?? null;
-
-	return where;
+function unchanged(row: CompanyImageRow): SQL | undefined {
+	return and(
+		...COMPANY_IMAGE_FIELDS.map((field) => {
+			const value = row[field];
+			return value === null
+				? isNull(company[field])
+				: eq(company[field], value);
+		}),
+	);
 }

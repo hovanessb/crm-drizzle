@@ -1,4 +1,20 @@
-import { db } from "@crm/db";
+import {
+	asc,
+	calendarEvent,
+	company as companyTable,
+	contactBrief,
+	contact as contactTable,
+	db,
+	dealContact,
+	deal as dealTable,
+	desc,
+	emailThread,
+	eq,
+	firstRow,
+	orNull,
+	relatedCount,
+	whereEq,
+} from "@crm/db";
 import { websiteUrl } from "@crm/db/workspace";
 import { capabilitiesMarkdown } from "./capabilities";
 import { identity, usMarkdown, type WorkspaceIdentity } from "./workspace";
@@ -78,26 +94,53 @@ export async function contactPreamble(
 	contactId: string,
 	opened: Opened,
 ): Promise<Preamble> {
-	const contact = await db.contact.findUnique({
-		where: { id: contactId },
-		select: {
-			firstName: true,
-			lastName: true,
-			email: true,
-			title: true,
-			company: { select: { id: true, name: true, domain: true } },
-			brief: { select: { refreshedAt: true } },
-			deals: {
-				orderBy: { deal: { lastActivityAt: "desc" } },
-				take: 5,
-				select: {
-					role: true,
-					deal: { select: { id: true, name: true, stage: true } },
+	const found = await firstRow(
+		db
+			.select({
+				firstName: contactTable.firstName,
+				lastName: contactTable.lastName,
+				email: contactTable.email,
+				title: contactTable.title,
+				company: {
+					id: companyTable.id,
+					name: companyTable.name,
+					domain: companyTable.domain,
 				},
-			},
-			_count: { select: { emailThreads: true, calendarEvents: true } },
-		},
-	});
+				brief: { refreshedAt: contactBrief.refreshedAt },
+				emailThreads: db.$count(
+					emailThread,
+					eq(emailThread.contactId, contactTable.id),
+				),
+				calendarEvents: db.$count(
+					calendarEvent,
+					eq(calendarEvent.contactId, contactTable.id),
+				),
+			})
+			.from(contactTable)
+			.leftJoin(companyTable, eq(companyTable.id, contactTable.companyId))
+			.leftJoin(contactBrief, eq(contactBrief.contactId, contactTable.id))
+			.where(eq(contactTable.id, contactId))
+			.limit(1),
+	);
+	const contact = found
+		? {
+				...found,
+				deals: await db
+					.select({
+						role: dealContact.role,
+						deal: {
+							id: dealTable.id,
+							name: dealTable.name,
+							stage: dealTable.stage,
+						},
+					})
+					.from(dealContact)
+					.innerJoin(dealTable, eq(dealTable.id, dealContact.dealId))
+					.where(eq(dealContact.contactId, contactId))
+					.orderBy(desc(dealTable.lastActivityAt))
+					.limit(5),
+			}
+		: null;
 
 	if (!contact) {
 		return { markdown: await closing(), focus: { contactId } };
@@ -106,8 +149,8 @@ export async function contactPreamble(
 	const name = [contact.firstName, contact.lastName].filter(Boolean).join(" ");
 
 	const known =
-		contact._count.emailThreads > 0 || contact._count.calendarEvents > 0
-			? `We have ${contact._count.emailThreads} thread(s) and ${contact._count.calendarEvents} meeting(s) with them — read those first.`
+		contact.emailThreads > 0 || contact.calendarEvents > 0
+			? `We have ${contact.emailThreads} thread(s) and ${contact.calendarEvents} meeting(s) with them — read those first.`
 			: "We have never corresponded with them, so there is nothing internal to go on.";
 
 	const deals = contact.deals
@@ -164,26 +207,34 @@ export async function companyPreamble(
 	companyId: string,
 	opened: Opened,
 ): Promise<Preamble> {
-	const company = await db.company.findUnique({
-		where: { id: companyId },
-		select: {
-			name: true,
-			domain: true,
-			industry: true,
-			description: true,
-			contacts: {
-				orderBy: [{ lastActivityAt: "desc" }, { createdAt: "asc" }],
-				take: 12,
-				select: { id: true, firstName: true, lastName: true, title: true },
+	const company = await db.query.company
+		.findFirst({
+			where: eq(companyTable.id, companyId),
+			columns: { name: true, domain: true, industry: true, description: true },
+			extras: (row: { id: typeof companyTable.id }) => ({
+				contactCount: relatedCount(
+					contactTable,
+					contactTable.companyId,
+					row.id,
+				).as("contactCount"),
+			}),
+			with: {
+				contacts: {
+					orderBy: [
+						desc(contactTable.lastActivityAt),
+						asc(contactTable.createdAt),
+					],
+					limit: 12,
+					columns: { id: true, firstName: true, lastName: true, title: true },
+				},
+				deals: {
+					orderBy: [desc(dealTable.lastActivityAt), desc(dealTable.createdAt)],
+					limit: 8,
+					columns: { id: true, name: true, stage: true },
+				},
 			},
-			deals: {
-				orderBy: [{ lastActivityAt: "desc" }, { createdAt: "desc" }],
-				take: 8,
-				select: { id: true, name: true, stage: true },
-			},
-			_count: { select: { contacts: true } },
-		},
-	});
+		})
+		.then(orNull);
 
 	if (!company) {
 		return { markdown: await closing(), focus: { companyId } };
@@ -199,8 +250,8 @@ export async function companyPreamble(
 		.join("\n");
 
 	const more =
-		company._count.contacts > company.contacts.length
-			? `\n- …and ${company._count.contacts - company.contacts.length} more; \`read_company_history\` lists them all.`
+		company.contactCount > company.contacts.length
+			? `\n- …and ${company.contactCount - company.contacts.length} more; \`read_company_history\` lists them all.`
 			: "";
 
 	const deals = company.deals
@@ -221,7 +272,7 @@ export async function companyPreamble(
 		),
 		"",
 		people
-			? `### Who we know there (${company._count.contacts})\n\n${people}${more}\n\nThose are contact ids. Use them directly — with \`read_crm_history\`, \`identify_contact\` or \`record_fact\`. Never ask a rep which contact they mean without naming these first.`
+			? `### Who we know there (${company.contactCount})\n\n${people}${more}\n\nThose are contact ids. Use them directly — with \`read_crm_history\`, \`identify_contact\` or \`record_fact\`. Never ask a rep which contact they mean without naming these first.`
 			: "We have no contacts on file here yet.",
 		"",
 		deals ? `Deals: ${deals}.` : "There are no deals here.",
@@ -243,27 +294,36 @@ export async function dealPreamble(
 	dealId: string,
 	opened: Opened,
 ): Promise<Preamble> {
-	const deal = await db.deal.findUnique({
-		where: { id: dealId },
-		select: {
-			name: true,
-			description: true,
-			stage: true,
-			amount: true,
-			currency: true,
-			expectedCloseDate: true,
-			lastActivityAt: true,
-			company: { select: { id: true, name: true } },
-			contacts: {
-				select: {
-					role: true,
-					contact: {
-						select: { id: true, firstName: true, lastName: true, title: true },
+	const deal = await db.query.deal
+		.findFirst({
+			where: whereEq(dealTable.id, dealId),
+			columns: {
+				name: true,
+				description: true,
+				stage: true,
+				amount: true,
+				currency: true,
+				expectedCloseDate: true,
+				lastActivityAt: true,
+			},
+			with: {
+				company: { columns: { id: true, name: true } },
+				contacts: {
+					columns: { role: true },
+					with: {
+						contact: {
+							columns: {
+								id: true,
+								firstName: true,
+								lastName: true,
+								title: true,
+							},
+						},
 					},
 				},
 			},
-		},
-	});
+		})
+		.then(orNull);
 
 	if (!deal) return { markdown: await closing(), focus: {} };
 

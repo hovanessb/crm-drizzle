@@ -1,4 +1,13 @@
-import type { Db } from "@crm/db";
+import {
+	asc,
+	company,
+	contact,
+	contains,
+	type Db,
+	deal,
+	eq,
+	or,
+} from "@crm/db";
 import { Injectable } from "@nestjs/common";
 import { InjectDatabase } from "../database/database.constants";
 
@@ -24,60 +33,60 @@ export class SearchService {
 		if (term.length < 2) return { hits: [] };
 
 		const [companies, contacts, deals] = await Promise.all([
-			this.db.company.findMany({
-				where: {
-					OR: [
-						{ name: { contains: term, mode: "insensitive" } },
-						{ domain: { contains: term, mode: "insensitive" } },
-					],
-				},
-				take: PER_KIND,
-				orderBy: { name: "asc" },
-				select: {
-					id: true,
-					name: true,
-					domain: true,
-					iconUrl: true,
-					iconDarkUrl: true,
-					iconTone: true,
-				},
-			}),
-			this.db.contact.findMany({
-				where: {
-					OR: [
-						{ firstName: { contains: term, mode: "insensitive" } },
-						{ lastName: { contains: term, mode: "insensitive" } },
-						{ email: { contains: term, mode: "insensitive" } },
-					],
-				},
-				take: PER_KIND,
-				orderBy: [{ lastName: "asc" }, { firstName: "asc" }],
-				select: {
-					id: true,
-					firstName: true,
-					lastName: true,
-					email: true,
-					imageUrl: true,
-					company: { select: { name: true } },
-				},
-			}),
-			this.db.deal.findMany({
-				where: { name: { contains: term, mode: "insensitive" } },
-				take: PER_KIND,
-				orderBy: [{ stage: "asc" }, { name: "asc" }],
-				select: {
-					id: true,
-					name: true,
+			this.db
+				.select({
+					id: company.id,
+					name: company.name,
+					domain: company.domain,
+					iconUrl: company.iconUrl,
+					iconDarkUrl: company.iconDarkUrl,
+					iconTone: company.iconTone,
+				})
+				.from(company)
+				.where(
+					or(
+						contains(company.name, term, { insensitive: true }),
+						contains(company.domain, term, { insensitive: true }),
+					),
+				)
+				.orderBy(asc(company.name))
+				.limit(PER_KIND),
+			this.db
+				.select({
+					id: contact.id,
+					firstName: contact.firstName,
+					lastName: contact.lastName,
+					email: contact.email,
+					imageUrl: contact.imageUrl,
+					company: { name: company.name },
+				})
+				.from(contact)
+				.leftJoin(company, eq(company.id, contact.companyId))
+				.where(
+					or(
+						contains(contact.firstName, term, { insensitive: true }),
+						contains(contact.lastName, term, { insensitive: true }),
+						contains(contact.email, term, { insensitive: true }),
+					),
+				)
+				.orderBy(asc(contact.lastName), asc(contact.firstName))
+				.limit(PER_KIND),
+			this.db
+				.select({
+					id: deal.id,
+					name: deal.name,
 					company: {
-						select: {
-							name: true,
-							iconUrl: true,
-							iconDarkUrl: true,
-							iconTone: true,
-						},
+						name: company.name,
+						iconUrl: company.iconUrl,
+						iconDarkUrl: company.iconDarkUrl,
+						iconTone: company.iconTone,
 					},
-				},
-			}),
+				})
+				.from(deal)
+				.innerJoin(company, eq(company.id, deal.companyId))
+				.where(contains(deal.name, term, { insensitive: true }))
+				.orderBy(asc(deal.stage), asc(deal.name))
+				.limit(PER_KIND),
 		]);
 
 		return {

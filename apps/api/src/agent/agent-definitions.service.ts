@@ -1,4 +1,24 @@
-import type { Db, Prisma } from "@crm/db";
+import {
+	agentAuditEvent,
+	agentBuilderArtifact,
+	agentDefinition,
+	agentRun,
+	agentRunEvent,
+	agentTrigger,
+	agentVersion,
+	and,
+	asc,
+	type Db,
+	desc,
+	type Executor,
+	eq,
+	inArray,
+	type JsonValue,
+	type NewAgentDefinition,
+	ne,
+	relatedCount,
+	sql,
+} from "@crm/db";
 import type { AgentDefinitionStatus } from "@crm/db/enums";
 import { schemas } from "@crm/validation";
 import { readAgentManifestSummary } from "@crm/validation/agent-manifest";
@@ -45,27 +65,29 @@ export class AgentDefinitionsService {
 	async list(userId: string) {
 		await this.access.assertMember(userId);
 
-		const rows = await this.db.agentDefinition.findMany({
-			where: { status: { in: [...TEAM_AGENT_STATUSES] } },
-			orderBy: { updatedAt: "desc" },
-			select: {
+		const rows = await this.db.query.agentDefinition.findMany({
+			where: inArray(agentDefinition.status, [...TEAM_AGENT_STATUSES]),
+			orderBy: [desc(agentDefinition.updatedAt)],
+			columns: {
 				id: true,
 				name: true,
 				description: true,
 				status: true,
 				createdAt: true,
 				updatedAt: true,
-				createdBy: { select: { id: true, name: true, image: true } },
+			},
+			extras: runCountExtra,
+			with: {
+				createdBy: { columns: { id: true, name: true, image: true } },
 				currentVersion: {
-					select: { id: true, number: true, deployedAt: true },
+					columns: { id: true, number: true, deployedAt: true },
 				},
 				triggers: {
-					where: { enabled: true },
-					orderBy: { nextRunAt: "asc" },
-					take: 1,
-					select: { id: true, type: true, name: true, nextRunAt: true },
+					where: eq(agentTrigger.enabled, true),
+					orderBy: [asc(agentTrigger.nextRunAt)],
+					limit: 1,
+					columns: { id: true, type: true, name: true, nextRunAt: true },
 				},
-				_count: { select: { runs: true } },
 			},
 		});
 
@@ -83,16 +105,19 @@ export class AgentDefinitionsService {
 				...trigger,
 				nextRunAt: trigger.nextRunAt?.toISOString() ?? null,
 			})),
-			runCount: row._count.runs,
+			runCount: row.runCount,
 		}));
 	}
 
 	async byId(id: string, userId: string) {
 		await this.access.assertCanRead(id, userId);
 
-		const row = await this.db.agentDefinition.findFirst({
-			where: { id, status: { not: "DELETED" } },
-			select: {
+		const row = await this.db.query.agentDefinition.findFirst({
+			where: and(
+				eq(agentDefinition.id, id),
+				ne(agentDefinition.status, "DELETED"),
+			),
+			columns: {
 				id: true,
 				name: true,
 				description: true,
@@ -100,9 +125,12 @@ export class AgentDefinitionsService {
 				createdById: true,
 				createdAt: true,
 				updatedAt: true,
-				createdBy: { select: { id: true, name: true, image: true } },
+			},
+			extras: runCountExtra,
+			with: {
+				createdBy: { columns: { id: true, name: true, image: true } },
 				currentVersion: {
-					select: {
+					columns: {
 						id: true,
 						number: true,
 						status: true,
@@ -114,10 +142,10 @@ export class AgentDefinitionsService {
 					},
 				},
 				versions: {
-					where: { status: { in: ["DRAFT", "READY"] } },
-					orderBy: { number: "desc" },
-					take: 1,
-					select: {
+					where: inArray(agentVersion.status, ["DRAFT", "READY"]),
+					orderBy: [desc(agentVersion.number)],
+					limit: 1,
+					columns: {
 						id: true,
 						number: true,
 						status: true,
@@ -128,8 +156,8 @@ export class AgentDefinitionsService {
 					},
 				},
 				triggers: {
-					orderBy: { createdAt: "asc" },
-					select: {
+					orderBy: [asc(agentTrigger.createdAt)],
+					columns: {
 						id: true,
 						type: true,
 						name: true,
@@ -139,7 +167,6 @@ export class AgentDefinitionsService {
 						lastRunAt: true,
 					},
 				},
-				_count: { select: { runs: true } },
 			},
 		});
 
@@ -168,7 +195,7 @@ export class AgentDefinitionsService {
 				nextRunAt: trigger.nextRunAt?.toISOString() ?? null,
 				lastRunAt: trigger.lastRunAt?.toISOString() ?? null,
 			})),
-			runCount: agent._count.runs,
+			runCount: agent.runCount,
 			capabilities: readCapabilities(
 				agent.currentVersion?.manifest ?? draft?.manifest,
 			),
@@ -178,26 +205,30 @@ export class AgentDefinitionsService {
 	async update(input: AgentUpdateInput, userId: string) {
 		const description = input.description?.trim() || null;
 
-		const updated = await this.db.$transaction(async (tx) => {
+		const updated = await this.db.transaction(async (tx) => {
 			await this.access.assertCanManageInTransaction(tx, input.id, userId);
 			const agent = await this.lockAgent(tx, input.id);
-			const row = await tx.agentDefinition.update({
-				where: { id: input.id },
-				data: { name: input.name, description },
-				select: { id: true, name: true, description: true, status: true },
-			});
+			const [row] = await tx
+				.update(agentDefinition)
+				.set({ name: input.name, description })
+				.where(eq(agentDefinition.id, input.id))
+				.returning({
+					id: agentDefinition.id,
+					name: agentDefinition.name,
+					description: agentDefinition.description,
+					status: agentDefinition.status,
+				});
+			if (!row) throw new NotFoundException(`No agent with id ${input.id}.`);
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: input.id,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "agent.updated",
-					summary: "Changed agent details",
-					before: { name: agent.name, description: agent.description },
-					after: { name: input.name, description },
-				},
+			await tx.insert(agentAuditEvent).values({
+				agentId: input.id,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "agent.updated",
+				summary: "Changed agent details",
+				before: { name: agent.name, description: agent.description },
+				after: { name: input.name, description },
 			});
 
 			return row;
@@ -209,23 +240,29 @@ export class AgentDefinitionsService {
 	async files(id: string, userId: string) {
 		await this.access.assertCanRead(id, userId);
 
-		const agent = await this.db.agentDefinition.findFirst({
-			where: { id, status: { not: "DELETED" } },
-			select: { currentVersionId: true },
-		});
+		const [agent] = await this.db
+			.select({ currentVersionId: agentDefinition.currentVersionId })
+			.from(agentDefinition)
+			.where(
+				and(eq(agentDefinition.id, id), ne(agentDefinition.status, "DELETED")),
+			)
+			.limit(1);
 		if (!agent?.currentVersionId) return { versionId: null, files: [] };
 
-		const rows = await this.db.agentBuilderArtifact.findMany({
-			where: { versionId: agent.currentVersionId },
-			orderBy: [{ path: "asc" }, { revision: "desc" }],
-			select: {
-				path: true,
-				language: true,
-				content: true,
-				previousContent: true,
-				revision: true,
-			},
-		});
+		const rows = await this.db
+			.select({
+				path: agentBuilderArtifact.path,
+				language: agentBuilderArtifact.language,
+				content: agentBuilderArtifact.content,
+				previousContent: agentBuilderArtifact.previousContent,
+				revision: agentBuilderArtifact.revision,
+			})
+			.from(agentBuilderArtifact)
+			.where(eq(agentBuilderArtifact.versionId, agent.currentVersionId))
+			.orderBy(
+				asc(agentBuilderArtifact.path),
+				desc(agentBuilderArtifact.revision),
+			);
 
 		const latest = new Map<string, (typeof rows)[number]>();
 		for (const row of rows)
@@ -238,105 +275,98 @@ export class AgentDefinitionsService {
 	}
 
 	async saveFile(input: AgentSaveFileInput, userId: string) {
-		return this.db.$transaction(async (tx) => {
+		return this.db.transaction(async (tx) => {
 			await this.access.assertCanManageInTransaction(tx, input.id, userId);
 			const agent = await this.lockAgent(tx, input.id);
 
-			const replay = await tx.agentAuditEvent.findFirst({
-				where: {
-					agentId: input.id,
-					type: "agent.file.saved",
-					requestId: input.clientRequestId,
-				},
-				select: { versionId: true },
-			});
+			const replay = await auditReplay(
+				tx,
+				input.id,
+				"agent.file.saved",
+				input.clientRequestId,
+			);
 			if (replay) return { saved: false, versionId: replay.versionId };
 
 			if (!agent.currentVersionId) {
 				throw new BadRequestException("This agent has no deployed version.");
 			}
 
-			const current = await tx.agentVersion.findFirstOrThrow({
-				where: { id: agent.currentVersionId },
-				select: {
-					status: true,
-					instructions: true,
-					manifest: true,
-					modelId: true,
-					modelContextWindowTokens: true,
-					sandboxPolicy: true,
-					validation: true,
-					sourceConversationId: true,
-					deployedAt: true,
-					approvedAt: true,
-				},
-			});
+			const current = await currentVersion(tx, agent.currentVersionId);
 
-			const file = await tx.agentBuilderArtifact.findFirst({
-				where: { versionId: agent.currentVersionId, path: input.path },
-				orderBy: { revision: "desc" },
-			});
+			const [file] = await tx
+				.select()
+				.from(agentBuilderArtifact)
+				.where(
+					and(
+						eq(agentBuilderArtifact.versionId, agent.currentVersionId),
+						eq(agentBuilderArtifact.path, input.path),
+					),
+				)
+				.orderBy(desc(agentBuilderArtifact.revision))
+				.limit(1);
 			if (!file) throw new NotFoundException(`No file at ${input.path}.`);
 			if (file.content === input.content) {
 				return { saved: false, versionId: agent.currentVersionId };
 			}
 
-			const version = await tx.agentVersion.create({
-				data: {
-					agentId: input.id,
-					number: await nextVersionNumber(tx, input.id),
-					status: current.status,
-					instructions:
-						input.path === INSTRUCTIONS_PATH
-							? input.content
-							: current.instructions,
-					manifest: current.manifest as Prisma.InputJsonValue,
-					modelId: current.modelId,
-					modelContextWindowTokens: current.modelContextWindowTokens,
-					sandboxPolicy: current.sandboxPolicy as Prisma.InputJsonValue,
-					validation: current.validation as Prisma.InputJsonValue,
-					sourceConversationId: current.sourceConversationId,
-					approvedAt: current.approvedAt,
-					deployedAt: current.deployedAt,
-					createdById: userId,
-				},
-				select: { id: true },
+			const version = await createVersion(tx, {
+				agentId: input.id,
+				number: await nextVersionNumber(tx, input.id),
+				status: current.status,
+				instructions:
+					input.path === INSTRUCTIONS_PATH
+						? input.content
+						: current.instructions,
+				manifest: current.manifest,
+				modelId: current.modelId,
+				modelContextWindowTokens: current.modelContextWindowTokens,
+				sandboxPolicy: current.sandboxPolicy,
+				validation: current.validation,
+				sourceConversationId: current.sourceConversationId,
+				approvedAt: current.approvedAt,
+				deployedAt: current.deployedAt,
+				createdById: userId,
 			});
 
 			await carryArtifactsForward(tx, agent.currentVersionId, version.id);
 
-			await tx.agentBuilderArtifact.updateMany({
-				where: { versionId: version.id, path: input.path },
-				data: { previousContent: file.content, content: input.content },
-			});
+			await tx
+				.update(agentBuilderArtifact)
+				.set({ previousContent: file.content, content: input.content })
+				.where(
+					and(
+						eq(agentBuilderArtifact.versionId, version.id),
+						eq(agentBuilderArtifact.path, input.path),
+					),
+				);
 
-			await tx.agentDefinition.update({
-				where: { id: input.id },
-				data: { currentVersionId: version.id },
-			});
+			await tx
+				.update(agentDefinition)
+				.set({ currentVersionId: version.id })
+				.where(eq(agentDefinition.id, input.id));
 
-			const repointed = await tx.agentTrigger.updateMany({
-				where: { agentId: input.id, versionId: agent.currentVersionId },
-				data: { versionId: version.id },
-			});
+			const repointed = await repointTriggers(
+				tx,
+				input.id,
+				agent.currentVersionId,
+				version.id,
+			);
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: input.id,
-					versionId: version.id,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "agent.file.saved",
-					summary: `Edited ${input.path}`,
-					before: { path: input.path, bytes: file.content.length },
-					after: {
-						path: input.path,
-						bytes: input.content.length,
-						triggers: repointed.count,
-					},
-					requestId: input.clientRequestId,
+			await tx.insert(agentAuditEvent).values({
+				agentId: input.id,
+				versionId: version.id,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "agent.file.saved",
+				summary: `Edited ${input.path}`,
+				before: { path: input.path, bytes: file.content.length },
+				after: {
+					path: input.path,
+					bytes: input.content.length,
+					triggers: repointed,
 				},
+				requestId: input.clientRequestId,
 			});
 
 			return { saved: true, versionId: version.id };
@@ -348,35 +378,19 @@ export class AgentDefinitionsService {
 			await this.access.assertCanManageInTransaction(tx, input.id, userId);
 			const agent = await this.lockAgent(tx, input.id);
 
-			const replay = await tx.agentAuditEvent.findFirst({
-				where: {
-					agentId: input.id,
-					type: "agent.revised",
-					requestId: input.clientRequestId,
-				},
-				select: { versionId: true },
-			});
+			const replay = await auditReplay(
+				tx,
+				input.id,
+				"agent.revised",
+				input.clientRequestId,
+			);
 			if (replay) return replay.versionId;
 
 			if (!agent.currentVersionId) {
 				throw new BadRequestException("This agent has no deployed version.");
 			}
 
-			const current = await tx.agentVersion.findFirstOrThrow({
-				where: { id: agent.currentVersionId },
-				select: {
-					status: true,
-					instructions: true,
-					manifest: true,
-					modelId: true,
-					modelContextWindowTokens: true,
-					sandboxPolicy: true,
-					validation: true,
-					sourceConversationId: true,
-					deployedAt: true,
-					approvedAt: true,
-				},
-			});
+			const current = await currentVersion(tx, agent.currentVersionId);
 
 			const parsed = agentManifest.safeParse(current.manifest);
 			if (!parsed.success) {
@@ -431,71 +445,68 @@ export class AgentDefinitionsService {
 					}
 				: manifest.dataScope;
 
-			const version = await tx.agentVersion.create({
-				data: {
-					agentId: input.id,
-					number: await nextVersionNumber(tx, input.id),
-					status: current.status,
-					instructions: current.instructions,
-					manifest: {
-						...manifest,
-						actions,
-						dataScope,
-					} as Prisma.InputJsonValue,
-					modelId: current.modelId,
-					modelContextWindowTokens: current.modelContextWindowTokens,
-					sandboxPolicy: current.sandboxPolicy as Prisma.InputJsonValue,
-					validation: reviseValidation(
-						current.validation,
-						manifest.actions.map((action) => action.type),
-						actions.map((action) => action.type),
-					),
-					sourceConversationId: current.sourceConversationId,
-					approvedAt: current.approvedAt,
-					deployedAt: current.deployedAt,
-					createdById: userId,
-				},
-				select: { id: true },
+			const version = await createVersion(tx, {
+				agentId: input.id,
+				number: await nextVersionNumber(tx, input.id),
+				status: current.status,
+				instructions: current.instructions,
+				manifest: {
+					...manifest,
+					actions,
+					dataScope,
+				} as JsonValue,
+				modelId: current.modelId,
+				modelContextWindowTokens: current.modelContextWindowTokens,
+				sandboxPolicy: current.sandboxPolicy,
+				validation: reviseValidation(
+					current.validation,
+					manifest.actions.map((action) => action.type),
+					actions.map((action) => action.type),
+				),
+				sourceConversationId: current.sourceConversationId,
+				approvedAt: current.approvedAt,
+				deployedAt: current.deployedAt,
+				createdById: userId,
 			});
 
 			await carryArtifactsForward(tx, agent.currentVersionId, version.id);
 
-			await tx.agentDefinition.update({
-				where: { id: input.id },
-				data: { currentVersionId: version.id },
-			});
+			await tx
+				.update(agentDefinition)
+				.set({ currentVersionId: version.id })
+				.where(eq(agentDefinition.id, input.id));
 
-			const repointed = await tx.agentTrigger.updateMany({
-				where: { agentId: input.id, versionId: agent.currentVersionId },
-				data: { versionId: version.id },
-			});
+			const repointed = await repointTriggers(
+				tx,
+				input.id,
+				agent.currentVersionId,
+				version.id,
+			);
 
 			if (channel && channel.id !== before?.destination?.id) {
 				await queue.slackChannelJoinRequested(channel.id, channel.name);
 			}
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: input.id,
-					versionId: version.id,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "agent.revised",
-					summary: reviseSummary(input),
-					before: {
-						channel: before?.destination?.label ?? null,
-						actions: manifest.actions.map((action) => action.type),
-						resources: manifest.dataScope.resources.length,
-					},
-					after: {
-						channel: channel ? `#${channel.name}` : null,
-						actions: input.actions ?? null,
-						resources: input.resources?.length ?? null,
-						triggers: repointed.count,
-					},
-					requestId: input.clientRequestId,
+			await tx.insert(agentAuditEvent).values({
+				agentId: input.id,
+				versionId: version.id,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "agent.revised",
+				summary: reviseSummary(input),
+				before: {
+					channel: before?.destination?.label ?? null,
+					actions: manifest.actions.map((action) => action.type),
+					resources: manifest.dataScope.resources.length,
 				},
+				after: {
+					channel: channel ? `#${channel.name}` : null,
+					actions: input.actions ?? null,
+					resources: input.resources?.length ?? null,
+					triggers: repointed,
+				},
+				requestId: input.clientRequestId,
 			});
 
 			return version.id;
@@ -505,17 +516,15 @@ export class AgentDefinitionsService {
 	}
 
 	async deploy(input: AgentDeployInput, userId: string) {
-		return this.db.$transaction(async (tx) => {
+		return this.db.transaction(async (tx) => {
 			await this.access.assertCanManageInTransaction(tx, input.id, userId);
 			const agent = await this.lockAgent(tx, input.id);
-			const existing = await tx.agentAuditEvent.findFirst({
-				where: {
-					agentId: input.id,
-					type: "agent.deployed",
-					requestId: input.clientRequestId,
-				},
-				select: { versionId: true },
-			});
+			const existing = await auditReplay(
+				tx,
+				input.id,
+				"agent.deployed",
+				input.clientRequestId,
+			);
 
 			if (existing) {
 				if (existing.versionId !== input.versionId) {
@@ -527,10 +536,21 @@ export class AgentDefinitionsService {
 				return { id: input.id, versionId: input.versionId, status: "LIVE" };
 			}
 
-			const version = await tx.agentVersion.findFirst({
-				where: { id: input.versionId, agentId: input.id },
-				select: { id: true, number: true, status: true, manifest: true },
-			});
+			const [version] = await tx
+				.select({
+					id: agentVersion.id,
+					number: agentVersion.number,
+					status: agentVersion.status,
+					manifest: agentVersion.manifest,
+				})
+				.from(agentVersion)
+				.where(
+					and(
+						eq(agentVersion.id, input.versionId),
+						eq(agentVersion.agentId, input.id),
+					),
+				)
+				.limit(1);
 
 			if (!version) {
 				throw new NotFoundException(`No version with id ${input.versionId}.`);
@@ -544,57 +564,58 @@ export class AgentDefinitionsService {
 			const metadata = versionMetadata(version.manifest);
 
 			const now = new Date();
-			await tx.agentVersion.updateMany({
-				where: {
-					agentId: input.id,
-					status: "DEPLOYED",
-					id: { not: input.versionId },
-				},
-				data: { status: "READY" },
-			});
+			await tx
+				.update(agentVersion)
+				.set({ status: "READY" })
+				.where(
+					and(
+						eq(agentVersion.agentId, input.id),
+						eq(agentVersion.status, "DEPLOYED"),
+						ne(agentVersion.id, input.versionId),
+					),
+				);
 
-			await tx.agentVersion.update({
-				where: { id: input.versionId },
-				data: {
-					status: "DEPLOYED",
-					approvedAt: now,
-					deployedAt: now,
-				},
-			});
+			await tx
+				.update(agentVersion)
+				.set({ status: "DEPLOYED", approvedAt: now, deployedAt: now })
+				.where(eq(agentVersion.id, input.versionId));
 
-			await tx.agentDefinition.update({
-				where: { id: input.id },
-				data: {
+			await tx
+				.update(agentDefinition)
+				.set({
 					currentVersionId: input.versionId,
 					status: "LIVE",
 					archivedAt: null,
 					...metadata,
-				},
-			});
+				})
+				.where(eq(agentDefinition.id, input.id));
 
-			await tx.agentTrigger.updateMany({
-				where: { agentId: input.id },
-				data: { enabled: false },
-			});
+			await tx
+				.update(agentTrigger)
+				.set({ enabled: false })
+				.where(eq(agentTrigger.agentId, input.id));
 
-			await tx.agentTrigger.updateMany({
-				where: { agentId: input.id, versionId: input.versionId },
-				data: { enabled: true },
-			});
+			await tx
+				.update(agentTrigger)
+				.set({ enabled: true })
+				.where(
+					and(
+						eq(agentTrigger.agentId, input.id),
+						eq(agentTrigger.versionId, input.versionId),
+					),
+				);
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: input.id,
-					versionId: input.versionId,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "agent.deployed",
-					summary: `Made version ${version.number} live for the team`,
-					before: { status: agent.status },
-					after: { status: "LIVE", version: version.number, ...metadata },
-					requestId: input.clientRequestId,
-				},
+			await tx.insert(agentAuditEvent).values({
+				agentId: input.id,
+				versionId: input.versionId,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "agent.deployed",
+				summary: `Made version ${version.number} live for the team`,
+				before: { status: agent.status },
+				after: { status: "LIVE", version: version.number, ...metadata },
+				requestId: input.clientRequestId,
 			});
 
 			return { id: input.id, versionId: input.versionId, status: "LIVE" };
@@ -654,89 +675,94 @@ export class AgentDefinitionsService {
 	async remove(id: string, userId: string) {
 		const now = new Date();
 
-		return this.db.$transaction(async (tx) => {
+		return this.db.transaction(async (tx) => {
 			await this.access.assertCanManageInTransaction(tx, id, userId);
-			const [current] = await tx.$queryRaw<
-				Array<{ id: string; status: string }>
-			>`
-				SELECT id, status
-				FROM "agentDefinition"
-				WHERE id = ${id}
-				FOR UPDATE
-			`;
+			const [current] = await tx
+				.select({ id: agentDefinition.id, status: agentDefinition.status })
+				.from(agentDefinition)
+				.where(eq(agentDefinition.id, id))
+				.for("update");
 
 			if (!current || current.status === "DELETED") {
 				throw new NotFoundException(`No agent with id ${id}.`);
 			}
 
-			const disabledTriggers = await tx.agentTrigger.updateMany({
-				where: { agentId: id, enabled: true },
-				data: { enabled: false, nextRunAt: null },
-			});
-
-			const cancellableRuns = await tx.$queryRaw<Array<{ id: string }>>`
-				SELECT id
-				FROM "agentRun"
-				WHERE "agentId" = ${id}
-					AND (
-						status IN ('QUEUED', 'WAITING_FOR_APPROVAL')
-						OR (status = 'RUNNING' AND "sessionId" IS NULL)
+			const disabledTriggers = (
+				await tx
+					.update(agentTrigger)
+					.set({ enabled: false, nextRunAt: null })
+					.where(
+						and(eq(agentTrigger.agentId, id), eq(agentTrigger.enabled, true)),
 					)
-				ORDER BY id
-				FOR UPDATE
-			`;
+					.returning({ id: agentTrigger.id })
+			).length;
+
+			const cancellableRuns = await tx
+				.select({ id: agentRun.id })
+				.from(agentRun)
+				.where(
+					and(
+						eq(agentRun.agentId, id),
+						sql`(${agentRun.status} IN ('QUEUED', 'WAITING_FOR_APPROVAL') OR (${agentRun.status} = 'RUNNING' AND ${agentRun.sessionId} IS NULL))`,
+					),
+				)
+				.orderBy(asc(agentRun.id))
+				.for("update");
 
 			for (const run of cancellableRuns) {
-				const cancelled = await tx.agentRun.update({
-					where: { id: run.id },
-					data: {
+				const [cancelled] = await tx
+					.update(agentRun)
+					.set({
 						status: "CANCELLED",
 						finishedAt: now,
 						errorCode: "AGENT_DELETED",
 						errorMessage: "The agent was deleted before this run completed.",
-						nextEventSequence: { increment: 1 },
-					},
-					select: { nextEventSequence: true },
-				});
+						nextEventSequence: sql`${agentRun.nextEventSequence} + 1`,
+					})
+					.where(eq(agentRun.id, run.id))
+					.returning({ nextEventSequence: agentRun.nextEventSequence });
+				if (!cancelled) continue;
 
-				await tx.agentRunEvent.create({
-					data: {
-						runId: run.id,
-						sequence: cancelled.nextEventSequence,
-						type: "run.cancelled",
-						data: { reason: "agent.deleted" },
-						emittedAt: now,
-					},
+				await tx.insert(agentRunEvent).values({
+					runId: run.id,
+					sequence: cancelled.nextEventSequence,
+					type: "run.cancelled",
+					data: { reason: "agent.deleted" },
+					emittedAt: now,
 				});
 			}
 
-			const agent = await tx.agentDefinition.update({
-				where: { id },
-				data: { status: "DELETED", deletedAt: now },
-				select: { id: true, name: true, status: true, updatedAt: true },
-			});
+			const [agent] = await tx
+				.update(agentDefinition)
+				.set({ status: "DELETED", deletedAt: now })
+				.where(eq(agentDefinition.id, id))
+				.returning({
+					id: agentDefinition.id,
+					name: agentDefinition.name,
+					status: agentDefinition.status,
+					updatedAt: agentDefinition.updatedAt,
+				});
+			if (!agent) throw new NotFoundException(`No agent with id ${id}.`);
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: id,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type: "agent.deleted",
-					summary: "Deleted agent",
-					before: { status: current.status },
-					after: {
-						status: "DELETED",
-						disabledTriggers: disabledTriggers.count,
-						cancelledRuns: cancellableRuns.length,
-					},
+			await tx.insert(agentAuditEvent).values({
+				agentId: id,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type: "agent.deleted",
+				summary: "Deleted agent",
+				before: { status: current.status },
+				after: {
+					status: "DELETED",
+					disabledTriggers,
+					cancelledRuns: cancellableRuns.length,
 				},
 			});
 
 			return {
 				...agent,
 				updatedAt: agent.updatedAt.toISOString(),
-				disabledTriggers: disabledTriggers.count,
+				disabledTriggers,
 				cancelledRuns: cancellableRuns.length,
 			};
 		});
@@ -750,53 +776,54 @@ export class AgentDefinitionsService {
 		type: string,
 		summary: string,
 		invalidStatusMessage: string,
-		extra: Prisma.AgentDefinitionUpdateInput = {},
+		extra: Partial<NewAgentDefinition> = {},
 	) {
-		return this.db.$transaction(async (tx) => {
+		return this.db.transaction(async (tx) => {
 			await this.access.assertCanManageInTransaction(tx, id, userId);
 			const before = await this.lockAgent(tx, id);
 			if (!allowedFrom.includes(before.status)) {
 				throw new BadRequestException(invalidStatusMessage);
 			}
 
-			const agent = await tx.agentDefinition.update({
-				where: { id },
-				data: { status, ...extra },
-				select: { id: true, name: true, status: true, updatedAt: true },
-			});
+			const [agent] = await tx
+				.update(agentDefinition)
+				.set({ status, ...extra })
+				.where(eq(agentDefinition.id, id))
+				.returning({
+					id: agentDefinition.id,
+					name: agentDefinition.name,
+					status: agentDefinition.status,
+					updatedAt: agentDefinition.updatedAt,
+				});
+			if (!agent) throw new NotFoundException(`No agent with id ${id}.`);
 
-			await tx.agentAuditEvent.create({
-				data: {
-					agentId: id,
-					actorUserId: userId,
-					actorType: "USER",
-					actorId: userId,
-					type,
-					summary,
-					before: { status: before.status },
-					after: { status },
-				},
+			await tx.insert(agentAuditEvent).values({
+				agentId: id,
+				actorUserId: userId,
+				actorType: "USER",
+				actorId: userId,
+				type,
+				summary,
+				before: { status: before.status },
+				after: { status },
 			});
 
 			return { ...agent, updatedAt: agent.updatedAt.toISOString() };
 		});
 	}
 
-	private async lockAgent(tx: Prisma.TransactionClient, id: string) {
-		const [agent] = await tx.$queryRaw<
-			Array<{
-				id: string;
-				status: AgentDefinitionStatus;
-				name: string;
-				description: string | null;
-				currentVersionId: string | null;
-			}>
-		>`
-			SELECT id, status, name, description, "currentVersionId"
-			FROM "agentDefinition"
-			WHERE id = ${id}
-			FOR UPDATE
-		`;
+	private async lockAgent(tx: Executor, id: string) {
+		const [agent] = await tx
+			.select({
+				id: agentDefinition.id,
+				status: agentDefinition.status,
+				name: agentDefinition.name,
+				description: agentDefinition.description,
+				currentVersionId: agentDefinition.currentVersionId,
+			})
+			.from(agentDefinition)
+			.where(eq(agentDefinition.id, id))
+			.for("update");
 
 		if (!agent || agent.status === "DELETED") {
 			throw new NotFoundException(`No agent with id ${id}.`);
@@ -811,7 +838,7 @@ export class AgentDefinitionsService {
 	}
 }
 
-function versionMetadata(manifest: Prisma.JsonValue): VersionMetadata {
+function versionMetadata(manifest: JsonValue): VersionMetadata {
 	const summary = readAgentManifestSummary(manifest);
 	const name = summary.name?.trim() ?? "";
 	const description =
@@ -826,7 +853,7 @@ function versionMetadata(manifest: Prisma.JsonValue): VersionMetadata {
 	return metadata;
 }
 
-function readCapabilities(manifest: Prisma.JsonValue | undefined) {
+function readCapabilities(manifest: JsonValue | undefined) {
 	const parsed = schemas.agents.capabilities.safeParse(manifest);
 
 	if (!parsed.success) {
@@ -871,10 +898,10 @@ function reviseSummary(input: {
 }
 
 function reviseValidation(
-	validation: Prisma.JsonValue,
+	validation: JsonValue,
 	before: string[],
 	after: string[],
-): Prisma.InputJsonValue {
+): JsonValue {
 	const removed = before.filter((type) => !after.includes(type));
 	const base = versionValidation.parse(validation);
 
@@ -891,36 +918,117 @@ function reviseValidation(
 	};
 }
 
+const runCountExtra = (agent: { id: typeof agentDefinition.id }) => ({
+	runCount: relatedCount(agentRun, agentRun.agentId, agent.id).as("runCount"),
+});
+
+async function auditReplay(
+	tx: Executor,
+	agentId: string,
+	type: string,
+	requestId: string,
+) {
+	const [row] = await tx
+		.select({ versionId: agentAuditEvent.versionId })
+		.from(agentAuditEvent)
+		.where(
+			and(
+				eq(agentAuditEvent.agentId, agentId),
+				eq(agentAuditEvent.type, type),
+				eq(agentAuditEvent.requestId, requestId),
+			),
+		)
+		.limit(1);
+	return row ?? null;
+}
+
+async function currentVersion(tx: Executor, id: string) {
+	const [row] = await tx
+		.select({
+			status: agentVersion.status,
+			instructions: agentVersion.instructions,
+			manifest: agentVersion.manifest,
+			modelId: agentVersion.modelId,
+			modelContextWindowTokens: agentVersion.modelContextWindowTokens,
+			sandboxPolicy: agentVersion.sandboxPolicy,
+			validation: agentVersion.validation,
+			sourceConversationId: agentVersion.sourceConversationId,
+			deployedAt: agentVersion.deployedAt,
+			approvedAt: agentVersion.approvedAt,
+		})
+		.from(agentVersion)
+		.where(eq(agentVersion.id, id))
+		.limit(1);
+	if (!row) throw new NotFoundException(`No version with id ${id}.`);
+	return row;
+}
+
+async function createVersion(
+	tx: Executor,
+	values: typeof agentVersion.$inferInsert,
+): Promise<{ id: string }> {
+	const [row] = await tx
+		.insert(agentVersion)
+		.values(values)
+		.returning({ id: agentVersion.id });
+	if (!row) throw new Error("The version insert returned no row.");
+	return row;
+}
+
+async function repointTriggers(
+	tx: Executor,
+	agentId: string,
+	fromVersionId: string,
+	toVersionId: string,
+): Promise<number> {
+	const rows = await tx
+		.update(agentTrigger)
+		.set({ versionId: toVersionId })
+		.where(
+			and(
+				eq(agentTrigger.agentId, agentId),
+				eq(agentTrigger.versionId, fromVersionId),
+			),
+		)
+		.returning({ id: agentTrigger.id });
+	return rows.length;
+}
+
 async function nextVersionNumber(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	agentId: string,
 ): Promise<number> {
-	const latest = await tx.agentVersion.findFirst({
-		where: { agentId },
-		orderBy: { number: "desc" },
-		select: { number: true },
-	});
+	const [latest] = await tx
+		.select({ number: agentVersion.number })
+		.from(agentVersion)
+		.where(eq(agentVersion.agentId, agentId))
+		.orderBy(desc(agentVersion.number))
+		.limit(1);
 
 	return (latest?.number ?? 0) + 1;
 }
 
 async function carryArtifactsForward(
-	tx: Prisma.TransactionClient,
+	tx: Executor,
 	fromVersionId: string,
 	toVersionId: string,
 ): Promise<void> {
-	const rows = await tx.agentBuilderArtifact.findMany({
-		where: { versionId: fromVersionId },
-		orderBy: [{ path: "asc" }, { revision: "desc" }],
-	});
+	const rows = await tx
+		.select()
+		.from(agentBuilderArtifact)
+		.where(eq(agentBuilderArtifact.versionId, fromVersionId))
+		.orderBy(
+			asc(agentBuilderArtifact.path),
+			desc(agentBuilderArtifact.revision),
+		);
 
 	const latest = new Map<string, (typeof rows)[number]>();
 	for (const row of rows) if (!latest.has(row.path)) latest.set(row.path, row);
 
 	if (latest.size === 0) return;
 
-	await tx.agentBuilderArtifact.createMany({
-		data: [...latest.values()].map((row) => ({
+	await tx.insert(agentBuilderArtifact).values(
+		[...latest.values()].map((row) => ({
 			versionId: toVersionId,
 			path: row.path,
 			language: row.language,
@@ -929,5 +1037,5 @@ async function carryArtifactsForward(
 			revision: row.revision,
 			status: row.status,
 		})),
-	});
+	);
 }

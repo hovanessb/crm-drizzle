@@ -7,7 +7,20 @@ import {
 	type WorkspaceRole,
 	workspaceRoleOf,
 } from "@crm/auth/organization";
-import type { Db, Prisma } from "@crm/db";
+import {
+	and,
+	asc,
+	contains,
+	type Db,
+	type Executor,
+	eq,
+	inArray,
+	member,
+	or,
+	organization,
+	type SQL,
+	user,
+} from "@crm/db";
 import { isOnboarded, markOnboarded, workspaceSlug } from "@crm/db/workspace";
 import {
 	BadRequestException,
@@ -22,10 +35,12 @@ import { normalizeDomain } from "../companies/domain";
 import { InjectDatabase } from "../database/database.constants";
 import {
 	countsByKey,
+	groupCounts,
 	type ListResult,
 	type OrderByColumns,
 	paginate,
 	resolveOrderBy,
+	sortBy,
 } from "../trpc/list-input";
 import type {
 	MemberListInput,
@@ -35,22 +50,35 @@ import type {
 	WorkspaceMember,
 } from "./workspace.contracts";
 
-const MEMBER_SELECT = {
-	id: true,
-	role: true,
-	createdAt: true,
-	userId: true,
-	user: { select: { name: true, email: true, image: true } },
-} as const;
-
-type MemberRow = Prisma.MemberGetPayload<{ select: typeof MEMBER_SELECT }>;
-
-const SORTABLE: OrderByColumns<Prisma.MemberOrderByWithRelationInput> = {
-	name: (dir) => ({ user: { name: dir } }),
-	email: (dir) => ({ user: { email: dir } }),
-	role: (dir) => ({ role: dir }),
-	joinedAt: (dir) => ({ createdAt: dir }),
+const MEMBER_FIELDS = {
+	id: member.id,
+	role: member.role,
+	createdAt: member.createdAt,
+	userId: member.userId,
+	user: { name: user.name, email: user.email, image: user.image },
 };
+
+type MemberRow = {
+	id: string;
+	role: string;
+	createdAt: Date;
+	userId: string;
+	user: { name: string; email: string; image: string | null };
+};
+
+const SORTABLE: OrderByColumns<SQL> = {
+	name: (dir) => sortBy(user.name, dir),
+	email: (dir) => sortBy(user.email, dir),
+	role: (dir) => sortBy(member.role, dir),
+	joinedAt: (dir) => sortBy(member.createdAt, dir),
+};
+
+function members(db: Executor) {
+	return db
+		.select(MEMBER_FIELDS)
+		.from(member)
+		.innerJoin(user, eq(user.id, member.userId));
+}
 
 function toRole(value: string): WorkspaceRole {
 	return isWorkspaceRole(value) ? value : "member";
@@ -105,10 +133,14 @@ export class WorkspaceService {
 			);
 		}
 
-		const before = await this.db.organization.findUnique({
-			where: { id: WORKSPACE_ID },
-			select: { website: true, metadata: true },
-		});
+		const [before] = await this.db
+			.select({
+				website: organization.website,
+				metadata: organization.metadata,
+			})
+			.from(organization)
+			.where(eq(organization.id, WORKSPACE_ID))
+			.limit(1);
 
 		const website = normalizeDomain(input.website);
 
@@ -118,15 +150,18 @@ export class WorkspaceService {
 			);
 		}
 
-		await this.db.organization.update({
-			where: { id: WORKSPACE_ID },
-			data: {
+		const renamed = await this.db
+			.update(organization)
+			.set({
 				name: input.name,
 				slug: workspaceSlug(input.slug ?? input.name),
 				website,
 				metadata: markOnboarded(before?.metadata ?? null, new Date()),
-			},
-		});
+			})
+			.where(eq(organization.id, WORKSPACE_ID))
+			.returning({ id: organization.id });
+		if (renamed.length === 0)
+			throw new NotFoundException("The workspace does not exist.");
 
 		this.logger.log({ message: "Workspace updated", userId });
 
@@ -150,25 +185,19 @@ export class WorkspaceService {
 		const { skip, take } = paginate(input);
 
 		const [rows, total, roles] = await Promise.all([
-			this.db.member.findMany({
-				where,
-				skip,
-				take,
-				select: MEMBER_SELECT,
-				orderBy: resolveOrderBy(input, SORTABLE, { createdAt: "asc" }),
-			}),
-			this.db.member.count({ where }),
-			this.db.member.groupBy({
-				by: ["role"],
-				where: this.searchWhere(input.q),
-				_count: { _all: true },
-			}),
+			members(this.db)
+				.where(where)
+				.orderBy(resolveOrderBy(input, SORTABLE, asc(member.createdAt)))
+				.limit(take)
+				.offset(skip),
+			this.db.$count(member, where),
+			groupCounts(this.db, member, member.role, this.searchWhere(input.q)),
 		]);
 
 		return {
 			rows: rows.map((row) => this.toMember(row, userId)),
 			total,
-			facetCounts: { role: countsByKey(roles, "role") },
+			facetCounts: { role: countsByKey(roles, "value") },
 		};
 	}
 
@@ -184,22 +213,33 @@ export class WorkspaceService {
 			);
 		}
 
-		const updated = await this.db.$transaction(async (tx) => {
-			const target = await tx.member.findFirst({
-				where: { id: input.memberId, organizationId: WORKSPACE_ID },
-				select: { id: true, role: true },
-			});
+		const updated = await this.db.transaction(async (tx) => {
+			const [target] = await tx
+				.select({ id: member.id, role: member.role })
+				.from(member)
+				.where(
+					and(
+						eq(member.id, input.memberId),
+						eq(member.organizationId, WORKSPACE_ID),
+					),
+				)
+				.limit(1);
 
 			if (!target) {
 				throw new NotFoundException("That person is not in this workspace.");
 			}
 
 			if (target.role === "owner" && input.role !== "owner") {
-				const owners = await tx.$queryRaw<{ id: string }[]>`
-					SELECT id FROM "member"
-					WHERE "organizationId" = ${WORKSPACE_ID} AND role = 'owner'
-					FOR UPDATE
-				`;
+				const owners = await tx
+					.select({ id: member.id })
+					.from(member)
+					.where(
+						and(
+							eq(member.organizationId, WORKSPACE_ID),
+							eq(member.role, "owner"),
+						),
+					)
+					.for("update");
 
 				if (owners.length <= 1) {
 					throw new ForbiddenException(
@@ -208,11 +248,15 @@ export class WorkspaceService {
 				}
 			}
 
-			return tx.member.update({
-				where: { id: target.id },
-				data: { role: input.role },
-				select: MEMBER_SELECT,
-			});
+			await tx
+				.update(member)
+				.set({ role: input.role })
+				.where(eq(member.id, target.id));
+
+			const [row] = await members(tx).where(eq(member.id, target.id));
+			if (!row)
+				throw new NotFoundException("That person is not in this workspace.");
+			return row;
 		});
 
 		this.logger.log({
@@ -238,42 +282,46 @@ export class WorkspaceService {
 		};
 	}
 
-	private searchWhere(q: string): Prisma.MemberWhereInput {
+	private searchWhere(q: string): SQL | undefined {
 		const term = q.trim();
-		const where: Prisma.MemberWhereInput = { organizationId: WORKSPACE_ID };
-
-		if (term) {
-			where.user = {
-				OR: [
-					{ name: { contains: term, mode: "insensitive" } },
-					{ email: { contains: term, mode: "insensitive" } },
-				],
-			};
-		}
-
-		return where;
+		return and(
+			eq(member.organizationId, WORKSPACE_ID),
+			term
+				? inArray(
+						member.userId,
+						this.db
+							.select({ id: user.id })
+							.from(user)
+							.where(
+								or(
+									contains(user.name, term, { insensitive: true }),
+									contains(user.email, term, { insensitive: true }),
+								),
+							),
+					)
+				: undefined,
+		);
 	}
 
-	private buildWhere(input: MemberListInput): Prisma.MemberWhereInput {
-		const where = this.searchWhere(input.q);
-
-		if (input.role.length > 0) {
-			where.role = { in: input.role };
-		}
-
-		return where;
+	private buildWhere(input: MemberListInput): SQL | undefined {
+		return and(
+			this.searchWhere(input.q),
+			input.role.length > 0 ? inArray(member.role, input.role) : undefined,
+		);
 	}
 
 	private async readWorkspace() {
-		return this.db.organization.findUnique({
-			where: { id: WORKSPACE_ID },
-			select: {
-				id: true,
-				slug: true,
-				name: true,
-				website: true,
-				metadata: true,
-			},
-		});
+		const [row] = await this.db
+			.select({
+				id: organization.id,
+				slug: organization.slug,
+				name: organization.name,
+				website: organization.website,
+				metadata: organization.metadata,
+			})
+			.from(organization)
+			.where(eq(organization.id, WORKSPACE_ID))
+			.limit(1);
+		return row ?? null;
 	}
 }

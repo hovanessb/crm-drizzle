@@ -1,4 +1,14 @@
-import { db } from "@crm/db";
+import {
+	agentRun,
+	and,
+	db,
+	eq,
+	inArray,
+	mcpConnection,
+	mcpToolSnapshot,
+	orNull,
+	whereEq,
+} from "@crm/db";
 import { WORKSPACE_ID } from "@crm/db/workspace";
 import { parseAgentManifest } from "@crm/validation/agent-manifest";
 import { defineDynamic, defineTool } from "eve/tools";
@@ -18,28 +28,30 @@ export default defineDynamic({
 			if (purposeOf(ctx) !== "team-agent") return null;
 			const runId = attribute(ctx, "runId");
 			if (!runId) return null;
-			const run = await db.agentRun.findUnique({
-				where: { id: runId },
-				select: { version: { select: { manifest: true } } },
-			});
+			const run = await db.query.agentRun
+				.findFirst({
+					where: whereEq(agentRun.id, runId),
+					columns: {},
+					with: { version: { columns: { manifest: true } } },
+				})
+				.then(orNull);
 			if (!run) return null;
 			const manifest = parseAgentManifest(run.version.manifest);
 			if (manifest.mcp.length === 0) return null;
-			const connections = await db.mcpConnection.findMany({
-				where: {
-					organizationId: WORKSPACE_ID,
-					platformSlug: {
-						in: manifest.mcp.map((grant) => grant.platformSlug),
-					},
-					status: "CONNECTED",
-				},
-				select: {
-					id: true,
-					platformSlug: true,
-					accessMode: true,
+			const connections = await db.query.mcpConnection.findMany({
+				where: and(
+					eq(mcpConnection.organizationId, WORKSPACE_ID),
+					inArray(
+						mcpConnection.platformSlug,
+						manifest.mcp.map((grant) => grant.platformSlug),
+					),
+					eq(mcpConnection.status, "CONNECTED"),
+				),
+				columns: { id: true, platformSlug: true, accessMode: true },
+				with: {
 					toolSnapshots: {
-						where: { reviewState: "REVIEWED" },
-						select: {
+						where: eq(mcpToolSnapshot.reviewState, "REVIEWED"),
+						columns: {
 							name: true,
 							description: true,
 							inputSchema: true,

@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
-import { db } from "@crm/db";
+import {
+	db,
+	eq,
+	install as installTable,
+	telemetryCounter,
+	telemetryMilestone,
+} from "@crm/db";
 import {
 	bumpCounter,
 	drainCounters,
@@ -18,7 +24,7 @@ const PRINT_UUID = [
 	'import { readInstall } from "./src/install";',
 	"const install = await readInstall();",
 	'process.stdout.write(install?.uuid ?? "none");',
-	"await db.$disconnect();",
+	"await db.$client.end();",
 	"process.exit(0);",
 ].join(" ");
 
@@ -41,7 +47,7 @@ async function uuidFromNewProcess(): Promise<string> {
 
 describe("the install row", () => {
 	it("is a single row the migration already wrote", async () => {
-		const rows = await db.install.findMany({ select: { id: true } });
+		const rows = await db.select({ id: installTable.id }).from(installTable);
 
 		expect(rows).toEqual([{ id: INSTALL_ID }]);
 	});
@@ -81,11 +87,15 @@ describe("milestones", () => {
 	const step = "first_fact_applied" as const;
 
 	afterEach(async () => {
-		await db.telemetryMilestone.deleteMany({ where: { step } });
+		await db
+			.delete(telemetryMilestone)
+			.where(eq(telemetryMilestone.step, step));
 	});
 
 	it("reports the first arrival and nothing after it", async () => {
-		await db.telemetryMilestone.deleteMany({ where: { step } });
+		await db
+			.delete(telemetryMilestone)
+			.where(eq(telemetryMilestone.step, step));
 
 		expect(await reachMilestone(step)).toBe(true);
 		expect(await reachMilestone(step)).toBe(false);
@@ -97,11 +107,11 @@ describe("counters", () => {
 	const name = "budget_exhausted";
 
 	afterEach(async () => {
-		await db.telemetryCounter.deleteMany({ where: { name } });
+		await db.delete(telemetryCounter).where(eq(telemetryCounter.name, name));
 	});
 
 	it("adds up and then drains to nothing", async () => {
-		await db.telemetryCounter.deleteMany({ where: { name } });
+		await db.delete(telemetryCounter).where(eq(telemetryCounter.name, name));
 
 		await bumpCounter(name);
 		await bumpCounter(name);
@@ -112,7 +122,7 @@ describe("counters", () => {
 	});
 
 	it("puts back what a rollup could not send", async () => {
-		await db.telemetryCounter.deleteMany({ where: { name } });
+		await db.delete(telemetryCounter).where(eq(telemetryCounter.name, name));
 
 		await bumpCounter(name, 2);
 		const drained = await drainCounters();

@@ -7,7 +7,16 @@ import {
 	ssoCallbackURL,
 	ssoProviderName,
 } from "@crm/auth/sso";
-import type { Db, Prisma } from "@crm/db";
+import {
+	and,
+	asc,
+	contains,
+	type Db,
+	eq,
+	or,
+	type SQL,
+	ssoProvider,
+} from "@crm/db";
 import {
 	BadRequestException,
 	ForbiddenException,
@@ -24,6 +33,7 @@ import {
 	type OrderByColumns,
 	paginate,
 	resolveOrderBy,
+	sortBy,
 } from "../trpc/list-input";
 import type {
 	DeleteSsoProviderInput,
@@ -34,22 +44,26 @@ import type {
 	SsoSettings,
 } from "./sso.contracts";
 
-const PROVIDER_SELECT = {
-	providerId: true,
-	issuer: true,
-	domain: true,
-	oidcConfig: true,
-	samlConfig: true,
-} satisfies Prisma.SsoProviderSelect;
+const PROVIDER_FIELDS = {
+	providerId: ssoProvider.providerId,
+	issuer: ssoProvider.issuer,
+	domain: ssoProvider.domain,
+	oidcConfig: ssoProvider.oidcConfig,
+	samlConfig: ssoProvider.samlConfig,
+};
 
-type ProviderRow = Prisma.SsoProviderGetPayload<{
-	select: typeof PROVIDER_SELECT;
-}>;
+type ProviderRow = {
+	providerId: string;
+	issuer: string;
+	domain: string;
+	oidcConfig: string | null;
+	samlConfig: string | null;
+};
 
-const SORTABLE: OrderByColumns<Prisma.SsoProviderOrderByWithRelationInput> = {
-	providerId: (dir) => ({ providerId: dir }),
-	domain: (dir) => ({ domain: dir }),
-	issuer: (dir) => ({ issuer: dir }),
+const SORTABLE: OrderByColumns<SQL> = {
+	providerId: (dir) => sortBy(ssoProvider.providerId, dir),
+	domain: (dir) => sortBy(ssoProvider.domain, dir),
+	issuer: (dir) => sortBy(ssoProvider.issuer, dir),
 };
 
 const STATUS_BY_CODE = new Map<string, number>([
@@ -115,11 +129,11 @@ export class SsoService {
 	constructor(@InjectDatabase() private readonly db: Db) {}
 
 	async signInOptions(): Promise<SignInOptions> {
-		const rows = await this.db.ssoProvider.findMany({
-			where: { organizationId: WORKSPACE_ID },
-			select: { providerId: true },
-			orderBy: { providerId: "asc" },
-		});
+		const rows = await this.db
+			.select({ providerId: ssoProvider.providerId })
+			.from(ssoProvider)
+			.where(eq(ssoProvider.organizationId, WORKSPACE_ID))
+			.orderBy(asc(ssoProvider.providerId));
 
 		return {
 			google: isGoogleConfigured(),
@@ -143,14 +157,14 @@ export class SsoService {
 		const { skip, take } = paginate(input);
 
 		const [rows, total] = await Promise.all([
-			this.db.ssoProvider.findMany({
-				where,
-				skip,
-				take,
-				select: PROVIDER_SELECT,
-				orderBy: resolveOrderBy(input, SORTABLE, { providerId: "asc" }),
-			}),
-			this.db.ssoProvider.count({ where }),
+			this.db
+				.select(PROVIDER_FIELDS)
+				.from(ssoProvider)
+				.where(where)
+				.orderBy(resolveOrderBy(input, SORTABLE, asc(ssoProvider.providerId)))
+				.limit(take)
+				.offset(skip),
+			this.db.$count(ssoProvider, where),
 		]);
 
 		return { rows: rows.map(toProvider), total, facetCounts: {} };
@@ -195,10 +209,16 @@ export class SsoService {
 			issuer: input.issuer,
 		});
 
-		const row = await this.db.ssoProvider.findUniqueOrThrow({
-			where: { providerId: input.providerId },
-			select: PROVIDER_SELECT,
-		});
+		const [row] = await this.db
+			.select(PROVIDER_FIELDS)
+			.from(ssoProvider)
+			.where(eq(ssoProvider.providerId, input.providerId))
+			.limit(1);
+		if (!row) {
+			throw new InternalServerErrorException(
+				"The provider was saved but cannot be read back.",
+			);
+		}
 
 		return toProvider(row);
 	}
@@ -226,21 +246,18 @@ export class SsoService {
 		return { providerId: input.providerId };
 	}
 
-	private searchWhere(q: string): Prisma.SsoProviderWhereInput {
+	private searchWhere(q: string): SQL | undefined {
 		const term = q.trim();
-		const where: Prisma.SsoProviderWhereInput = {
-			organizationId: WORKSPACE_ID,
-		};
-
-		if (term) {
-			where.OR = [
-				{ providerId: { contains: term, mode: "insensitive" } },
-				{ domain: { contains: term, mode: "insensitive" } },
-				{ issuer: { contains: term, mode: "insensitive" } },
-			];
-		}
-
-		return where;
+		return and(
+			eq(ssoProvider.organizationId, WORKSPACE_ID),
+			term
+				? or(
+						contains(ssoProvider.providerId, term, { insensitive: true }),
+						contains(ssoProvider.domain, term, { insensitive: true }),
+						contains(ssoProvider.issuer, term, { insensitive: true }),
+					)
+				: undefined,
+		);
 	}
 
 	private async call<T>(run: () => Promise<T>): Promise<T> {
