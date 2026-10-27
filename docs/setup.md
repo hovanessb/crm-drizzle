@@ -28,6 +28,36 @@ A database that the Prisma releases migrated needs no manual step. `db:deploy`
 adopts it when every Prisma migration is recorded, and refuses it otherwise.
 `packages/db/README.md` says how.
 
+## `bun run dev` in Docker, for an older Linux
+
+`nestjs-trpc watch` runs a native binary that needs GLIBC 2.39 on x86-64. Ubuntu
+22.04 and older have an older GLIBC, so the API's tRPC watcher fails there.
+`docker/dev` runs the whole `bun run dev` in an Ubuntu 24.04 container with Bun
+1.4.0 and Node 24, which eve needs.
+
+```sh
+docker/dev/run.sh                                    # bun install, then bun run dev
+docker/dev/run.sh bun run --filter=api trpc:generate # any other command
+```
+
+- **The container uses the host network.** `localhost` in `.env` reaches your local
+  PostgreSQL, a `llama-server` and the other two servers, and the app is on
+  `localhost:3000` as before. `eve dev` listens on `127.0.0.1` only, so published
+  ports would not reach it. This needs Linux; Docker Desktop on macOS behaves
+  differently.
+- **The repo is mounted at the same path as on the host.** eve's Docker sandbox
+  asks the host's Docker daemon to bind-mount a path inside the repo, and that path
+  must exist on the host. `run.sh` mounts `/var/run/docker.sock` when it exists.
+  Without it, `eve dev` falls back to its `just-bash` sandbox.
+- **The container runs as your user.** `run.sh` builds it with your UID and GID, so
+  `node_modules`, `.turbo` and `.next` on the host stay yours. The Bun cache is a
+  named volume, `crm-dev_bun-cache`.
+- **Start it with `run.sh`, not `docker compose`.** The compose file needs the
+  values `run.sh` exports, and a plain `docker compose` stops with that message.
+- **The Docker socket is root on the host.** A process in the container that uses it
+  controls the host's Docker. `CRM_DEV_NO_DOCKER=1 docker/dev/run.sh` leaves the socket
+  out, and the agent uses `just-bash` instead.
+
 ## Google Cloud
 
 - **Enable the Gmail API and the Google Calendar API** on the project.

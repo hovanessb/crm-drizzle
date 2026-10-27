@@ -228,6 +228,19 @@ bun run dev
 The app is on [localhost:3000](http://localhost:3000), the API on
 [localhost:3001](http://localhost:3001).
 
+**On Ubuntu 22.04 or older**, the API's tRPC watcher fails: its native binary needs
+GLIBC 2.39. Run the same command in an Ubuntu 24.04 container instead. The host needs only
+Docker with the Compose plugin:
+
+```sh
+docker/dev/run.sh
+```
+
+It installs dependencies, then runs `bun run dev` on the host network, so your local
+PostgreSQL and `.env` work unchanged.
+[`docs/setup.md`](./docs/setup.md#bun-run-dev-in-docker-for-an-older-linux) has the
+details.
+
 That clone gives you `release`, the default branch and the last tagged release — what you
 want if you are running this. `main` is where unreleased work lands: green, but not cut
 yet. If you are here to send a pull request, `git switch main` first and read

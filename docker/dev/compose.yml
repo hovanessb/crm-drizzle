@@ -1,0 +1,23 @@
+name: crm-dev
+
+services:
+  dev:
+    build:
+      context: .
+      args:
+        USER_UID: ${CRM_UID:-1000}
+        USER_GID: ${CRM_GID:-1000}
+    image: crm-dev:latest
+    network_mode: host
+    working_dir: ${CRM_REPO:?run docker/dev/run.sh instead of docker compose}
+    volumes:
+      - ${CRM_REPO}:${CRM_REPO}
+      - bun-cache:/home/ubuntu/.bun
+    group_add:
+      - "${CRM_DOCKER_GID:-1000}"
+    init: true
+    tty: true
+    stdin_open: true
+
+volumes:
+  bun-cache:
