@@ -264,7 +264,5 @@ that a plain clone runs the last tagged release, and the only things that merge
 into it are release pull requests. A branch cut from `release` carries release
 merge commits that do not belong in a feature pull request.
 
-**You do not write the pull request title.** `.github/scripts/pr-title.sh` reads
-the diff and writes one. Retitle it yourself and the automation stops.
-`CONTRIBUTING.md` is the whole account of how a change reaches `release`; read it
-before shipping.
+`CONTRIBUTING.md` describes the original project's release process. This fork
+does not run it: there is no automatic pull request, title or release.
