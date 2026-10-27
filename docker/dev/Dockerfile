@@ -1,7 +1,8 @@
 FROM dhi.io/node:24-debian13-dev AS node
 USER root
 RUN mkdir -p /out \
-	&& cp "$(command -v node)" /out/node
+	&& cp "$(readlink -f "$(command -v node)")" /out/node \
+	&& /out/node -e "process.exit(process.versions.bun ? 1 : 0)"
 
 FROM docker:29-cli AS docker
 
@@ -24,8 +25,12 @@ RUN apt-get update \
 		unzip \
 	&& rm -rf /var/lib/apt/lists/*
 
-COPY --from=node /out/node /usr/local/bin/node
-RUN node --version
+COPY --from=node /out/node /opt/node/bin/node
+ENV PATH=/opt/node/bin:$PATH
+RUN test "$(command -v node)" = /opt/node/bin/node \
+	&& node -e "process.exit(process.versions.bun ? 1 : 0)" \
+	&& node --version \
+	&& bun --version
 
 COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
 
