@@ -32,10 +32,13 @@ adopts it when every Prisma migration is recorded, and refuses it otherwise.
 
 `nestjs-trpc watch` runs a native binary that needs GLIBC 2.39 on x86-64. Ubuntu
 22.04 and older have an older GLIBC, so the API's tRPC watcher fails there.
-`docker/dev` runs the whole `bun run dev` in an Ubuntu 24.04 container with Bun
-1.4.0 and Node 24, which eve needs.
+`docker/dev` runs the whole `bun run dev` in a container built on Docker's hardened
+Bun image, `dhi.io/bun:1.4-debian13-dev` (Debian 13, GLIBC 2.41). The Dockerfile copies
+Node 24, which eve needs, from the hardened `dhi.io/node:24-debian13-dev` image, and
+adds the Docker CLI.
 
 ```sh
+docker login dhi.io                                  # once: your Docker account
 docker/dev/run.sh                                    # bun install, then bun run dev
 docker/dev/run.sh bun run --filter=api trpc:generate # any other command
 ```
@@ -49,6 +52,10 @@ docker/dev/run.sh bun run --filter=api trpc:generate # any other command
   asks the host's Docker daemon to bind-mount a path inside the repo, and that path
   must exist on the host. `run.sh` mounts `/var/run/docker.sock` when it exists.
   Without it, `eve dev` falls back to its `just-bash` sandbox.
+- **Only the `-dev` Debian tag works.** The runtime tags have no shell, and `bun run
+  dev` starts its servers through `sh`. The Alpine tags use musl, and the tRPC
+  binary is built only for GLIBC. The `-dev` tag is not hardened for production use,
+  which does not matter for a dev container.
 - **The container runs as your user.** `run.sh` builds it with your UID and GID, so
   `node_modules`, `.turbo` and `.next` on the host stay yours. The Bun cache is a
   named volume, `crm-dev_bun-cache`.

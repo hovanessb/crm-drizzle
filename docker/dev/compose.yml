@@ -12,7 +12,7 @@ services:
     working_dir: ${CRM_REPO:?run docker/dev/run.sh instead of docker compose}
     volumes:
       - ${CRM_REPO}:${CRM_REPO}
-      - bun-cache:/home/ubuntu/.bun
+      - bun-cache:/home/dev/.bun
     group_add:
       - "${CRM_DOCKER_GID:-1000}"
     init: true

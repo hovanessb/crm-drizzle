@@ -229,10 +229,11 @@ The app is on [localhost:3000](http://localhost:3000), the API on
 [localhost:3001](http://localhost:3001).
 
 **On Ubuntu 22.04 or older**, the API's tRPC watcher fails: its native binary needs
-GLIBC 2.39. Run the same command in an Ubuntu 24.04 container instead. The host needs only
-Docker with the Compose plugin:
+GLIBC 2.39. Run the same command in a container on Docker's hardened Bun image
+(Debian 13, GLIBC 2.41) instead. The host needs only Docker with the Compose plugin:
 
 ```sh
+docker login dhi.io      # once, with your Docker account
 docker/dev/run.sh
 ```
 
